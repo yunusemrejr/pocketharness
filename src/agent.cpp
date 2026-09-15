@@ -85,6 +85,7 @@ void Agent::ensureMeta() {
         meta.systemPrompt = buildSystemPrompt(ws);
         meta.modelSpec = opts_.model.spec;
         meta.systemSource = systemPromptSource(ws);
+        meta.thinking = opts_.thinking;
         sessionSaveMeta(opts_.sessionId, meta);
     }
     if (meta.orSessionId.empty()) {

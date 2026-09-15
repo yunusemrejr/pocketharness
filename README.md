@@ -160,7 +160,9 @@ deepseek:deepseek-chat
 friendli:glm-5.3-flash
 ```
 
-The last explicitly selected model and thinking level persist across sessions.
+Each session owns its model and thinking level (stored in the session,
+restored by `--resume`); new sessions start from config unless `-m`/`-t` say
+otherwise, so concurrent sessions never affect each other.
 HTTPS is done by invoking the installed **`curl` binary** (argv-based, never
 shell strings); the API key travels in a 0600 `-K` config file, never in
 argv, logs, or sessions. PocketHarness ships no TLS/HTTP stack of its own.

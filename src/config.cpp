@@ -9,8 +9,6 @@ std::string userConfigDir() { return homeDir() + "/.config/pocketharness"; }
 std::string userConfigPath() { return userConfigDir() + "/config.json"; }
 std::string stateDir() { return homeDir() + "/.local/share/pocketharness"; }
 std::string sessionDir() { return stateDir() + "/sessions"; }
-std::string statePath() { return stateDir() + "/state.json"; }
-std::string cacheDir() { return homeDir() + "/.cache/pocketharness"; }
 std::string globalSkillDir() { return userConfigDir() + "/skills"; }
 std::string userSystemPath() { return userConfigDir() + "/system.md"; }
 std::string projectSystemPath(const std::string& workspace) {
@@ -255,27 +253,6 @@ Result<ResolvedModel> resolveModel(const Config& cfg, const std::string& spec) {
         }
     return Result<ResolvedModel>::Err("unknown model \"" + s +
                                       "\" (use provider:model, or a models{} alias)");
-}
-
-Result<UiState> loadUiState() {
-    UiState st;
-    if (access(statePath().c_str(), R_OK) != 0) return Result<UiState>::Ok(st);
-    auto t = readFileBounded(statePath(), 65536);
-    if (!t.ok) return Result<UiState>::Ok(st);  // corrupt state is not fatal
-    auto v = json::parse(t.value);
-    if (!v.ok) return Result<UiState>::Ok(st);
-    st.lastModel = v.value.at("last_model").asStr();
-    st.thinking = v.value.at("thinking").asStr();
-    return Result<UiState>::Ok(st);
-}
-
-VoidResult saveUiState(const UiState& st) {
-    auto r = ensureDir(stateDir());
-    if (!r.ok) return r;
-    json::Object o;
-    o["last_model"] = json::Value(st.lastModel);
-    o["thinking"] = json::Value(st.thinking);
-    return atomicWriteFile(statePath(), json::stringify(json::Value(o), true) + "\n", 0600);
 }
 
 }  // namespace pocket

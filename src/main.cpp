@@ -215,34 +215,17 @@ int pocketMain(int argc, char** argv) {
         }
     }
 
-    // --- model + thinking (last explicit selection wins, then CLI, then config) ---
-    UiState ui = loadUiState().value;
-    if (!modelSpec.empty() || !thinkingCli.empty()) {
-        if (!modelSpec.empty()) ui.lastModel = modelSpec;
-        if (!thinkingCli.empty()) {
-            std::string t = toLower(thinkingCli);
-            if (t != "off" && t != "low" && t != "medium" && t != "high" && t != "max") {
-                fprintf(stderr, "pocket: bad --thinking (off|low|medium|high|max)\n");
-                return 2;
-            }
-            ui.thinking = t;
+    auto thinkOk = [](const std::string& t) {
+        return t == "off" || t == "low" || t == "medium" || t == "high" || t == "max";
+    };
+    std::string thinkingFlag;
+    if (!thinkingCli.empty()) {
+        thinkingFlag = toLower(thinkingCli);
+        if (!thinkOk(thinkingFlag)) {
+            fprintf(stderr, "pocket: bad --thinking (off|low|medium|high|max)\n");
+            return 2;
         }
-        saveUiState(ui);
     }
-    std::string wantModel = !modelSpec.empty() ? modelSpec : ui.lastModel;
-    auto rmR = resolveModel(cfg, wantModel);
-    if (!rmR.ok && !wantModel.empty() && wantModel != cfg.defaultModel) {
-        fprintf(stderr, "pocket: %s; falling back to default\n", rmR.error.c_str());
-        rmR = resolveModel(cfg, "");
-    }
-    if (!rmR.ok) {
-        fprintf(stderr, "pocket: %s\n", rmR.error.c_str());
-        return 1;
-    }
-    ResolvedModel model = rmR.value;
-    std::string thinking = !thinkingCli.empty() ? toLower(thinkingCli)
-                           : !ui.thinking.empty() ? ui.thinking
-                                                  : cfg.thinking;
 
     if (listSessions) {
         auto list = sessionList();
@@ -255,19 +238,8 @@ int pocketMain(int argc, char** argv) {
         return 0;
     }
 
-    if (!curlAvailable()) {
-        fprintf(stderr, "pocket: the `curl` executable is required but not runnable\n");
-        return 1;
-    }
-
-    // --- authority + session ---
-    auto authR = authorityInit(workspace, cfg.allowRead, cfg.allowWrite, optUnsafe);
-    if (!authR.ok) {
-        fprintf(stderr, "pocket: %s\n", authR.error.c_str());
-        return 1;
-    }
-    Authority auth = authR.value;
-
+    // --- session first: resume restores its own model/thinking, so
+    // concurrent sessions never observe each other (no shared UI state). ---
     std::string sessionId;
     if (resume) {
         auto s = sessionResolve(resumeId);
@@ -284,6 +256,35 @@ int pocketMain(int argc, char** argv) {
         }
         sessionId = s.value;
     }
+    SessionMeta sm = sessionLoadMeta(sessionId).value;
+
+    // --- model + thinking: explicit CLI wins, then this session, then config ---
+    std::string wantModel = !modelSpec.empty() ? modelSpec : sm.modelSpec;
+    auto rmR = resolveModel(cfg, wantModel);
+    if (!rmR.ok && !wantModel.empty() && wantModel != cfg.defaultModel) {
+        fprintf(stderr, "pocket: %s; falling back to default\n", rmR.error.c_str());
+        rmR = resolveModel(cfg, "");
+    }
+    if (!rmR.ok) {
+        fprintf(stderr, "pocket: %s\n", rmR.error.c_str());
+        return 1;
+    }
+    ResolvedModel model = rmR.value;
+    std::string thinking = !thinkingFlag.empty() ? thinkingFlag : sm.thinking;
+    if (!thinkOk(thinking)) thinking = cfg.thinking;
+
+    if (!curlAvailable()) {
+        fprintf(stderr, "pocket: the `curl` executable is required but not runnable\n");
+        return 1;
+    }
+
+    // --- authority ---
+    auto authR = authorityInit(workspace, cfg.allowRead, cfg.allowWrite, optUnsafe);
+    if (!authR.ok) {
+        fprintf(stderr, "pocket: %s\n", authR.error.c_str());
+        return 1;
+    }
+    Authority auth = authR.value;
 
     // --- session scratch: TMPDIR, fake HOME, provider key file ---
     std::string tmpBase = getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
@@ -349,18 +350,12 @@ int pocketMain(int argc, char** argv) {
     if (resume) {
         auto r = agent.restore(sessionId);
         if (!r.ok) fprintf(stderr, "pocket: resume note: %s\n", r.error.c_str());
-        // A resumed session keeps the model it was created with (when that
-        // model still resolves); an explicit -m wins over history.
-        if (modelSpec.empty()) {
-            std::string sessModel = sessionLoadMeta(sessionId).value.modelSpec;
-            if (!sessModel.empty()) {
-                auto sm = resolveModel(cfg, sessModel);
-                if (sm.ok) {
-                    model = sm.value;
-                    agent.setModel(model, thinking);
-                }
-            }
-        }
+    }
+    if (!modelSpec.empty() || !thinkingCli.empty()) {
+        SessionMeta m = sessionLoadMeta(sessionId).value;
+        if (!modelSpec.empty()) m.modelSpec = model.spec;
+        if (!thinkingCli.empty()) m.thinking = thinking;
+        sessionSaveMeta(sessionId, m);
     }
 
     std::string sysSrc = sessionLoadMeta(sessionId).value.systemSource;

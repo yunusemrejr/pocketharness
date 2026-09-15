@@ -16,8 +16,6 @@ std::string userConfigDir();    // ~/.config/pocketharness
 std::string userConfigPath();   // ~/.config/pocketharness/config.json
 std::string stateDir();         // ~/.local/share/pocketharness
 std::string sessionDir();       // ~/.local/share/pocketharness/sessions
-std::string statePath();        // ~/.local/share/pocketharness/state.json
-std::string cacheDir();         // ~/.cache/pocketharness
 std::string globalSkillDir();   // ~/.config/pocketharness/skills
 std::string userSystemPath();   // ~/.config/pocketharness/system.md (optional override)
 std::string projectSystemPath(const std::string& workspace);  // <ws>/.pocket/system.md
@@ -69,14 +67,6 @@ Result<Config> loadConfig(const std::string& workspace);
 
 // Resolve "alias" | "provider:model" | "provider:model@routing" | "" (default).
 Result<ResolvedModel> resolveModel(const Config& cfg, const std::string& spec);
-
-// Last explicitly selected model/thinking, persisted across sessions.
-struct UiState {
-    std::string lastModel;  // spec string
-    std::string thinking;
-};
-Result<UiState> loadUiState();
-VoidResult saveUiState(const UiState& st);
 
 // Built-in provider defaults used when no user config exists.
 Config defaultConfig();

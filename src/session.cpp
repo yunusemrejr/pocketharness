@@ -136,6 +136,7 @@ Result<SessionMeta> sessionLoadMeta(const std::string& id) {
     m.orSessionId = v.value.at("or_session_id").asStr();
     m.modelSpec = v.value.at("model").asStr();
     m.systemSource = v.value.at("system_source").asStr();
+    m.thinking = v.value.at("thinking").asStr();
     m.turns = v.value.at("turns").asInt(0);
     m.toolCalls = v.value.at("tool_calls").asInt(0);
     m.compactions = v.value.at("compactions").asInt(0);
@@ -159,6 +160,7 @@ VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m) {
     o["or_session_id"] = json::Value(m.orSessionId);
     o["model"] = json::Value(m.modelSpec);
     o["system_source"] = json::Value(m.systemSource);
+    o["thinking"] = json::Value(m.thinking);
     o["turns"] = json::Value((double)m.turns);
     o["tool_calls"] = json::Value((double)m.toolCalls);
     o["compactions"] = json::Value((double)m.compactions);

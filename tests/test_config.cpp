@@ -78,15 +78,4 @@ TEST(config_Invalid) {
     return "";
 }
 
-TEST(config_UiState_Roundtrip) {
-    std::string home = makeTempDir("pocket-state");
-    CHECK(!home.empty());
-    HomeGuard hg(home);
-    CHECK(saveUiState(UiState{"a:b@c", "high"}).ok);
-    auto s = loadUiState();
-    CHECK(s.ok);
-    CHECK_EQ(s.value.lastModel, std::string("a:b@c"));
-    CHECK_EQ(s.value.thinking, std::string("high"));
-    rmRf(home);
-    return "";
-}
+

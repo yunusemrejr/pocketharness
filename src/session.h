@@ -57,6 +57,7 @@ struct SessionMeta {
     std::string orSessionId;   // stable OpenRouter sticky-routing id
     std::string modelSpec;     // model active at creation (restored on resume)
     std::string systemSource;  // "" = built-in base prompt, else override path
+    std::string thinking;  // this session's level ("" = config default)
     // Cumulative counters (restored on resume so /session tells the truth).
     long turns = 0, toolCalls = 0, compactions = 0;
     long inTokens = 0, outTokens = 0, cacheHit = 0, cacheMiss = 0, genMs = 0;
