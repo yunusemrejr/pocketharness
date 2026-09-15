@@ -35,7 +35,8 @@ struct ModelCfg {
     std::string provider;   // provider name
     std::string model;      // wire model id
     std::string routing;    // e.g. "deepinfra" for OpenRouter order ("" = auto)
-    long context = 200000;  // context window tokens
+    long context = 200000;  // context window tokens (guess unless contextSet)
+    bool contextSet = false;  // true only when "context" appears in config
 };
 
 struct Config {
@@ -45,7 +46,7 @@ struct Config {
     std::vector<ModelCfg> models;
     // Security-relevant knobs. Only the USER config may grant authority;
     // project config values for these are ignored (see config.cpp).
-    bool toolNetwork = false;
+    bool toolNetwork = true;  // model tools may use the network unless denied
     int bashTimeoutSec = 120;
     long outputLimitBytes = 262144;  // 256 KiB per tool result
     std::vector<std::string> allowRead;
@@ -67,6 +68,11 @@ Result<Config> loadConfig(const std::string& workspace);
 
 // Resolve "alias" | "provider:model" | "provider:model@routing" | "" (default).
 Result<ResolvedModel> resolveModel(const Config& cfg, const std::string& spec);
+
+// True when an alias pins an explicit context for this provider+model id
+// (explicit config wins over dynamic /models lookup).
+bool hasExplicitContext(const Config& cfg, const std::string& provider,
+                        const std::string& model);
 
 // Built-in provider defaults used when no user config exists.
 Config defaultConfig();

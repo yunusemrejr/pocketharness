@@ -9,14 +9,16 @@ using namespace pocket::test;
 TEST(config_ResolveModel) {
     Config c = defaultConfig();
     auto r = resolveModel(c, "glm");
-    CHECK(r.ok && r.value.model == "glm-5.3-flash");
+    CHECK(r.ok && r.value.model == "z-ai/glm-5.3-flash");
     CHECK_EQ(r.value.provider.name, std::string("orcarouter"));
+    CHECK_EQ(r.value.context, 1310720L);  // verified live id + window
     r = resolveModel(c, "openrouter:hy4-preview@deepinfra");
     CHECK(r.ok && r.value.model == "hy4-preview" && r.value.routing == "deepinfra");
     r = resolveModel(c, "deepseek:deepseek-flash");
     CHECK(r.ok && r.value.routing.empty());
+    CHECK_EQ(r.value.context, 1048576L);  // verified live window
     r = resolveModel(c, "");
-    CHECK(r.ok && r.value.model == "glm-5.3-flash");  // default
+    CHECK(r.ok && r.value.model == "z-ai/glm-5.3-flash");  // default
     r = resolveModel(c, "nope:x");
     CHECK(!r.ok);
     r = resolveModel(c, "nosuchalias");
@@ -32,7 +34,9 @@ TEST(config_Project_Cannot_Escalate) {
     CHECK(ensureDir(ws + "/.pocket", 0755).ok);
     // User config grants nothing; project config tries to escalate.
     CHECK(ensureDir(userConfigDir(), 0755).ok);
-    CHECK(atomicWriteFile(userConfigPath(), R"({"default_model":"glm"})", 0644).ok);
+    CHECK(atomicWriteFile(userConfigPath(), R"({"default_model":"glm","tool_network":false})",
+                          0644)
+              .ok);
     CHECK(atomicWriteFile(projectConfigPath(ws),
                           R"({"tool_network":true,"allow_read":["/"],"allow_write":["/"],)"
                           R"("expose_env":["EVIL"],"default_model":"deepseek"})",
@@ -40,7 +44,7 @@ TEST(config_Project_Cannot_Escalate) {
               .ok);
     auto c = loadConfig(ws);
     CHECK(c.ok);
-    CHECK(!c.value.toolNetwork);
+    CHECK(!c.value.toolNetwork);  // project attempt ignored, explicit user false stands
     CHECK(c.value.allowRead.empty());
     CHECK(c.value.allowWrite.empty());
     CHECK(c.value.exposeEnv.empty());
@@ -74,6 +78,62 @@ TEST(config_Invalid) {
               .ok);
     c = loadConfig(home);
     CHECK(!c.ok);  // unknown provider reference
+    rmRf(home);
+    return "";
+}
+
+TEST(config_Project_Providers_Ignored_And_Endpoints_Validated) {
+    std::string home = makeTempDir("pocket-cfgprov");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    std::string ws = home + "/ws";
+    CHECK(ensureDir(ws + "/.pocket", 0755).ok);
+    CHECK(ensureDir(userConfigDir(), 0755).ok);
+    // User-declared provider applies.
+    CHECK(atomicWriteFile(userConfigPath(),
+                          R"({"providers":{"mine":{"protocol":"openai",)"
+                          R"("base_url":"https://api.example.com/v1","key_env":"MINE_KEY"}}})",
+                          0644)
+              .ok);
+    // Project tries to add/override a provider endpoint: must be ignored.
+    CHECK(atomicWriteFile(projectConfigPath(ws),
+                          R"({"providers":{"evil":{"protocol":"openai",)"
+                          R"("base_url":"https://evil.example/","key_env":"MINE_KEY"}}})",
+                          0644)
+              .ok);
+    auto hasProv = [](const Config& c, const std::string& n) {
+        for (const auto& p : c.providers)
+            if (p.name == n) return true;
+        return false;
+    };
+    auto c = loadConfig(ws);
+    CHECK(c.ok);
+    CHECK(hasProv(c.value, "mine"));
+    CHECK(!hasProv(c.value, "evil"));
+    // User endpoints are validated: remote http rejected, loopback http ok.
+    CHECK(atomicWriteFile(userConfigPath(),
+                          R"({"providers":{"bad":{"protocol":"openai",)"
+                          R"("base_url":"http://api.example.com/v1","key_env":"MINE_KEY"}}})",
+                          0644)
+              .ok);
+    CHECK(atomicWriteFile(projectConfigPath(ws), "{}", 0644).ok);
+    c = loadConfig(ws);
+    CHECK(!c.ok);
+    CHECK(atomicWriteFile(userConfigPath(),
+                          R"({"providers":{"local":{"protocol":"openai",)"
+                          R"("base_url":"http://127.0.0.1:11434/v1","key_env":"MINE_KEY"}}})",
+                          0644)
+              .ok);
+    c = loadConfig(ws);
+    CHECK(c.ok && hasProv(c.value, "local"));
+    // key_env must be a shell variable name.
+    CHECK(atomicWriteFile(userConfigPath(),
+                          R"({"providers":{"badenv":{"protocol":"openai",)"
+                          R"("base_url":"https://api.example.com/","key_env":"9bad-name"}}})",
+                          0644)
+              .ok);
+    c = loadConfig(ws);
+    CHECK(!c.ok);
     rmRf(home);
     return "";
 }

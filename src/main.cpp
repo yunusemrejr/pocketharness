@@ -37,7 +37,8 @@ void usage() {
         "  -p, --print PROMPT   non-interactive prompt (stdout = final answer)\n"
         "  --resume [id]        resume a session (interactive unless -p)\n"
         "  --sessions           list sessions and exit\n"
-        "  --network            allow network access for model bash commands\n"
+        "  --network            allow network access for tools (on by default)\n"
+        "  --no-network, --offline  deny network access for tools\n"
         "  --allow-read PATH    extra read root for native tools (repeatable)\n"
         "  --allow-write PATH   extra write root for native tools (repeatable)\n"
         "  --allow-destructive  -p mode: permit guard-flagged commands (explicit)\n"
@@ -51,10 +52,31 @@ void usage() {
         kVersion);
 }
 
-int myDepth() {
-    const char* d = getenv("POCKETHARNESS_DEPTH");
-    if (!d || !*d) return 0;
-    return atoi(d);
+// Parent state for a recursive `pocket`: depth, parent workspace and the net
+// grant. Read from $TMPDIR/pocket.parent (written by the parent into its
+// own 0700 sessionTmp), NEVER from env: env is model-visible and untrusted.
+// The file must be an euid-owned regular file, else it is ignored outright.
+struct ParentState {
+    int depth = 0;
+    std::string workspace;
+    bool net = false;
+};
+ParentState readParentState() {
+    ParentState ps;
+    const char* td = getenv("TMPDIR");
+    if (!td || !*td) return ps;
+    std::string p = std::string(td) + "/pocket.parent";
+    struct stat st;
+    if (lstat(p.c_str(), &st) != 0) return ps;
+    if (!S_ISREG(st.st_mode) || st.st_uid != geteuid()) return ps;
+    auto t = readFileBounded(p, 4096);
+    if (!t.ok) return ps;
+    for (const std::string& ln : splitLines(t.value)) {
+        if (startsWith(ln, "depth=")) ps.depth = atoi(ln.c_str() + 6);
+        else if (startsWith(ln, "workspace=")) ps.workspace = ln.substr(10);
+        else if (ln == "net=1") ps.net = true;
+    }
+    return ps;
 }
 
 bool startsWithDash(const std::string& s) { return !s.empty() && s[0] == '-'; }
@@ -85,7 +107,7 @@ int pocketMain(int argc, char** argv) {
     std::string thinkingCli;
     std::string resumeId;
     bool resume = false, listSessions = false;
-    bool optNetwork = false, optUnsafe = false, optAllowRoot = false;
+    bool optNetwork = false, optUnsafe = false, optAllowRoot = false, optNoNetwork = false;
     bool optAllowDestructive = false;
     bool optHelp = false, optVersion = false;
     std::vector<std::string> allowRead, allowWrite;
@@ -109,6 +131,7 @@ int pocketMain(int argc, char** argv) {
             if (i + 1 < argc && !startsWithDash(argv[i + 1])) resumeId = argv[++i];
         } else if (a == "--sessions") listSessions = true;
         else if (a == "--network") optNetwork = true;
+        else if (a == "--no-network" || a == "--offline") optNoNetwork = true;
         else if (a == "--unsafe") optUnsafe = true;
         else if (a == "--allow-root") optAllowRoot = true;
         else if (a == "--allow-destructive") optAllowDestructive = true;
@@ -143,17 +166,15 @@ int pocketMain(int argc, char** argv) {
     }
 
     // --- recursion guards (defense in depth; kernel confinement inherits) ---
-    int depth = myDepth();
+    ParentState ps = readParentState();
+    int depth = ps.depth;
     if (depth < 0) depth = 0;
     if (depth > kMaxPocketDepth) {
-        fprintf(stderr, "pocket: nesting too deep (POCKETHARNESS_DEPTH=%d, max %d)\n", depth,
-                kMaxPocketDepth);
+        fprintf(stderr, "pocket: nesting too deep (depth=%d, max %d)\n", depth, kMaxPocketDepth);
         return 1;
     }
-    const char* parentWsEnv = getenv("POCKETHARNESS_WORKSPACE");
-    std::string parentWs = parentWsEnv ? parentWsEnv : "";
-    bool parentNet = getenv("POCKETHARNESS_PARENT_NET") &&
-                     std::string(getenv("POCKETHARNESS_PARENT_NET")) == "1";
+    std::string parentWs = ps.workspace;
+    bool parentNet = ps.net;
     if (depth > 0) {
         if (optUnsafe) {
             fprintf(stderr, "pocket: --unsafe refused in a child instance (depth %d)\n", depth);
@@ -193,7 +214,10 @@ int pocketMain(int argc, char** argv) {
         return 1;
     }
     Config cfg = cfgR.value;
-    bool allowNet = cfg.toolNetwork || optNetwork;
+    bool allowNet = (cfg.toolNetwork || optNetwork) && !optNoNetwork;
+    // A child never out-networks its parent: under an --offline parent the
+    // default-on tool network stays off, whatever the child config says.
+    if (depth > 0 && !parentNet) allowNet = false;
     for (const auto& p : allowRead) cfg.allowRead.push_back(expandHome(p));
     for (const auto& p : allowWrite) cfg.allowWrite.push_back(expandHome(p));
     if (depth > 0 && !parentWs.empty()) {
@@ -286,7 +310,10 @@ int pocketMain(int argc, char** argv) {
     }
     Authority auth = authR.value;
 
-    // --- session scratch: TMPDIR, fake HOME, provider key file ---
+    // --- session scratch: TMPDIR, fake HOME, parent-state file ---
+    // No key material is ever staged here: this dir is child-visible, so it
+    // may only hold non-secret staging. Provider header files live in a
+    // per-request parent-only dir under the state dir (see provStaging).
     std::string tmpBase = getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
     std::string tmpTpl = tmpBase + "/pocket-" + sessionId + "-XXXXXX";
     std::vector<char> tpl(tmpTpl.begin(), tmpTpl.end());
@@ -299,31 +326,18 @@ int pocketMain(int argc, char** argv) {
     std::string sessionTmp = tpl.data();
     std::string sandboxHome = sessionTmp + "/home";
     ensureDir(sandboxHome, 0700);
-    std::string keyfile = sessionTmp + "/provider.env";
-    {
-        // Merge parent keyfile (recursive pocket) with our own env; env wins.
-        std::string content;
-        if (const char* pkf = getenv("POCKETHARNESS_KEYFILE")) {
-            if (pkf[0] && access(pkf, R_OK) == 0) {
-                auto t = readFileBounded(pkf, 65536);
-                if (t.ok) content = t.value;
-            }
-        }
-        for (const auto& p : cfg.providers) {
-            const char* v = getenv(p.keyEnv.c_str());
-            if (!v || !*v) continue;
-            std::string val(v);
-            if (val.find('\n') != std::string::npos) continue;
-            // Drop any older line for this name, then append.
-            std::string next;
-            for (const std::string& ln : splitLines(content)) {
-                if (ln.substr(0, ln.find('=')) != p.keyEnv && !trim(ln).empty())
-                    next += ln + "\n";
-            }
-            next += p.keyEnv + "=" + val + "\n";
-            content = next;
-        }
-        if (!content.empty()) atomicWriteFile(keyfile, content, 0600);
+    // Parent-state file for a recursive `pocket` (depth/workspace/net grant).
+    // Keys are deliberately NOT inherited: recursive instances authenticate
+    // via explicit expose_env passthrough only.
+    atomicWriteFile(sessionTmp + "/pocket.parent",
+                    "depth=" + std::to_string(depth + 1) + "\nworkspace=" + workspace +
+                        "\nnet=" + (allowNet ? "1" : "0") + "\n",
+                    0600);
+
+    // Live context window unless config pins one explicitly.
+    if (!hasExplicitContext(cfg, model.provider.name, model.model)) {
+        long live = fetchModelContext(model.provider, model.model);
+        if (live > 0) model.context = live;
     }
 
     ToolEnv tools;
@@ -332,9 +346,6 @@ int pocketMain(int argc, char** argv) {
     tools.workspace = workspace;
     tools.sessionTmp = sessionTmp;
     tools.sandboxHome = sandboxHome;
-    tools.sessionId = sessionId;
-    tools.keyfile = keyfile;
-    tools.depth = depth + 1;
     tools.allowNet = allowNet;
     tools.unsafe = optUnsafe;
     tools.interactive = prompt.empty();
@@ -345,7 +356,6 @@ int pocketMain(int argc, char** argv) {
     ao.thinking = thinking;
     ao.tools = &tools;
     ao.sessionId = sessionId;
-    ao.tmpDir = sessionTmp;
     Agent agent(ao);
     if (resume) {
         auto r = agent.restore(sessionId);
@@ -367,13 +377,20 @@ int pocketMain(int argc, char** argv) {
         std::atomic<bool> cancel{false};
         tools.cancel = &cancel;
         agent.setCancel(&cancel);
+        bool errTty = isatty(STDERR_FILENO);
         agent.setCallbacks(
             [&](std::string_view tok) {
                 std::string s = sanitizeTerminal(std::string(tok));
                 (void)!fwrite(s.data(), 1, s.size(), stdout);
                 fflush(stdout);
             },
-            [&](const std::string& note) { fprintf(stderr, "(%s)\n", note.c_str()); });
+            [&](const std::string& note) { fprintf(stderr, "(%s)\n", note.c_str()); },
+            [&](std::string_view chunk) {
+                // Thinking streams to stderr so stdout stays the pure answer.
+                std::string s = sanitizeTerminal(std::string(chunk));
+                if (errTty) s = "\033[2m" + s + "\033[0m";
+                (void)!fwrite(s.data(), 1, s.size(), stderr);
+            });
         tools.onEvent = [&](const std::string& line) { fprintf(stderr, "⚙ %s\n", line.c_str()); };
         tools.onToolDone = [&](const std::string& name, bool ok, const std::string&) {
             fprintf(stderr, "%s %s\n", ok ? "✓" : "✗", name.c_str());
@@ -397,7 +414,7 @@ int pocketMain(int argc, char** argv) {
         }
     } else {
         // --- interactive ---
-        if (getenv("POCKETHARNESS_DEPTH") && depth > 0 && !isatty(STDIN_FILENO)) {
+        if (depth > 0 && !isatty(STDIN_FILENO)) {
             fprintf(stderr, "pocket: child interactive session without a TTY; refusing\n");
             rc = 1;
         } else {

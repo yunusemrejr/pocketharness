@@ -48,9 +48,16 @@ install: $(BIN)
 	install -m 0755 $(BIN) $(BINDIR)/pocket
 	@echo "installed $(BINDIR)/pocket"
 
+# Optional: copy the bundled skills into the user skill dir. Never runs as
+# part of `install`: skills are user configuration, not program files.
+install-skills:
+	mkdir -p $(HOME)/.config/pocketharness/skills
+	cp -r skills/* $(HOME)/.config/pocketharness/skills/
+	@echo "installed skills to $(HOME)/.config/pocketharness/skills"
+
 clean:
 	rm -f $(OBJ) $(BIN) $(TEST_OBJ) $(TEST_BIN) $(OBJ:.o=.d) $(TEST_OBJ:.o=.d)
 
 -include $(OBJ:.o=.d) $(TEST_OBJ:.o=.d)
 
-.PHONY: all test sanitize install clean
+.PHONY: all test sanitize install install-skills clean

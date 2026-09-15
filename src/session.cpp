@@ -145,6 +145,7 @@ Result<SessionMeta> sessionLoadMeta(const std::string& id) {
     m.cacheHit = v.value.at("cache_hit").asInt(0);
     m.cacheMiss = v.value.at("cache_miss").asInt(0);
     m.genMs = v.value.at("gen_ms").asInt(0);
+    m.lastPrompt = v.value.at("last_prompt").asInt(-1);
     m.cost = v.value.at("cost").asNum(0);
     m.cacheSeen = v.value.at("cache_seen").asBool(false);
     m.costSeen = v.value.at("cost_seen").asBool(false);
@@ -169,6 +170,7 @@ VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m) {
     o["cache_hit"] = json::Value((double)m.cacheHit);
     o["cache_miss"] = json::Value((double)m.cacheMiss);
     o["gen_ms"] = json::Value((double)m.genMs);
+    o["last_prompt"] = json::Value((double)m.lastPrompt);
     o["cost"] = json::Value(m.cost);
     o["cache_seen"] = json::Value(m.cacheSeen);
     o["cost_seen"] = json::Value(m.costSeen);

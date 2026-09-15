@@ -132,8 +132,7 @@ TEST(sandbox_Env_Sanitized) {
     EnvGuard g2("POCKETTEST_TOKEN", "tok");
     EnvGuard g3("AWS_SECRET_ACCESS_KEY", "aws");
     EnvGuard g4("MYAPP_MODE", "debug");
-    auto env = buildChildEnv({"MYAPP_MODE"}, "/ws", "/tmp/x", "/tmp/x/home", "/tmp/x/kf", "s1",
-                             1, false, false);
+    auto env = buildChildEnv({"MYAPP_MODE"}, "/ws", "/tmp/x", "/tmp/x/home");
     auto has = [&](const std::string& prefix) {
         for (const auto& kv : env)
             if (kv.compare(0, prefix.size(), prefix) == 0) return true;
@@ -144,7 +143,13 @@ TEST(sandbox_Env_Sanitized) {
     CHECK(!has("AWS_SECRET_ACCESS_KEY="));
     CHECK(has("MYAPP_MODE=debug"));  // explicit expose works
     CHECK(has("PWD=/ws") && has("TMPDIR=/tmp/x") && has("HOME=/tmp/x/home"));
-    CHECK(has("POCKETHARNESS_DEPTH=1"));
+    CHECK(has("POCKETHARNESS=1"));
+    // No trusted state via env: depth/session/keyfile/parent flags are gone.
+    CHECK(!has("POCKETHARNESS_DEPTH="));
+    CHECK(!has("POCKETHARNESS_SESSION="));
+    CHECK(!has("POCKETHARNESS_KEYFILE="));
+    CHECK(!has("POCKETHARNESS_PARENT_NET="));
+    CHECK(!has("POCKETHARNESS_WORKSPACE="));
     CHECK(has("PATH="));
     CHECK(looksSecretEnv("OPENROUTER_API_KEY") && looksSecretEnv("GITHUB_TOKEN") &&
           looksSecretEnv("AWS_REGION") && !looksSecretEnv("PATH"));
@@ -208,15 +213,13 @@ TEST(sandbox_Child_Landlock_And_NoNewPrivs) {
     cs.auth = &g_auth;
     cs.workspace = g_auth.workspace;
     cs.sessionTmp = tmp;
-    cs.stateDirPath = tmp + "/state";
     cs.allowNet = true;  // isolate the fs test from seccomp here
     // Outside read must fail; inside read must work.
     for (int i = 0; i < 2; ++i) {
         SpawnOpts o;
         o.exe = "/bin/cat";
         o.argv = {"cat", i == 0 ? (g_outside + "/secret.txt") : (g_ws + "/hello.txt")};
-        o.env = buildChildEnv({}, g_auth.workspace, tmp, tmp + "/home", tmp + "/kf", "t", 1,
-                              true, false);
+        o.env = buildChildEnv({}, g_auth.workspace, tmp, tmp + "/home");
         o.childSetup = [cs]() { childEnterSandbox(cs); };
         SpawnResult r = spawn(o);
         if (i == 0) {
@@ -230,8 +233,7 @@ TEST(sandbox_Child_Landlock_And_NoNewPrivs) {
         SpawnOpts o;
         o.exe = "/bin/sh";
         o.argv = {"sh", "-c", "grep NoNewPrivs /proc/self/status"};
-        o.env = buildChildEnv({}, g_auth.workspace, tmp, tmp + "/home", tmp + "/kf", "t", 1,
-                              true, false);
+        o.env = buildChildEnv({}, g_auth.workspace, tmp, tmp + "/home");
         o.childSetup = [cs]() { childEnterSandbox(cs); };
         SpawnResult r = spawn(o);
         CHECK(r.ok && r.out.find("NoNewPrivs:\t1") != std::string::npos);
@@ -261,8 +263,7 @@ TEST(sandbox_Child_DevNodes_Usable) {
               "echo hi > /dev/null && echo RES-NULL-W-OK; "
               "exec 3<>/dev/null && echo RES-NULL-RDWR-OK; "
               "head -c 1 /dev/zero | wc -c | grep -q 1 && echo RES-ZERO-OK"};
-    o.env = buildChildEnv({}, g_auth.workspace, tmp, tmp + "/home", tmp + "/kf", "t", 1,
-                          true, false);
+    o.env = buildChildEnv({}, g_auth.workspace, tmp, tmp + "/home");
     o.childSetup = [cs]() { childEnterSandbox(cs); };
     SpawnResult r = spawn(o);
     CHECK(r.ok && r.exitCode == 0);
@@ -300,13 +301,33 @@ TEST(sandbox_Child_Net_Denied) {
               "try:\n"
               " socket.socket(socket.AF_UNIX); print('RES-UNIX-'+'OK')\n"
               "except OSError as e: print('RES-UNIX-BLOCKED', e)\" 2>&1"};
-    o.env = buildChildEnv({}, g_auth.workspace, tmp, tmp + "/home", tmp + "/kf", "t", 1, false,
-                          false);
+    o.env = buildChildEnv({}, g_auth.workspace, tmp, tmp + "/home");
     o.childSetup = [cs]() { childEnterSandbox(cs); };
     SpawnResult r = spawn(o);
     CHECK(r.out.find("RES-INET-ALLOWED") == std::string::npos);  // blocked
     CHECK(r.out.find("RES-INET-BLOCKED") != std::string::npos);
     CHECK(r.out.find("RES-UNIX-OK") != std::string::npos);  // unix sockets fine
     rmRf(tmp);
+    return "";
+}
+
+TEST(sandbox_Write_Preserves_Exec_Bit) {
+    std::string e = setup();
+    CHECK(e.empty());
+    CHECK(boxWrite(g_auth, "sub/tool.sh", "#!/bin/sh\necho one\n", 0755).ok);
+    struct stat st;
+    CHECK(stat((g_ws + "/sub/tool.sh").c_str(), &st) == 0);
+    CHECK(st.st_mode & S_IXUSR);
+    // Overwriting with a plain 0644 request must keep the script executable.
+    CHECK(boxWrite(g_auth, "sub/tool.sh", "#!/bin/sh\necho two\n", 0644).ok);
+    CHECK(stat((g_ws + "/sub/tool.sh").c_str(), &st) == 0);
+    CHECK(st.st_mode & S_IXUSR);
+    auto back = boxRead(g_auth, "sub/tool.sh", 100);
+    CHECK(back.ok && back.value.find("two") != std::string::npos);
+    // Fresh non-script files stay non-executable; dirs are rejected.
+    CHECK(boxWrite(g_auth, "sub/plain.txt", "x", 0644).ok);
+    CHECK(stat((g_ws + "/sub/plain.txt").c_str(), &st) == 0);
+    CHECK(!(st.st_mode & S_IXUSR));
+    CHECK(!boxWrite(g_auth, "sub/", "x", 0644).ok);
     return "";
 }

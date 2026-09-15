@@ -13,6 +13,19 @@ namespace pocket {
 
 namespace {
 
+std::vector<std::string> splitWords(const std::string& s) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        while (i < s.size() && isspace((unsigned char)s[i])) ++i;
+        size_t j = i;
+        while (j < s.size() && !isspace((unsigned char)s[j])) ++j;
+        if (j > i) out.push_back(s.substr(i, j - i));
+        i = j;
+    }
+    return out;
+}
+
 void scanDir(const std::string& dir, const std::string& source, std::vector<SkillMeta>& out) {
     DIR* d = opendir(dir.c_str());
     if (!d) return;
@@ -79,11 +92,30 @@ std::vector<SkillMeta> skillDiscover(const std::string& workspace) {
 std::vector<SkillMeta> skillSearch(const std::vector<SkillMeta>& all, const std::string& query) {
     std::string q = toLower(trim(query));
     if (q.empty()) return all;
-    std::vector<SkillMeta> out;
+    // Token-overlap ranking: every query word scores where it hits, with
+    // name hits weighing most. At least one token must match.
+    std::vector<std::string> toks;
+    for (const std::string& w : splitWords(q))
+        if (w.size() > 1) toks.push_back(w);
+    if (toks.empty()) toks.push_back(q);
+    std::vector<std::pair<long, SkillMeta>> scored;
     for (const auto& m : all) {
-        std::string hay = toLower(m.name + "\n" + m.heading + "\n" + m.preview);
-        if (hay.find(q) != std::string::npos) out.push_back(m);
+        std::string name = toLower(m.name), head = toLower(m.heading),
+                    prev = toLower(m.preview);
+        long score = 0;
+        for (const auto& t : toks) {
+            if (name.find(t) != std::string::npos) score += 10;
+            if (head.find(t) != std::string::npos) score += 4;
+            if (prev.find(t) != std::string::npos) score += 1;
+        }
+        if (score > 0) scored.emplace_back(score, m);
     }
+    std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second.name < b.second.name;
+    });
+    std::vector<SkillMeta> out;
+    for (auto& s : scored) out.push_back(std::move(s.second));
     return out;
 }
 

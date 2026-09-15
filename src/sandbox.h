@@ -47,6 +47,7 @@ void authorityClose(Authority& a);
 // Contained file operations for the native tools.
 Result<std::string> boxRead(const Authority& a, const std::string& path, size_t maxBytes);
 // Atomic write (tmp + rename). Creates parent dirs inside the owning root.
+// Preserves the owner-execute bit when overwriting an executable file.
 VoidResult boxWrite(const Authority& a, const std::string& path,
                     const std::string& data, mode_t mode = 0644);
 Result<bool> boxExists(const Authority& a, const std::string& path);
@@ -56,20 +57,30 @@ Result<bool> boxExists(const Authority& a, const std::string& path);
 struct ChildSpec {
     const Authority* auth = nullptr;
     std::string workspace;
-    std::string sessionTmp;    // RW scratch (also contains the fake HOME)
-    std::string stateDirPath;  // RW (own sessions/state)
+    std::string sessionTmp;   // RW scratch (also contains the fake HOME)
+    std::string providerTmp;  // RW staging dir, provider curl only (parent-owned 0700)
     bool allowNet = false;
     bool unsafe = false;
-    bool providerCurl = false;  // trusted harness networking: skip confinement
+    // Trusted harness networking: minimal Landlock/seccomp profile instead of
+    // the full tool profile (system RO + staging RW, network allowed).
+    bool providerCurl = false;
 };
 void childEnterSandbox(const ChildSpec& spec);
 
 // Build the sanitized child environment (complete "K=V" list).
+// Carries NO secrets and NO trusted harness state: no keyfile, no session
+// id, no depth, no parent flags. A recursive `pocket` reads parent state
+// (depth/workspace/net) from $TMPDIR/pocket.parent instead; keys flow only
+// via explicit expose_env passthrough.
 std::vector<std::string> buildChildEnv(const std::vector<std::string>& exposeEnv,
                                        const std::string& workspace,
-                                       const std::string& tmpdir, const std::string& home,
-                                       const std::string& keyfile, const std::string& sessionId,
-                                       int depth, bool parentNet, bool parentUnsafe);
+                                       const std::string& tmpdir, const std::string& home);
+
+// Keep only PATH entries the sandbox can actually execute (Landlock would
+// deny the rest with a confusing exit 126). Empty entries mean the child
+// cwd, i.e. the workspace. Exposed for tests.
+std::string filterChildPath(const char* path, const std::string& workspace,
+                            const std::string& tmpdir);
 
 // True when an env name looks credential-like (defense in depth; the
 // allowlist already drops everything not explicitly permitted).

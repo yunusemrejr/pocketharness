@@ -88,6 +88,10 @@ SpawnResult spawn(const SpawnOpts& opts) {
         _exit(127);
     }
     // ---- parent ----
+    // Move the child into its own group NOW (the child does the same): without
+    // this, kill(-pid) below could fire before the child's setpgid and hit
+    // our own process group. Errors are harmless (child may have exited).
+    setpgid(pid, pid);
     close(pin[0]);
     close(pout[1]);
     close(perr[1]);

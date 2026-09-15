@@ -24,7 +24,7 @@ std::string projectSkillDir(const std::string& workspace) {
 
 Config defaultConfig() {
     Config c;
-    c.defaultModel = "orcarouter:glm-5.3-flash";
+    c.defaultModel = "orcarouter:z-ai/glm-5.3-flash";
     c.providers = {
         {"orcarouter", "openai", "https://api.orcarouter.ai/v1", "ORCAROUTER_API_KEY"},
         {"openrouter", "openai", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"},
@@ -34,9 +34,11 @@ Config defaultConfig() {
         {"deepinfra", "openai", "https://api.deepinfra.com/v1/openai", "DEEPINFRA_API_KEY"},
         {"anthropic", "anthropic", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY"},
     };
+    // Built-in ids + windows verified against live provider /models listings
+    // and the OpenRouter catalog (ids must exist; windows must match).
     c.models = {
-        {"glm", "orcarouter", "glm-5.3-flash", "", 200000},
-        {"deepseek", "deepseek", "deepseek-chat", "", 128000},
+        {"glm", "orcarouter", "z-ai/glm-5.3-flash", "", 1310720, true},
+        {"deepseek", "deepseek", "deepseek-flash", "", 1048576, true},
     };
     return c;
 }
@@ -47,6 +49,24 @@ const ProviderCfg* findProvider(const Config& c, const std::string& name) {
     for (const auto& p : c.providers)
         if (p.name == name) return &p;
     return nullptr;
+}
+
+bool validEnvName(const std::string& n) {
+    if (n.empty() || !(n[0] == '_' || isalpha((unsigned char)n[0]))) return false;
+    for (char c : n)
+        if (!(c == '_' || isalnum((unsigned char)c))) return false;
+    return true;
+}
+
+// https anywhere; plain http only for loopback (local Ollama-style daemons).
+bool validProviderUrl(const std::string& u) {
+    if (startsWith(u, "https://")) return true;
+    if (!startsWith(u, "http://")) return false;
+    std::string host = u.substr(7);
+    size_t end = host.find_first_of("/:");
+    if (end != std::string::npos) host = host.substr(0, end);
+    return host == "localhost" || startsWith(host, "127.") || host == "::1" ||
+           host == "[::1]";
 }
 
 // Parse one config JSON object into cfg. If isProject is true, security
@@ -73,32 +93,46 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
         cfg.thinking = t;
     }
     if (v.has("providers")) {
-        const auto& p = o.at("providers");
-        if (!p.isObj()) return typeErr("providers", "an object");
-        for (const auto& kv : p.asObj()) {
-            if (!kv.second.isObj())
-                return VoidResult::Err("provider \"" + kv.first + "\" must be an object");
-            ProviderCfg pc;
-            pc.name = kv.first;
-            pc.protocol = kv.second.at("protocol").asStr().empty()
-                              ? "openai"
-                              : toLower(kv.second.at("protocol").asStr());
-            if (pc.protocol != "openai" && pc.protocol != "anthropic")
-                return VoidResult::Err("provider \"" + kv.first +
-                                       "\": protocol must be \"openai\" or \"anthropic\"");
-            pc.baseUrl = kv.second.at("base_url").asStr();
-            if (pc.baseUrl.empty())
-                return VoidResult::Err("provider \"" + kv.first + "\" needs \"base_url\"");
-            pc.keyEnv = kv.second.at("key_env").asStr();
-            if (pc.keyEnv.empty())
-                return VoidResult::Err("provider \"" + kv.first + "\" needs \"key_env\"");
-            bool replaced = false;
-            for (auto& e : cfg.providers)
-                if (e.name == pc.name) {
-                    e = pc;
-                    replaced = true;
-                }
-            if (!replaced) cfg.providers.push_back(std::move(pc));
+        // Provider endpoints control where keys are sent: a hostile checkout
+        // must never be able to redirect them. User config only.
+        if (isProject) {
+            projWarn += "ignoring project config key \"providers\" (user config only: "
+                        "endpoints decide where API keys go)\n";
+        } else {
+            const auto& p = o.at("providers");
+            if (!p.isObj()) return typeErr("providers", "an object");
+            for (const auto& kv : p.asObj()) {
+                if (!kv.second.isObj())
+                    return VoidResult::Err("provider \"" + kv.first + "\" must be an object");
+                ProviderCfg pc;
+                pc.name = kv.first;
+                pc.protocol = kv.second.at("protocol").asStr().empty()
+                                  ? "openai"
+                                  : toLower(kv.second.at("protocol").asStr());
+                if (pc.protocol != "openai" && pc.protocol != "anthropic")
+                    return VoidResult::Err("provider \"" + kv.first +
+                                           "\": protocol must be \"openai\" or \"anthropic\"");
+                pc.baseUrl = kv.second.at("base_url").asStr();
+                if (pc.baseUrl.empty())
+                    return VoidResult::Err("provider \"" + kv.first + "\" needs \"base_url\"");
+                if (!validProviderUrl(pc.baseUrl))
+                    return VoidResult::Err("provider \"" + kv.first +
+                                           "\": base_url must be https, or http loopback "
+                                           "(localhost/127./::1 for local daemons)");
+                pc.keyEnv = kv.second.at("key_env").asStr();
+                if (pc.keyEnv.empty())
+                    return VoidResult::Err("provider \"" + kv.first + "\" needs \"key_env\"");
+                if (!validEnvName(pc.keyEnv))
+                    return VoidResult::Err("provider \"" + kv.first +
+                                           "\": key_env must be a shell variable name");
+                bool replaced = false;
+                for (auto& e : cfg.providers)
+                    if (e.name == pc.name) {
+                        e = pc;
+                        replaced = true;
+                    }
+                if (!replaced) cfg.providers.push_back(std::move(pc));
+            }
         }
     }
     if (v.has("models")) {
@@ -112,7 +146,10 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
             mc.provider = kv.second.at("provider").asStr();
             mc.model = kv.second.at("model").asStr();
             mc.routing = kv.second.at("routing").asStr();
-            mc.context = kv.second.at("context").asInt(200000);
+            if (kv.second.has("context")) {
+                mc.context = kv.second.at("context").asInt(200000);
+                mc.contextSet = true;
+            }
             if (mc.provider.empty() || mc.model.empty())
                 return VoidResult::Err("model \"" + kv.first +
                                        "\" needs \"provider\" and \"model\"");
@@ -230,10 +267,10 @@ Result<ResolvedModel> resolveModel(const Config& cfg, const std::string& spec) {
         }
         if (rm.model.empty()) return Result<ResolvedModel>::Err("empty model id in \"" + s + "\"");
         rm.spec = s;
-        rm.context = 200000;
-        // Inherit context size from a matching alias if one exists.
+        rm.context = 200000;  // last resort; dynamic /models lookup refines this
+        // Inherit context size from a matching alias with explicit context.
         for (const auto& m : cfg.models)
-            if (m.provider == pname && m.model == rm.model) {
+            if (m.contextSet && m.provider == pname && m.model == rm.model) {
                 rm.context = m.context;
                 break;
             }
@@ -253,6 +290,13 @@ Result<ResolvedModel> resolveModel(const Config& cfg, const std::string& spec) {
         }
     return Result<ResolvedModel>::Err("unknown model \"" + s +
                                       "\" (use provider:model, or a models{} alias)");
+}
+
+bool hasExplicitContext(const Config& cfg, const std::string& provider,
+                        const std::string& model) {
+    for (const auto& m : cfg.models)
+        if (m.contextSet && m.provider == provider && m.model == model) return true;
+    return false;
 }
 
 }  // namespace pocket

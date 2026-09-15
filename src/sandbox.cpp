@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -323,7 +324,8 @@ bool resolveModelPath(const std::vector<std::string>& roots, const std::string& 
         }
         (void)dummy;
         if (bestIdx < 0) {
-            err = "path escapes allowed roots: " + p;
+            err = "path escapes allowed roots: " + p +
+                  " (pocket --allow-read/--allow-write <root> permits more)";
             return false;
         }
         out.rootIdx = bestIdx;
@@ -414,6 +416,8 @@ VoidResult boxWrite(const Authority& a, const std::string& path, const std::stri
     std::string err;
     if (!resolveModelPath(a.writeRoots, path, rs, err))
         return VoidResult::Err("write denied: " + err);
+    if (!path.empty() && path.back() == '/')
+        return VoidResult::Err("write denied: not a file: " + path);
     const std::string& leaf = rs.comps.back();
     if (leaf == "." || leaf == ".." || leaf.empty())
         return VoidResult::Err("write denied: invalid name");
@@ -423,11 +427,13 @@ VoidResult boxWrite(const Authority& a, const std::string& path, const std::stri
     // Refuse to replace a symlink, even though rename would stay contained:
     // silently swapping a link for a file hides what the model really did.
     struct stat leafSt;
-    if (fstatat(dirfd, leaf.c_str(), &leafSt, AT_SYMLINK_NOFOLLOW) == 0 &&
-        S_ISLNK(leafSt.st_mode)) {
+    bool haveSt = fstatat(dirfd, leaf.c_str(), &leafSt, AT_SYMLINK_NOFOLLOW) == 0;
+    if (haveSt && S_ISLNK(leafSt.st_mode)) {
         close(dirfd);
         return VoidResult::Err("write denied: '" + leaf + "' is a symlink");
     }
+    // Overwriting a script must not strip its executable bit.
+    if (haveSt && S_ISREG(leafSt.st_mode) && (leafSt.st_mode & S_IXUSR)) mode |= 0111;
     // Tmp file + rename inside the same directory (atomic for readers).
     std::string tmp = ".pocket-tmp-" + randHex(4);
     int fd;
@@ -627,14 +633,21 @@ int landlockConfine(const ChildSpec& spec, uint64_t* handledOut) {
     static const char* kDevRw[] = {"/dev/null", "/dev/zero",  "/dev/full", "/dev/random",
                                    "/dev/urandom", "/dev/shm", "/dev/pts", nullptr};
     for (const char** p = kDevRw; *p; ++p) allowTree(*p, rw, false);
-    // Writable: workspace, session scratch, own state, /tmp.
-    if (!allowTree(spec.workspace.c_str(), rw, true)) return -1;
-    if (!allowTree(spec.sessionTmp.c_str(), rw, true)) return -1;
-    if (!spec.stateDirPath.empty()) allowTree(spec.stateDirPath.c_str(), rw, false);
-    allowTree("/tmp", rw, false);
-    if (spec.auth) {
-        for (const auto& r : spec.auth->readRoots) allowTree(r.c_str(), ro, false);
-        for (const auto& r : spec.auth->writeRoots) allowTree(r.c_str(), rw, false);
+    // Writable: provider curl gets ONLY its staging dir (system RO, network
+    // allowed); tool children get the workspace, session scratch, /tmp and
+    // the authority roots. The real state dir is never granted: the child
+    // works on a broker copy, never on live keys/state.
+    if (spec.providerCurl) {
+        if (spec.providerTmp.empty() || !allowTree(spec.providerTmp.c_str(), rw, true))
+            return -1;
+    } else {
+        if (!allowTree(spec.workspace.c_str(), rw, true)) return -1;
+        if (!allowTree(spec.sessionTmp.c_str(), rw, true)) return -1;
+        allowTree("/tmp", rw, false);
+        if (spec.auth) {
+            for (const auto& r : spec.auth->readRoots) allowTree(r.c_str(), ro, false);
+            for (const auto& r : spec.auth->writeRoots) allowTree(r.c_str(), rw, false);
+        }
     }
     // /proc/self/fd etc. are under /proc (ro). Dynamic loader paths covered.
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -1;
@@ -646,8 +659,10 @@ int landlockConfine(const ChildSpec& spec, uint64_t* handledOut) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// seccomp: deny AF_INET/AF_INET6 socket() with EACCES (unprivileged, needs
-// only NO_NEW_PRIVS). AF_UNIX and everything else is untouched.
+// seccomp: deny AF_INET/AF_INET6 socket() with ECONNREFUSED (unprivileged,
+// needs only NO_NEW_PRIVS). Foreign-arch syscalls KILL the process: a
+// 32-bit ABI must never slip past the filter unconfined. AF_UNIX and
+// everything else is untouched.
 // ---------------------------------------------------------------------------
 #ifdef __has_include
 #if __has_include(<linux/seccomp.h>)
@@ -666,6 +681,13 @@ int landlockConfine(const ChildSpec& spec, uint64_t* handledOut) {
 #ifndef SECCOMP_RET_ALLOW
 #define SECCOMP_RET_ALLOW 0x7fff0000U
 #define SECCOMP_RET_ERRNO 0x00050000U
+#endif
+#ifndef SECCOMP_RET_KILL_PROCESS
+#ifdef SECCOMP_RET_KILL
+#define SECCOMP_RET_KILL_PROCESS SECCOMP_RET_KILL
+#else
+#define SECCOMP_RET_KILL_PROCESS 0x80000000U
+#endif
 #endif
 #ifndef AUDIT_ARCH_X86_64
 #define AUDIT_ARCH_X86_64 62
@@ -694,37 +716,65 @@ int seccompDenyInet() {
 #else
     return 1;  // unknown arch: report unsupported
 #endif
+    // Layout 0..9: foreign arch -> KILL (never silently unconfined);
+    // native socket(AF_INET/AF_INET6) -> ECONNREFUSED; else ALLOW.
     struct sock_filter f[] = {
         // A = arch
         {(uint16_t)(BPF_LD | BPF_W | BPF_ABS), 0, 0, (uint32_t)__builtin_offsetof(SeccompData, arch)},
-        // if A != kArch -> allow (foreign ABI; ignore)
-        {(uint16_t)(BPF_JMP | BPF_JEQ | BPF_K), 0, 5, kArch},
+        // if A == kArch -> next, else KILL
+        {(uint16_t)(BPF_JMP | BPF_JEQ | BPF_K), 0, 0, kArch},
         // A = syscall nr
         {(uint16_t)(BPF_LD | BPF_W | BPF_ABS), 0, 0, (uint32_t)__builtin_offsetof(SeccompData, nr)},
-        // if nr != socket -> allow
-        {(uint16_t)(BPF_JMP | BPF_JEQ | BPF_K), 0, 3, (uint32_t)kSockNr},
+        // if nr == socket -> next, else ALLOW
+        {(uint16_t)(BPF_JMP | BPF_JEQ | BPF_K), 0, 0, (uint32_t)kSockNr},
         // A = family (arg0, low 32 bits)
         {(uint16_t)(BPF_LD | BPF_W | BPF_ABS), 0, 0,
          (uint32_t)__builtin_offsetof(SeccompData, args)},
-        // if family == AF_INET -> deny; if AF_INET6 -> deny; else allow
-        {(uint16_t)(BPF_JMP | BPF_JEQ | BPF_K), 0, 1, (uint32_t)AF_INET},
-        {(uint16_t)(BPF_RET | BPF_K), 0, 0, (uint32_t)(SECCOMP_RET_ERRNO | (EACCES & 0xffff))},
-        {(uint16_t)(BPF_JMP | BPF_JEQ | BPF_K), 0, 1, (uint32_t)AF_INET6},
-        {(uint16_t)(BPF_RET | BPF_K), 0, 0, (uint32_t)(SECCOMP_RET_ERRNO | (EACCES & 0xffff))},
-        {(uint16_t)(BPF_RET | BPF_K), 0, 0, (uint32_t)SECCOMP_RET_ALLOW},
+        // if family == AF_INET -> DENY, else next
+        {(uint16_t)(BPF_JMP | BPF_JEQ | BPF_K), 0, 0, (uint32_t)AF_INET},
+        // if family == AF_INET6 -> DENY, else ALLOW
+        {(uint16_t)(BPF_JMP | BPF_JEQ | BPF_K), 0, 0, (uint32_t)AF_INET6},
+        {(uint16_t)(BPF_RET | BPF_K), 0, 0,
+         (uint32_t)(SECCOMP_RET_ERRNO | (ECONNREFUSED & 0xffff))},  // DENY
+        {(uint16_t)(BPF_RET | BPF_K), 0, 0, (uint32_t)SECCOMP_RET_ALLOW},  // ALLOW
+        {(uint16_t)(BPF_RET | BPF_K), 0, 0, (uint32_t)SECCOMP_RET_KILL_PROCESS},  // KILL
     };
-    // Fix jump offsets: after arch check (idx1): jt=0 -> idx2, jf=5 -> idx7?
-    // Recompute carefully: indexes 0..9. idx1: eq->next(2), ne->allow(9): jf=7.
-    // idx3: eq->next(4), ne->allow(9): jf=5. idx5: eq->deny(6)? jt path...
-    // Layout: 5: jeq AF_INET -> deny(6) else next(7)? We have two denies.
-    // Simplify: 5: jeq INET, jt=0(jump to 6 deny), jf=1(skip to 7 check INET6).
-    // 7: jeq INET6, jt=0(->8 deny), jf=1(->9 allow).
-    f[1].jf = 7;  // 1 -> 9
-    f[3].jf = 5;  // 3 -> 9
-    f[5].jt = 0;  // 5 -> 6
-    f[5].jf = 1;  // 5 -> 7
-    f[7].jt = 0;  // 7 -> 8
-    f[7].jf = 1;  // 7 -> 9
+    f[1].jt = 0;  // 1 -> 2
+    f[1].jf = 7;  // 1 -> 9 KILL
+    f[3].jt = 0;  // 3 -> 4
+    f[3].jf = 4;  // 3 -> 8 ALLOW
+    f[5].jt = 1;  // 5 -> 7 DENY
+    f[5].jf = 0;  // 5 -> 6
+    f[6].jt = 0;  // 6 -> 7 DENY
+    f[6].jf = 1;  // 6 -> 8 ALLOW
+    struct sock_fprog {
+        uint16_t len;
+        struct sock_filter* filter;
+    } prog{(uint16_t)(sizeof(f) / sizeof(f[0])), f};
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -1;
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
+        if (errno == EINVAL || errno == ENOSYS) return 1;
+        return -1;
+    }
+    return 0;
+}
+
+// Trusted provider-curl profile: network is the point, so sockets stay
+// allowed; only foreign-arch syscalls are killed (fail closed).
+int providerSeccomp() {
+#if defined(__x86_64__)
+    const uint32_t kArch = AUDIT_ARCH_X86_64;
+#elif defined(__aarch64__)
+    const uint32_t kArch = AUDIT_ARCH_AARCH64;
+#else
+    return 1;  // unknown arch: report unsupported
+#endif
+    struct sock_filter f[] = {
+        {(uint16_t)(BPF_LD | BPF_W | BPF_ABS), 0, 0, (uint32_t)__builtin_offsetof(SeccompData, arch)},
+        {(uint16_t)(BPF_JMP | BPF_JEQ | BPF_K), 0, 1, kArch},  // == native -> ALLOW
+        {(uint16_t)(BPF_RET | BPF_K), 0, 0, (uint32_t)SECCOMP_RET_ALLOW},       // idx 2
+        {(uint16_t)(BPF_RET | BPF_K), 0, 0, (uint32_t)SECCOMP_RET_KILL_PROCESS},  // idx 3
+    };
     struct sock_fprog {
         uint16_t len;
         struct sock_filter* filter;
@@ -749,9 +799,30 @@ void childWarn(const char* msg) {
 }  // namespace
 
 void childEnterSandbox(const ChildSpec& spec) {
-    if (spec.providerCurl || spec.unsafe) {
-        // Trusted harness networking, or explicit escape hatch: no confinement.
-        // Still start clean (no-op here by design).
+    if (spec.unsafe) return;  // explicit escape hatch: no confinement
+    if (spec.providerCurl) {
+        // Trusted harness networking: NOT unconfined. Minimal profile: system
+        // read-only, staging dir read-write, network allowed, foreign-arch
+        // syscalls killed, tight rlimits. A compromised curl sees no keys
+        // (header file holds one redacted-shaped bearer) and no filesystem.
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+            childWarn("provider PR_SET_NO_NEW_PRIVS failed; refusing to run");
+            _exit(127);
+        }
+        int ll = landlockConfine(spec, nullptr);
+        if (ll < 0) {
+            childWarn("provider Landlock setup failed; refusing to run");
+            _exit(127);
+        }
+        if (ll > 0) childWarn("provider Landlock unavailable: no fs confinement");
+        if (providerSeccomp() < 0) {
+            childWarn("provider seccomp setup failed; refusing to run");
+            _exit(127);
+        }
+        struct rlimit rlCpu{10, 10};  // curl has its own --max-time too
+        setrlimit(RLIMIT_CPU, &rlCpu);
+        struct rlimit rlAs{512u << 20, 512u << 20};
+        setrlimit(RLIMIT_AS, &rlAs);
         return;
     }
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
@@ -801,7 +872,7 @@ bool probeSeccompChild() {
         close(fd);
         return false;  // filter did not block: broken
     }
-    if (errno != EACCES) return false;
+    if (errno != ECONNREFUSED) return false;
     int ufd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (ufd < 0) return false;  // unix sockets must keep working
     close(ufd);
@@ -857,11 +928,35 @@ void copyIfSet(std::vector<std::string>& out, const char* name) {
 
 }  // namespace
 
+std::string filterChildPath(const char* path, const std::string& workspace,
+                            const std::string& tmpdir) {
+    const char* roots[] = {"/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/snap", nullptr};
+    auto under = [&](const std::string& e) {
+        if (e == workspace || e == tmpdir) return true;
+        if (startsWith(e, workspace + "/") || startsWith(e, tmpdir + "/")) return true;
+        for (const char** r = roots; *r; ++r) {
+            if (e == *r || startsWith(e, std::string(*r) + "/")) return true;
+        }
+        return false;
+    };
+    std::string out;
+    std::string rest = path ? path : "";
+    while (true) {
+        size_t c = rest.find(':');
+        std::string e = rest.substr(0, c);
+        while (e.size() > 1 && e.back() == '/') e.pop_back();
+        if (e.empty()) e = workspace;  // empty entry = child cwd
+        if (!e.empty() && e[0] == '/' && under(e)) out += (out.empty() ? "" : ":") + e;
+        if (c == std::string::npos) break;
+        rest = rest.substr(c + 1);
+    }
+    if (out.empty()) out = "/usr/local/bin:/usr/bin:/bin";
+    return out;
+}
+
 std::vector<std::string> buildChildEnv(const std::vector<std::string>& exposeEnv,
                                        const std::string& workspace, const std::string& tmpdir,
-                                       const std::string& home, const std::string& keyfile,
-                                       const std::string& sessionId, int depth, bool parentNet,
-                                       bool parentUnsafe) {
+                                       const std::string& home) {
     std::vector<std::string> env;
     // Fixed allowlist of ordinary tool variables.
     static const char* kKeep[] = {"PATH", "USER",       "LOGNAME", "LANG",     "LANGUAGE",
@@ -903,15 +998,10 @@ std::vector<std::string> buildChildEnv(const std::vector<std::string>& exposeEnv
     set("TEMP=" + tmpdir);
     set("HOME=" + home);
     set("SHELL=/bin/bash");
-    const char* path = getenv("PATH");
-    if (!path || !*path) set("PATH=/usr/local/bin:/usr/bin:/bin");
+    set("PATH=" + filterChildPath(getenv("PATH"), workspace, tmpdir));
+    // Marker only (lets scripts detect the harness). Everything else a
+    // recursive pocket needs lives in $TMPDIR/pocket.parent, never here.
     set("POCKETHARNESS=1");
-    set("POCKETHARNESS_WORKSPACE=" + workspace);
-    set("POCKETHARNESS_SESSION=" + sessionId);
-    set("POCKETHARNESS_DEPTH=" + std::to_string(depth));
-    set("POCKETHARNESS_KEYFILE=" + keyfile);
-    set(std::string("POCKETHARNESS_PARENT_NET=") + (parentNet ? "1" : "0"));
-    set(std::string("POCKETHARNESS_PARENT_UNSAFE=") + (parentUnsafe ? "1" : "0"));
     return env;
 }
 
@@ -998,7 +1088,7 @@ GuardResult classifyCommand(const std::string& cmd, const std::string& workspace
             if (hasWord(c, *p)) {
                 r.verdict = Verdict::Deny;
                 r.reason = std::string("tool networking is disabled; command uses '") + *p +
-                           "' (run pocket --network to allow, or use skills/files instead)";
+                           "' (drop --offline to allow, or use skills/files instead)";
                 return r;
             }
         }

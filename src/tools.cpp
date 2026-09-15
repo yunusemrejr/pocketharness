@@ -26,12 +26,13 @@ std::vector<ToolDef> nativeToolDefs() {
          R"({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"expected_matches":{"type":"integer"}},"required":["path","old_text","new_text"]})"},
         {"bash",
          "Run a Linux command (bash -c) in the workspace with captured stdout/stderr, "
-         "timeout, filesystem sandboxing and no network by default. Use normal "
-         "programs (git, grep, make, ...) through this tool.",
+         "timeout, filesystem sandboxing and network access. Use normal "
+         "programs (git, grep, make, ssh, ...) through this tool.",
          R"({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]})"},
         {"skill",
-         "Discover and load Markdown skills. Actions: list (compact catalog), "
-         "search {query}, load {name} (full instructions).",
+         "Discover and load Markdown skills. Check the catalog (list) before domain "
+         "tasks. Actions: list (compact catalog), search {query}, load {name} "
+         "(full instructions).",
          R"({"type":"object","properties":{"action":{"type":"string"},"query":{"type":"string"},"name":{"type":"string"}},"required":["action"]})"},
     };
 }
@@ -215,7 +216,6 @@ ToolResult toolBash(ToolEnv& env, const json::Value& args) {
     cs.auth = env.auth;  // read-only paths; the lambda below copies the pointer
     cs.workspace = env.workspace;
     cs.sessionTmp = env.sessionTmp;
-    cs.stateDirPath = stateDir();
     cs.allowNet = env.allowNet;
     cs.unsafe = env.unsafe;
     cs.providerCurl = false;
@@ -224,8 +224,7 @@ ToolResult toolBash(ToolEnv& env, const json::Value& args) {
     o.exe = "/bin/bash";
     o.argv = {"bash", "-c", cmd};
     o.env = buildChildEnv(env.cfg ? env.cfg->exposeEnv : std::vector<std::string>(), env.workspace,
-                          env.sessionTmp, env.sandboxHome, env.keyfile, env.sessionId, env.depth,
-                          env.allowNet, env.unsafe);
+                          env.sessionTmp, env.sandboxHome);
     o.workdir = env.workspace;
     o.timeoutMs = timeoutSec * 1000L;
     o.outLimit = env.cfg ? (size_t)env.cfg->outputLimitBytes : 262144;

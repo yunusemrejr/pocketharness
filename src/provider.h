@@ -47,6 +47,7 @@ struct ChatRequest {
 
 struct ChatResponse {
     std::string text;
+    std::string reasoning;  // model thinking, when the provider streams it
     std::vector<ToolCall> calls;
     long inTokens = -1;
     long outTokens = -1;
@@ -59,6 +60,7 @@ struct ChatResponse {
 
 struct ChatCallbacks {
     std::function<void(std::string_view token)> onToken;
+    std::function<void(std::string_view chunk)> onReasoning;  // thinking preview
     std::atomic<bool>* cancel = nullptr;
 };
 
@@ -74,6 +76,7 @@ std::vector<std::string> sseSplit(std::string_view chunk, std::string& carry);
 // Streaming accumulators (pure, unit-tested). Feed parsed data payloads.
 struct OpenAiStreamAcc {
     std::string text;
+    std::string reasoning;
     struct Pending {
         std::string id, name, args;
     };
@@ -86,6 +89,7 @@ struct OpenAiStreamAcc {
 };
 struct AnthropicStreamAcc {
     std::string text;
+    std::string reasoning;
     struct Block {
         std::string id, name, input;
         bool isTool = false;
@@ -102,15 +106,26 @@ struct AnthropicStreamAcc {
 Result<ChatResponse> parseOpenAiResponse(const json::Value& v);
 Result<ChatResponse> parseAnthropicResponse(const json::Value& v);
 
-// API key lookup: $keyEnv, else POCKETHARNESS_KEYFILE (recursive children).
+// API key lookup: $keyEnv only (recursive children: explicit expose_env).
 // The returned key must never be logged or placed in argv.
 Result<std::string> providerApiKey(const ProviderCfg& prov);
 
-// Full request over `curl`. tmpDir holds request/response temp files.
-Result<ChatResponse> chatRequest(const ChatRequest& req, const ChatCallbacks& cb,
-                                 const std::string& tmpDir);
+// Full request over `curl`. All staging (body, headers, secrets) lives in
+// a per-request parent-only dir under the state dir; nothing caller-visible.
+Result<ChatResponse> chatRequest(const ChatRequest& req, const ChatCallbacks& cb);
 
 // True when the system curl binary is runnable.
 bool curlAvailable();
+
+// Context window for a model id from a /models listing body (exact id
+// match; reads context_length|context_window|max_context|context|
+// inputTokenLimit). Handles {"data":[...]}, Gemini {"models":[...]} and
+// bare [...] shapes. -1 when unpublished.
+long parseModelsContext(const std::string& body, const std::string& modelId);
+
+// Live context window via GET {base}/models, cached per process. Secret
+// staging is internal (parent-only dir); needs no caller tmp dir.
+// -1 on any failure (offline, auth, unpublished id): callers keep static.
+long fetchModelContext(const ProviderCfg& prov, const std::string& modelId);
 
 }  // namespace pocket

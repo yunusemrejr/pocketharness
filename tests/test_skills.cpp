@@ -41,3 +41,23 @@ TEST(skills_Discover_Precedence) {
     rmRf(home);
     return "";
 }
+
+TEST(skills_Search_Ranks_Name_Heading_Preview) {
+    SkillMeta webby{"webby", "global", "Do stuff", "fetch pages and search the web", ""};
+    SkillMeta fetch{"fetch", "global", "Other thing", "unrelated words here", ""};
+    SkillMeta heady{"heady", "global", "How to fetch things", "nothing relevant", ""};
+    std::vector<SkillMeta> all{webby, fetch, heady};
+    auto hits = skillSearch(all, "fetch");
+    CHECK_EQ(hits.size(), (size_t)3);
+    CHECK_EQ(hits[0].name, std::string("fetch"));  // name hit first
+    CHECK_EQ(hits[1].name, std::string("heady"));  // then heading hit
+    CHECK_EQ(hits[2].name, std::string("webby"));  // then preview hit
+    // Multi-token query: tokens union across fields, totals rank, ties break alpha.
+    hits = skillSearch(all, "search unrelated");
+    CHECK_EQ(hits.size(), (size_t)2);
+    CHECK_EQ(hits[0].name, std::string("fetch"));
+    CHECK_EQ(hits[1].name, std::string("webby"));
+    CHECK(skillSearch(all, "").size() == 3);  // empty query returns all
+    CHECK(skillSearch(all, "zzz-no-match").empty());
+    return "";
+}

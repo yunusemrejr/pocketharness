@@ -166,3 +166,32 @@ TEST(provider_ApiKey_Lookup) {
     CHECK(k.ok && k.value == "env-key");
     return "";
 }
+
+TEST(provider_Models_Gemini_Shape) {
+    std::string body =
+        R"({"models":[{"name":"models/gemini-flash","inputTokenLimit":1000000},)"
+        R"({"name":"models/other","inputTokenLimit":32000}]})";
+    CHECK_EQ(parseModelsContext(body, "gemini-flash"), 1000000L);
+    CHECK_EQ(parseModelsContext(body, "missing"), -1L);
+    CHECK_EQ(parseModelsContext(R"({"data":[{"id":"m","context_length":64000}]})", "m"), 64000L);
+    CHECK_EQ(parseModelsContext(R"({"data":[{"id":"m"}]})", "m"), -1L);  // unpublished
+    return "";
+}
+
+TEST(provider_Stream_Reasoning_Captured) {
+    OpenAiStreamAcc a;
+    auto v = json::parse(R"({"choices":[{"delta":{"reasoning_content":"hmm"}}]})");
+    CHECK(v.ok);
+    a.feed(v.value);
+    CHECK_EQ(a.reasoning, std::string("hmm"));
+    CHECK(a.text.empty());
+    AnthropicStreamAcc b;
+    auto w = json::parse(
+        R"({"type":"content_block_delta","index":0,)"
+        R"("delta":{"type":"thinking_delta","thinking":"deep"}})");
+    CHECK(w.ok);
+    b.feed(w.value);
+    CHECK_EQ(b.reasoning, std::string("deep"));
+    CHECK(b.text.empty());
+    return "";
+}

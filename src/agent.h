@@ -33,22 +33,29 @@ std::string buildSystemPrompt(const std::string& workspace);
 // Which base prompt is active: "" = built-in, else the override file path.
 std::string systemPromptSource(const std::string& workspace);
 
+// Wire copy of history for a request: all but the last 3 tool results are
+// cut to 500 chars (pairing ids intact). History on disk stays full.
+// contextUsed() mirrors this rule; keep the constants in sync.
+std::vector<ChatMessage> trimWireHistory(const std::vector<ChatMessage>& msgs);
+
 // The conversation driver. Owns message history; ToolEnv drives tools;
 // session persistence happens here (one place, always consistent).
 struct AgentOpts {
     ResolvedModel model;
     std::string thinking = "off";
+    long maxTokens = 8192;     // completion budget; also the compaction reserve
     ToolEnv* tools = nullptr;  // not owned
     std::string sessionId;
-    std::string tmpDir;
     std::atomic<bool>* cancel = nullptr;
     std::function<void(std::string_view token)> onToken;
+    std::function<void(std::string_view chunk)> onReasoning;  // live thinking preview
     std::function<void(const std::string&)> onNotice;  // compaction, retries, etc.
 };
 
 struct AgentStats {
     long inTokens = 0;  // summed when the provider reports usage, else stays 0
     long outTokens = 0;
+    long lastPrompt = -1;  // exact prompt tokens of the latest request (-1 unknown)
     long genMs = 0;  // provider wall-time of successful requests (no tool time)
     int turns = 0;
     int toolCalls = 0;
@@ -81,9 +88,11 @@ class Agent {
         opts_.thinking = thinking;
     }
     void setCallbacks(std::function<void(std::string_view)> tok,
-                      std::function<void(const std::string&)> notice) {
+                      std::function<void(const std::string&)> notice,
+                      std::function<void(std::string_view)> reasoning = {}) {
         opts_.onToken = std::move(tok);
         opts_.onNotice = std::move(notice);
+        opts_.onReasoning = std::move(reasoning);
     }
     void setCancel(std::atomic<bool>* c) { opts_.cancel = c; }
     long contextUsed() const;  // estimated tokens in the next request

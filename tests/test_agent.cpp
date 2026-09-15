@@ -203,3 +203,35 @@ TEST(agent_Restore_Pairs_Tools) {
     rmRf(home);
     return "";
 }
+
+TEST(agent_Restore_Compact_Boundary) {
+    std::string home = makeTempDir("pocket-acompact");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    // Pre-compact history, a compaction, then post-compact turns.
+    CHECK(sessionAppend(id.value, SessionEvent{"user", "old q", "", "", "", true}).ok);
+    CHECK(sessionAppend(id.value, SessionEvent{"assistant", "old a", "", "", "", true}).ok);
+    CHECK(sessionAppend(id.value, SessionEvent{"compact", "SUMMARY", "", "", "", true}).ok);
+    CHECK(sessionAppend(id.value, SessionEvent{"user", "new q", "", "", "", true}).ok);
+    CHECK(sessionAppend(id.value, SessionEvent{"assistant", "new a", "", "", "", true}).ok);
+    Config cfg = defaultConfig();
+    ToolEnv env;
+    env.workspace = home;
+    AgentOpts ao;
+    ao.model = resolveModel(cfg, "glm").value;
+    ao.tools = &env;
+    ao.sessionId = id.value;
+    Agent a(ao);
+    CHECK(a.restore(id.value).ok);
+    // Parity with live compaction: the pre-compact raw events are dropped
+    // (their content lives in the summary), the summary + tail are kept.
+    CHECK_EQ(a.messageCount(), (size_t)3);
+    CHECK(startsWith(a.messages()[0].content, "[Summary of earlier work]"));
+    CHECK(a.messages()[0].content.find("SUMMARY") != std::string::npos);
+    CHECK_EQ(a.messages()[1].content, std::string("new q"));
+    CHECK_EQ(a.messages()[2].content, std::string("new a"));
+    rmRf(home);
+    return "";
+}

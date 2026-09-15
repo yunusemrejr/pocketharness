@@ -19,7 +19,8 @@ struct SkillMeta {
 // Discover skills. Project skills win on name collision.
 std::vector<SkillMeta> skillDiscover(const std::string& workspace);
 
-// Case-insensitive substring search over name/heading/preview.
+// Case-insensitive token-overlap search over name/heading/preview,
+// best match first (name hits outrank heading, heading outranks preview).
 std::vector<SkillMeta> skillSearch(const std::vector<SkillMeta>& all,
                                    const std::string& query);
 

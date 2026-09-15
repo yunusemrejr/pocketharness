@@ -21,9 +21,6 @@ struct ToolEnv {
     std::string workspace;
     std::string sessionTmp;
     std::string sandboxHome;
-    std::string sessionId;
-    std::string keyfile;
-    int depth = 0;
     bool allowNet = false;
     bool unsafe = false;
     bool interactive = false;

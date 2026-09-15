@@ -3,9 +3,11 @@
 
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdio>
+#include <map>
 
 #include "process.h"
 #include "sandbox.h"
@@ -222,6 +224,20 @@ void OpenAiStreamAcc::feed(const json::Value& p) {
         const auto& delta = choices.at(0).at("delta");
         if (delta.has("content") && delta.at("content").isStr())
             text += delta.at("content").asStr();
+        // Thinking preview shapes (DeepSeek reasoning_content, OpenRouter
+        // reasoning / reasoning_details). Display-only, never stored.
+        if (delta.has("reasoning_content") && delta.at("reasoning_content").isStr())
+            reasoning += delta.at("reasoning_content").asStr();
+        if (delta.has("reasoning")) {
+            const auto& r = delta.at("reasoning");
+            if (r.isStr()) reasoning += r.asStr();
+        }
+        const auto& rds = delta.at("reasoning_details");
+        if (rds.isArr()) {
+            for (const auto& rd : rds.asArr()) {
+                if (rd.has("text") && rd.at("text").isStr()) reasoning += rd.at("text").asStr();
+            }
+        }
         const auto& tcs = delta.at("tool_calls");
         if (tcs.isArr()) {
             for (const auto& tc : tcs.asArr()) {
@@ -243,6 +259,7 @@ void OpenAiStreamAcc::feed(const json::Value& p) {
 ChatResponse OpenAiStreamAcc::finish() {
     ChatResponse r;
     r.text = text;
+    r.reasoning = reasoning;
     r.inTokens = inTokens;
     r.outTokens = outTokens;
     r.cacheHit = cacheHit;
@@ -282,7 +299,8 @@ void AnthropicStreamAcc::feed(const json::Value& p) {
         else if (dt == "input_json_delta")
             blocks[(size_t)idx].input += d.at("partial_json").asStr();
         else if (dt == "thinking_delta") {
-            // Thinking content is not shown; models still act on it.
+            if (d.has("thinking") && d.at("thinking").isStr())
+                reasoning += d.at("thinking").asStr();
         }
     } else if (type == "message_start") {
         const auto& u = p.at("message").at("usage");
@@ -299,6 +317,7 @@ void AnthropicStreamAcc::feed(const json::Value& p) {
 ChatResponse AnthropicStreamAcc::finish() {
     ChatResponse r;
     r.text = text;
+    r.reasoning = reasoning;
     r.inTokens = inTokens;
     r.outTokens = outTokens;
     r.cacheHit = cacheHit;
@@ -368,26 +387,14 @@ Result<ChatResponse> parseAnthropicResponse(const json::Value& v) {
 }
 
 Result<std::string> providerApiKey(const ProviderCfg& prov) {
+    // $keyEnv ONLY. No keyfile fallback: a recursive `pocket` inherits keys
+    // solely through explicit expose_env passthrough in the user config, so
+    // key flow is always a deliberate user decision, never ambient magic.
     if (const char* v = getenv(prov.keyEnv.c_str())) {
         if (v[0] != '\0') return Result<std::string>::Ok(v);
     }
-    // Recursive `pocket` children receive a key file instead of env secrets.
-    if (const char* kf = getenv("POCKETHARNESS_KEYFILE")) {
-        if (kf[0] != '\0' && access(kf, R_OK) == 0) {
-            auto t = readFileBounded(kf, 65536);
-            if (t.ok) {
-                for (const std::string& line : splitLines(t.value)) {
-                    size_t eq = line.find('=');
-                    if (eq == std::string::npos) continue;
-                    if (line.substr(0, eq) == prov.keyEnv) {
-                        std::string val = line.substr(eq + 1);
-                        if (!val.empty()) return Result<std::string>::Ok(val);
-                    }
-                }
-            }
-        }
-    }
-    return Result<std::string>::Err("missing API key: set $" + prov.keyEnv + " in your shell");
+    return Result<std::string>::Err("missing API key: export " + prov.keyEnv +
+                                    " in your shell (recursive pocket: expose_env it)");
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +406,28 @@ std::string joinUrl(const std::string& base, const std::string& path) {
     std::string b = base;
     while (!b.empty() && b.back() == '/') b.pop_back();
     return b + path;
+}
+
+// Per-request secret staging: stateDir()/curl-<pid>-<tag>, mode 0700.
+// The state dir is granted to NO child profile, so only the provider-curl
+// child (whose profile grants exactly this dir) can read the header file;
+// tool children can never reach it. Unlinked + rmdir'd after each request.
+std::string provStaging(const std::string& tag) {
+    std::string d = stateDir() + "/curl-" + std::to_string((long)getpid()) + "-" + tag;
+    if (mkdir(d.c_str(), 0700) != 0) return "";
+    return d;
+}
+
+// curl transport locks: HTTPS-only protocol set + modern TLS, but only for
+// https URLs. Plain http is rejected at config validation except loopback
+// (local Ollama-style daemons), which needs neither flag.
+void lockTransport(std::vector<std::string>& argv, const std::string& url) {
+    if (!startsWith(url, "https://")) return;
+    argv.insert(argv.end() - 1, "--proto");
+    argv.insert(argv.end() - 1, "=https");
+    argv.insert(argv.end() - 1, "--proto-redir");
+    argv.insert(argv.end() - 1, "=https");
+    argv.insert(argv.end() - 1, "--tlsv1.2");
 }
 
 int readHttpStatus(const std::string& hdrPath) {
@@ -427,8 +456,78 @@ bool curlAvailable() {
     return r.ok && r.exitCode == 0;
 }
 
-Result<ChatResponse> chatRequest(const ChatRequest& req, const ChatCallbacks& cb,
-                                 const std::string& tmpDir) {
+long parseModelsContext(const std::string& body, const std::string& modelId) {
+    auto v = json::parse(body);
+    if (!v.ok) return -1;
+    const json::Value* arr = nullptr;
+    if (v.value.isObj() && v.value.at("data").isArr()) arr = &v.value.at("data");
+    // Gemini: {"models":[{"name":"models/gemini-...","inputTokenLimit":N}]}
+    else if (v.value.isObj() && v.value.at("models").isArr())
+        arr = &v.value.at("models");
+    else if (v.value.isArr()) arr = &v.value;
+    if (!arr) return -1;
+    for (const auto& e : arr->asArr()) {
+        if (!e.isObj()) continue;
+        std::string id = e.at("id").asStr();
+        if (id.empty()) {
+            id = e.at("name").asStr();
+            if (startsWith(id, "models/")) id = id.substr(7);
+        }
+        if (id != modelId) continue;
+        for (const char* f :
+             {"context_length", "context_window", "max_context", "context", "inputTokenLimit"}) {
+            long n = e.at(f).asInt(-1);
+            if (n > 0) return n;
+        }
+        return -1;  // id matched but unpublished
+    }
+    return -1;
+}
+
+long fetchModelContext(const ProviderCfg& prov, const std::string& modelId) {
+    static std::map<std::string, long> cache;  // process-lifetime
+    std::string key = prov.baseUrl + "\n" + modelId;
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    long found = -1;
+    auto k = providerApiKey(prov);
+    if (k.ok) {
+        std::string tag = randHex(4);
+        std::string stage = provStaging(tag);
+        if (!stage.empty()) {
+            std::string cfgPath = stage + "/curl.conf";
+            std::string hdr =
+                prov.protocol == "anthropic" ? "x-api-key: " : "Authorization: Bearer ";
+            if (atomicWriteFile(cfgPath, "header = \"" + hdr + k.value + "\"\n", 0600).ok) {
+                std::string url = joinUrl(prov.baseUrl, "/models");
+                SpawnOpts o;
+                o.exe = "curl";
+                o.argv = {"curl", "-sS", "--no-progress-meter", "--connect-timeout", "8",
+                          "--max-time", "20", "--location", "-K", cfgPath, url};
+                if (prov.protocol == "anthropic") {
+                    o.argv.insert(o.argv.end() - 1, "-H");
+                    o.argv.insert(o.argv.end() - 1, "anthropic-version: 2023-06-01");
+                }
+                lockTransport(o.argv, url);
+                o.timeoutMs = 25000;
+                o.outLimit = 2 << 20;
+                ChildSpec cs;
+                cs.providerCurl = true;
+                cs.providerTmp = stage;
+                o.childSetup = [cs]() { childEnterSandbox(cs); };
+                SpawnResult r = spawn(o);
+                if (r.ok && r.exitCode == 0 && !r.truncated)
+                    found = parseModelsContext(r.out, modelId);
+            }
+            unlink(cfgPath.c_str());
+            rmdir(stage.c_str());
+        }
+    }
+    cache[key] = found;
+    return found;
+}
+
+Result<ChatResponse> chatRequest(const ChatRequest& req, const ChatCallbacks& cb) {
     if (req.model.provider.protocol != "openai" && req.model.provider.protocol != "anthropic")
         return Result<ChatResponse>::Err("unsupported protocol");
     auto key = providerApiKey(req.model.provider);
@@ -451,10 +550,15 @@ Result<ChatResponse> chatRequest(const ChatRequest& req, const ChatCallbacks& cb
     std::string url = isOpenAi ? joinUrl(req.model.provider.baseUrl, "/chat/completions")
                                : joinUrl(req.model.provider.baseUrl, "/messages");
 
+    // All staging lives in the per-request parent-only dir: the confined
+    // provider curl is granted exactly this dir, nothing else. (The
+    // child-visible session tmp is deliberately unreachable to it.)
     std::string tag = randHex(4);
-    std::string bodyPath = tmpDir + "/req-" + tag + ".json";
-    std::string hdrPath = tmpDir + "/resp-" + tag + ".hdr";
-    std::string cfgPath = tmpDir + "/curl-" + tag + ".conf";
+    std::string stage = provStaging(tag);
+    if (stage.empty()) return Result<ChatResponse>::Err("cannot stage request");
+    std::string bodyPath = stage + "/req.json";
+    std::string hdrPath = stage + "/resp.hdr";
+    std::string cfgPath = stage + "/curl.conf";
     {
         auto w = atomicWriteFile(bodyPath, json::stringify(body), 0600);
         if (!w.ok) return Result<ChatResponse>::Err("cannot stage request: " + w.error);
@@ -499,11 +603,13 @@ Result<ChatResponse> chatRequest(const ChatRequest& req, const ChatCallbacks& cb
         o.argv.insert(o.argv.end() - 1, "-H");
         o.argv.insert(o.argv.end() - 1, "anthropic-version: 2023-06-01");
     }
+    lockTransport(o.argv, url);
     o.timeoutMs = 620000;
     o.outLimit = 32 << 20;
     o.cancel = cb.cancel;
     ChildSpec cs;
-    cs.providerCurl = true;  // trusted harness networking: no confinement
+    cs.providerCurl = true;
+    cs.providerTmp = stage;
     o.childSetup = [cs]() { childEnterSandbox(cs); };
 
     std::string sseCarry;
@@ -521,6 +627,7 @@ Result<ChatResponse> chatRequest(const ChatRequest& req, const ChatCallbacks& cb
             auto v = json::parse(payload);
             if (!v.ok) continue;  // keep-alive / partial: ignore
             size_t before = isOpenAi ? oacc.text.size() : aacc.text.size();
+            size_t rBefore = isOpenAi ? oacc.reasoning.size() : aacc.reasoning.size();
             if (isOpenAi)
                 oacc.feed(v.value);
             else
@@ -530,6 +637,11 @@ Result<ChatResponse> chatRequest(const ChatRequest& req, const ChatCallbacks& cb
                 const std::string& t = isOpenAi ? oacc.text : aacc.text;
                 cb.onToken(std::string_view(t.data() + before, after - before));
             }
+            size_t rAfter = isOpenAi ? oacc.reasoning.size() : aacc.reasoning.size();
+            if (cb.onReasoning && rAfter > rBefore) {
+                const std::string& t = isOpenAi ? oacc.reasoning : aacc.reasoning;
+                cb.onReasoning(std::string_view(t.data() + rBefore, rAfter - rBefore));
+            }
         }
     };
 
@@ -538,6 +650,7 @@ Result<ChatResponse> chatRequest(const ChatRequest& req, const ChatCallbacks& cb
     unlink(cfgPath.c_str());
     int http = readHttpStatus(hdrPath);
     unlink(hdrPath.c_str());
+    rmdir(stage.c_str());  // last: only succeeds once the dir is empty
 
     if (r.cancelled) return Result<ChatResponse>::Err("cancelled");
     if (r.timedOut) return Result<ChatResponse>::Err("provider request timed out");

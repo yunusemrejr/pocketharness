@@ -789,17 +789,30 @@ struct StreamRenderer {
         writeAll(STDOUT_FILENO, out);
         partRows = 0;
     }
+    bool dim = false;  // inside a thinking span: render everything dim
+    std::string shade(const std::string& vis) {
+        return dim ? col(C_DIM) + vis + col(C_RESET) : vis;
+    }
     void showPart() {
         // ponytail: re-render the whole tail per token; O(line^2) worst case,
         // lines are short and it converges when the line completes.
         bool f = fence;  // display-only: completed lines mutate the real state
         std::string vis = renderLine(carry, f);
-        writeAll(STDOUT_FILENO, vis);
+        writeAll(STDOUT_FILENO, shade(vis));
         int W = termWidth();
         int r = (int)((visibleWidth(vis) + (size_t)W - 1) / (size_t)W);
         partRows = r < 1 ? 1 : r;
     }
-    void feed(std::string_view tok) {
+    // think=true streams a thinking chunk (dim); think=false streams answer
+    // text. Spans never interleave inside one request: thinking always
+    // precedes the answer, so a text chunk commits any open thinking tail.
+    void feed(std::string_view tok, bool think = false) {
+        if (think && !dim && !carry.empty()) endLine();  // defensive: fresh span
+        if (dim && !think) {
+            dim = false;
+            endLine();
+        }  // thinking span ends: commit its tail
+        dim = think;
         clearPart();
         carry.append(tok.data(), tok.size());
         // Bound memory + quadratic re-render on newline-free floods: commit
@@ -808,14 +821,14 @@ struct StreamRenderer {
             size_t cut = 8192;
             while (cut > 0 && ((unsigned char)carry[cut] & 0xC0) == 0x80) --cut;
             if (cut == 0) cut = 8192;  // degenerate: terminal shows U+FFFD
-            writeAll(STDOUT_FILENO, renderLine(carry.substr(0, cut), fence) + "\n");
+            writeAll(STDOUT_FILENO, shade(renderLine(carry.substr(0, cut), fence)) + "\n");
             carry.erase(0, cut);
         }
         size_t start = 0;
         for (;;) {
             size_t nl = carry.find('\n', start);
             if (nl == std::string::npos) break;
-            writeAll(STDOUT_FILENO, renderLine(carry.substr(start, nl - start), fence) + "\n");
+            writeAll(STDOUT_FILENO, shade(renderLine(carry.substr(start, nl - start), fence)) + "\n");
             start = nl + 1;
         }
         carry.erase(0, start);
@@ -1027,6 +1040,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
     } gate(shared);
     StreamRenderer rend;
     g_endPartial = [&] { rend.endLine(); };
+    bool thinkHead = false;
     agent.setCallbacks(
         [&](std::string_view tok) {
             if (cancel.load()) return;
@@ -1035,6 +1049,15 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
         },
         [&](const std::string& note) {
             rend.write(col(C_DIM) + "(" + sanitizeTerminal(note) + ")" + col(C_RESET) + "\n");
+        },
+        [&](std::string_view chunk) {
+            if (cancel.load()) return;
+            if (!thinkHead) {
+                thinkHead = true;
+                rend.write(col(C_DIM) + std::string("💭 thinking:") + col(C_RESET) + "\n");
+            }
+            rend.feed(chunk, true);
+            if (bar) bar->liveKpi();
         });
     opts.tools->onEvent = [&](const std::string& line) {
         rend.write(col(C_DIM) + "  ⚙ " + sanitizeTerminal(line) + col(C_RESET) + "\n");
@@ -1314,6 +1337,10 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             say(col(C_RED) + std::string("error: ") + rm.error + col(C_RESET) + "\n");
             return;
         }
+        if (!hasExplicitContext(*opts.cfg, rm.value.provider.name, rm.value.model)) {
+            long live = fetchModelContext(rm.value.provider, rm.value.model);
+            if (live > 0) rm.value.context = live;
+        }
         opts.model = rm.value;
         agent.setModel(rm.value, opts.thinking);
         SessionMeta m = sessionLoadMeta(opts.sessionId).value;
@@ -1434,8 +1461,9 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         s += std::string("kernel: openat2 ") + (caps.openat2 ? "yes" : "NO") + " · landlock " +
              (caps.landlock ? "yes" : "NO") + " · seccomp-net " +
              (caps.seccompNet ? "yes" : "NO") + "\n";
-        s += "tool network: " + std::string(opts.allowNet ? "ON (explicit)" : "OFF") +
+        s += "tool network: " + std::string(opts.allowNet ? "ON (default)" : "OFF (--offline)") +
              " · env: sanitized allowlist · no_new_privs: yes · root: refused by default\n";
+        s += "keys: $ENV only, brokered per-request (never in env/argv/child fs)\n";
         say(s);
         return true;
     }
@@ -1549,6 +1577,13 @@ int lineRun(TuiOpts& opts) {
             std::string s = "(" + sanitizeTerminal(note) + ")\n";
             if (g_plain) writeAll(STDOUT_FILENO, s);
             else rend.write(s);
+        },
+        [&](std::string_view chunk) {
+            if (g_plain) {
+                writeAll(STDOUT_FILENO, sanitizeTerminal(std::string(chunk)));
+            } else {
+                rend.feed(chunk, true);
+            }
         });
     opts.tools->onEvent = [&](const std::string& line) {
         std::string s = "⚙ " + sanitizeTerminal(line) + "\n";

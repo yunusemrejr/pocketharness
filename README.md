@@ -81,10 +81,13 @@ wait
 ```
 
 PocketHarness itself does not know what a "swarm" is. Child instances get
-their own session, stay within the parent workspace, never inherit `--unsafe`
-or `--network`, and stop nesting past depth 5. Provider keys reach children
-through a 0600 session keyfile (never through the model's scrubbed
-environment); kernel confinement is inherited and cannot be shed.
+their own session, stay within the parent workspace, never inherit `--unsafe`,
+never out-network an `--offline` parent, and stop nesting past depth 5.
+Depth, workspace, and the net grant travel via a `$TMPDIR/pocket.parent`
+file (never via environment, which the model can read). Provider keys are
+never inherited implicitly: a child authenticates only through explicit
+user-level `expose_env` passthrough. Kernel confinement is inherited and
+cannot be shed — under `--offline` the whole subtree loses `AF_INET`.
 
 ## The five tools
 
@@ -101,7 +104,8 @@ authority boundary, test surface, and context cost.
 - **edit** — exact replacement; fails unless `old_text` occurs exactly
   `expected_matches` times (default 1). Never edits a surprise match.
 - **bash** — normal Linux commands with captured stdout/stderr, exit status,
-  timeout, cancellation, sandboxing, and no network by default.
+  timeout, cancellation, sandboxing, and network access on by default
+  (`--offline` denies it: guard fails fast, seccomp blocks the sockets).
 - **skill** — `list` / `search` / `load` Markdown skills (metadata first,
   full text only when deliberately loaded).
 
@@ -111,7 +115,7 @@ One transparent user config, optional project overlay:
 
 ```
 ~/.config/pocketharness/config.json
-./.pocket/config.json                  # may set models/providers only
+./.pocket/config.json                  # models/aliases only, never providers
 ```
 
 ```json
@@ -128,7 +132,7 @@ One transparent user config, optional project overlay:
   "models": {
     "glm": { "provider": "orcarouter", "model": "glm-5.3-flash", "context": 200000 }
   },
-  "tool_network": false,
+  "tool_network": true,
   "bash_timeout": 120,
   "output_limit": 262144,
   "allow_read": [],
@@ -137,9 +141,12 @@ One transparent user config, optional project overlay:
 }
 ```
 
-Security-sensitive keys (`tool_network`, `allow_read`, `allow_write`,
-`expose_env`, timeouts) from **project** config are ignored with a warning —
-a repository must never silently escalate its own authority. Invalid config
+Security-sensitive keys (`providers`, `tool_network`, `allow_read`,
+`allow_write`, `expose_env`, timeouts) from **project** config are ignored
+with a warning — a repository must never silently escalate its own authority,
+and especially never redirect provider endpoints (which decide where API
+keys are sent). Provider `base_url` must be `https`, or `http` loopback for
+local daemons; `key_env` must be a shell variable name. Invalid config
 produces precise errors, never silent guesses.
 
 ## Providers: wire protocols, not brands
@@ -164,12 +171,25 @@ Each session owns its model and thinking level (stored in the session,
 restored by `--resume`); new sessions start from config unless `-m`/`-t` say
 otherwise, so concurrent sessions never affect each other.
 HTTPS is done by invoking the installed **`curl` binary** (argv-based, never
-shell strings); the API key travels in a 0600 `-K` config file, never in
-argv, logs, or sessions. PocketHarness ships no TLS/HTTP stack of its own.
+shell strings, HTTPS-only protocol lock + TLS 1.2+ for `https://` URLs).
+Per request, the harness stages body, response headers, and the secret
+bearer (`-K` config, 0600) in a fresh parent-only directory under the state
+dir; the key never appears in argv, logs, sessions, child environments, or
+any child-visible filesystem. The staging dir is unlinked after each
+request. PocketHarness ships no TLS/HTTP stack of its own.
 
 Thinking levels (`off/low/medium/high/max`, `/thinking`) map to
 `reasoning_effort` / Anthropic thinking budgets, and are omitted entirely
-when `off` for maximum endpoint compatibility.
+when `off` for maximum endpoint compatibility. When the provider streams
+thinking (`reasoning_content` / `reasoning_details` / `thinking_delta`),
+it renders live and dim — inline in the TUI, on `-p` stderr — while the
+answer streams normally.
+
+Context windows resolve live: unless a model pins `"context"` explicitly,
+the harness `GET`s `{base}/models` once per process (`{"data"}`, bare
+arrays, and Gemini `{"models"}` shapes) and adopts the published window
+for that exact model id. Anything unpublished or unreachable keeps the
+configured default; the probe never fails a run.
 
 ### Prompt caching
 
@@ -226,7 +246,16 @@ The intentionally flexible layer. A skill is just:
 
 No manifests, no code, no SDK. Directory name + first heading + first
 paragraph are the metadata. The model sees only that skills exist until it
-loads one. See `examples/skills/` for a starter skill.
+loads one. `search` ranks by token overlap (name hits outrank heading,
+heading outranks preview). See `examples/skills/` for a starter skill, and
+`skills/web-research/` for the bundled curl-based web client guide
+(`make install-skills` copies bundled skills into the user skill dir;
+never part of `make install`).
+
+There is no `web_search` tool, fetch subsystem, or browser runtime: web
+research is `curl` via `bash`, taught by the skill, gated by the same
+`--offline` switch as all tool networking. Fetched content is untrusted
+data, never harness authority.
 
 ## Sessions & context
 
@@ -234,10 +263,15 @@ Append-only JSONL under `~/.local/share/pocketharness/sessions/` — one event
 per line, fsync'd, tolerant of a torn last line after a crash. No SQLite, no
 indexing, no daemons. Keys never touch session files.
 
-Context: estimated usage vs configured window, `/compact` on demand plus
-automatic summarization past ~80% (older turns summarized, recent raw turns
-kept with tool pairs intact). No memory graphs, no governors, no injected
-observations. Durable knowledge belongs in project files or skills.
+Context: provider-reported prompt tokens when available, else estimated
+usage vs the (possibly live-resolved) window. `/compact` on demand plus
+automatic summarization at ~90%, or whenever the next completion would no
+longer fit (a full `maxTokens` of headroom is reserved for the answer).
+Compaction summarizes older turns and keeps recent raw turns with tool
+pairs intact; `--resume` replays from the last summary, so a resumed
+session sees exactly what the live session saw — never history twice.
+No memory graphs, no governors, no injected observations. Durable knowledge
+belongs in project files or skills.
 
 ## Security architecture
 
@@ -249,11 +283,12 @@ Default posture:
 
 ```
 Workspace read/write        YES (that is the agent's job)
-Session tmp + own state     YES (narrow)
+Session tmp                 YES (narrow; never holds secrets)
+State dir / sessions        PARENT ONLY (no child profile grants it)
 System binaries/libraries   read/execute
 $HOME, ~/.ssh, other repos  NO by default
-Provider network (harness)  YES
-Model bash network          NO by default
+Provider network (harness)  YES (confined curl, brokered key)
+Model bash network          YES by default (--offline denies)
 sudo / setuid gain          NO (NO_NEW_PRIVS)
 Running as root             REFUSED (unless --allow-root)
 ```
@@ -265,16 +300,29 @@ Mechanisms (a few Linux primitives, not a policy framework):
   string-prefix checks. Pre-openat2 kernels get a strict symlink-refusing
   fallback plus a loud warning — never a silent downgrade.
 - **Landlock** confines every model command: RO system runtime, RW workspace
-  + session tmp + own state + `/tmp`. `~/.ssh`, shell configs, sibling
-  projects, and cloud credentials are simply unreachable.
+  + session tmp + `/tmp`. The state dir, `~/.ssh`, shell configs, sibling
+  projects, and cloud credentials are simply unreachable. Provider `curl`
+  gets its own tighter profile: system RO, per-request staging dir RW,
+  network allowed, foreign-arch syscalls killed, tight rlimits.
+- **Key broker, not key sharing**: provider keys live only in the parent's
+  environment and per-request 0600 staging. No keyfile is ever handed to a
+  child, no session id / depth / parent flag travels via env (a recursive
+  `pocket` reads those from `$TMPDIR/pocket.parent`), and keys never appear
+  in argv, logs, or session files.
 - **NO_NEW_PRIVS** on every model child; setuid/sudo gains impossible.
 - **Sanitized environment**: default-deny allowlist (`PATH HOME USER LANG
   TERM PWD TMPDIR ...` + `LC_*`); `*_API_KEY/*_TOKEN/*_SECRET/AWS_*/SSH_*`
-  never pass. Deliberate passthrough only via user-level `expose_env`.
-- **Network isolation** via seccomp (blocks `AF_INET/AF_INET6 socket()`,
-  keeps `AF_UNIX`), enforced without privileges. `--network` lifts it
-  explicitly for one invocation. `seccomp unavailable` is reported, not
-  hidden.
+  never pass. Deliberate passthrough only via user-level `expose_env`
+  (with a stderr warning for secret-looking names).
+- **Network isolation** via seccomp (INET sockets fail `ECONNREFUSED`,
+  `AF_UNIX` untouched, foreign-arch syscalls kill the process), enforced
+  without privileges and inherited by the whole subtree. Applies only under
+  `--offline`; `seccomp unavailable` is reported, not hidden. On kernels
+  without seccomp the guard + parent-net propagation are the backstop.
+- **SSH**: `ssh`/`git` remotes work as normal tool-network clients. Agent
+  keys are NOT forwarded by default (`SSH_AUTH_SOCK` is scrubbed); opt in
+  with user-level `expose_env: ["SSH_AUTH_SOCK"]` when you want the agent
+  pushing over ssh. The fake `$HOME` carries no keys either way.
 - **Destructive-command guard**: last-resort screening (`rm -rf .`, `git
   reset --hard`, `git clean -f`, `mkfs`, `dd of=/dev`, fork bombs,
   `chmod -R /`, ...) → human `[y/N]` approval in the TUI, fail-closed in
@@ -282,7 +330,7 @@ Mechanisms (a few Linux primitives, not a policy framework):
 - **Terminal sanitization**: ESC/CSI/OSC/C0 stripped from all untrusted
   output before rendering.
 - **Explicit overrides only**: `--allow-read/--allow-write PATH`,
-  `--network`, `--allow-root`, `--allow-destructive`, `--unsafe`.
+  `--offline`, `--allow-root`, `--allow-destructive`, `--unsafe`.
   `--unsafe` is conspicuous, never default, never persisted, never
   inheritable by children, never activatable by repo files or the model.
 
@@ -312,9 +360,10 @@ and provider keys stay out of the model environment.
 ```
 
 ```bash
-make            # build ./pocket
-make test       # build + run 45 tests (functional + security)
-make install    # install to ~/.local/bin
+make               # build ./pocket
+make test          # build + run the suite (functional + security)
+make install       # install to ~/.local/bin
+make install-skills  # copy bundled skills to ~/.config/pocketharness/skills
 make clean
 ```
 
@@ -324,8 +373,10 @@ No extension/plugin API, hooks, event bus, MCP, dependency graph, councils,
 swarms, subagent/workflow frameworks, embedded browser, semantic memory,
 telemetry, local-ML helpers, prompt-injection systems,
 capability registries, Linux-command wrappers, DI frameworks, or enterprise
-ceremony. Boring function > framework; struct > hierarchy; file > service;
-subprocess > plugin; Linux primitive > custom subsystem; deletion >
-abstraction.
+ceremony. No libcurl/Boost/ncurses/OpenSSL linkage, no SQLite, no browser
+runtime, no `web_search` subsystem, no special Git or web tool, no
+background-job framework. Boring function > framework; struct > hierarchy;
+file > service; subprocess > plugin; Linux primitive > custom subsystem;
+deletion > abstraction.
 
 If PocketHarness starts resembling the frameworks it replaced, simplify.

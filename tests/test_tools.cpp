@@ -40,9 +40,6 @@ struct ToolFixture {
         env.workspace = auth.workspace;
         env.sessionTmp = tmp;
         env.sandboxHome = tmp + "/home";
-        env.sessionId = "test";
-        env.keyfile = tmp + "/kf";
-        env.depth = 1;
         ok = true;
     }
     ~ToolFixture() {
