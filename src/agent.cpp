@@ -106,6 +106,7 @@ VoidResult Agent::restore(const std::string& sessionId) {
     stats_.outTokens = m.outTokens;
     stats_.cacheHit = m.cacheHit;
     stats_.cacheMiss = m.cacheMiss;
+    stats_.genMs = m.genMs;
     stats_.cost = m.cost;
     stats_.cacheSeen = m.cacheSeen;
     stats_.costSeen = m.costSeen;
@@ -155,6 +156,7 @@ void Agent::appendSession(const SessionEvent& ev) {
     m.outTokens = stats_.outTokens;
     m.cacheHit = stats_.cacheHit;
     m.cacheMiss = stats_.cacheMiss;
+    m.genMs = stats_.genMs;
     m.cost = stats_.cost;
     m.cacheSeen = stats_.cacheSeen;
     m.costSeen = stats_.costSeen;
@@ -204,8 +206,10 @@ std::string Agent::requestOnce(std::vector<ToolCall>& callsOut, std::string& tex
     ChatCallbacks cb;
     cb.cancel = opts_.cancel;
     cb.onToken = opts_.onToken;
+    int64_t t0 = nowMs();
     auto r = chatRequest(req, cb, opts_.tmpDir);
     if (!r.ok) return r.error;
+    stats_.genMs += nowMs() - t0;
     if (r.value.inTokens >= 0) stats_.inTokens += r.value.inTokens;
     if (r.value.outTokens >= 0) stats_.outTokens += r.value.outTokens;
     if (r.value.cacheHit >= 0 || r.value.cacheMiss >= 0) {

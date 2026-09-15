@@ -473,6 +473,7 @@ Result<ChatResponse> chatRequest(const ChatRequest& req, const ChatCallbacks& cb
     o.exe = "curl";
     o.argv = {"curl",
               "-sS",
+              "-N",  // no buffering: SSE chunks must reach us as generated
               "--no-progress-meter",
               "--connect-timeout",
               "25",

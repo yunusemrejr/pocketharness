@@ -49,6 +49,7 @@ struct AgentOpts {
 struct AgentStats {
     long inTokens = 0;  // summed when the provider reports usage, else stays 0
     long outTokens = 0;
+    long genMs = 0;  // provider wall-time of successful requests (no tool time)
     int turns = 0;
     int toolCalls = 0;
     int compactions = 0;
