@@ -38,4 +38,12 @@ bool askApprovalCli(const std::string& cmd, const std::string& reason);
 // Exposed for tests.
 std::string renderLine(const std::string& line, bool& inFence);
 
+// Visible terminal columns of a string (ANSI zero-width, tabs = tab stops).
+// Exposed for tests.
+size_t visibleWidth(const std::string& s);
+
+// Compact counts for the status line: 999, 1k, 12.4k, 200k, 1.5M.
+// Exposed for tests.
+std::string fmtK(long n);
+
 }  // namespace pocket

@@ -67,6 +67,8 @@ export OPENROUTER_API_KEY=...
 Slash commands: `/model` `/thinking` `/compact` `/skills` `/session`
 `/security` `/help` `/quit`. Keys: Enter submits, Ctrl-J/Alt-Enter newline,
 Up/Down history, Ctrl-C cancels (empty prompt quits), Ctrl-D quits.
+Paste is bracketed (multi-line paste never submits early); the pinned bottom
+bar always shows the input box plus context/tok-s/cache KPIs.
 
 ## Recursive agency (no orchestration framework)
 

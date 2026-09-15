@@ -25,3 +25,29 @@ TEST(tui_RenderLine) {
     CHECK(c0.find("ab") != std::string::npos);
     return "";
 }
+
+TEST(tui_VisibleWidth) {
+    CHECK(visibleWidth("hello") == 5);
+    CHECK(visibleWidth("") == 0);
+    // ANSI color sequences are zero-width (prompt width math depends on this).
+    CHECK(visibleWidth("\033[1mhi\033[0m") == 2);
+    CHECK(visibleWidth("\033]0;title\aok") == 2);
+    // Tabs advance to 8-column stops, like the terminal does.
+    CHECK(visibleWidth("a\tb") == 9);
+    CHECK(visibleWidth("\t") == 8);
+    // C0 controls / DEL are dropped, multibyte chars count 1.
+    CHECK(visibleWidth("a\x01\x07" "b") == 2);
+    CHECK(visibleWidth("\xc3\xa9") == 1);
+    return "";
+}
+
+TEST(tui_FmtK) {
+    CHECK(fmtK(0) == "0");
+    CHECK(fmtK(999) == "999");
+    CHECK(fmtK(1000) == "1k");
+    CHECK(fmtK(12400) == "12.4k");
+    CHECK(fmtK(200000) == "200k");
+    CHECK(fmtK(1500000) == "1.5M");
+    CHECK(fmtK(-5) == "0");
+    return "";
+}
