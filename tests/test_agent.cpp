@@ -109,6 +109,36 @@ TEST(agent_System_Prompt_Override) {
     return "";
 }
 
+TEST(agent_Compact_Cut_Points) {
+    auto msg = [](const std::string& role) { return ChatMessage{role, "x", {}, ""}; };
+    CHECK_EQ(compactCutPoint({msg("user"), msg("assistant")}), (size_t)2);  // too short
+    // Short history starting at a user message: nothing worth dropping.
+    CHECK_EQ(compactCutPoint({msg("user"), msg("assistant"), msg("user"), msg("assistant"),
+                              msg("user")}),
+             (size_t)5);
+    // 12 alternating turns: keep last 8, cut lands on a user boundary.
+    std::vector<ChatMessage> twelve;
+    for (int i = 0; i < 12; ++i) twelve.push_back(msg(i % 2 == 0 ? "user" : "assistant"));
+    CHECK_EQ(compactCutPoint(twelve), (size_t)4);
+    CHECK_EQ(twelve[compactCutPoint(twelve)].role, std::string("user"));
+    // Cut must skip past a tool exchange, never split a call from its result.
+    std::vector<ChatMessage> chain = {msg("user"), msg("assistant")};
+    ChatMessage acall{"assistant", "", {{"c1", "bash", "{}"}}, ""};
+    chain.push_back(msg("user"));   // 2
+    chain.push_back(acall);         // 3 <- naive keepLast=8 cut (size 11)
+    chain.push_back(msg("tool"));   // 4
+    chain.push_back(msg("user"));   // 5
+    chain.push_back(msg("assistant"));
+    chain.push_back(msg("user"));
+    chain.push_back(msg("assistant"));
+    chain.push_back(msg("user"));
+    chain.push_back(msg("assistant"));  // size 11
+    size_t cut = compactCutPoint(chain);
+    CHECK_EQ(chain[cut].role, std::string("user"));
+    CHECK(cut == 5);  // skipped assistant@3 + tool@4, kept pair intact in summary zone
+    return "";
+}
+
 TEST(agent_Restore_Pairs_Tools) {
     std::string home = makeTempDir("pocket-arestore");
     CHECK(!home.empty());

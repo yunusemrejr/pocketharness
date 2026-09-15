@@ -98,6 +98,17 @@ void Agent::ensureMeta() {
 VoidResult Agent::restore(const std::string& sessionId) {
     opts_.sessionId = sessionId;
     ensureMeta();  // same session => same frozen prefix and sticky tag
+    SessionMeta m = sessionLoadMeta(sessionId).value;
+    stats_.turns = m.turns;
+    stats_.toolCalls = m.toolCalls;
+    stats_.compactions = m.compactions;
+    stats_.inTokens = m.inTokens;
+    stats_.outTokens = m.outTokens;
+    stats_.cacheHit = m.cacheHit;
+    stats_.cacheMiss = m.cacheMiss;
+    stats_.cost = m.cost;
+    stats_.cacheSeen = m.cacheSeen;
+    stats_.costSeen = m.costSeen;
     auto loaded = sessionLoad(sessionId);
     if (!loaded.ok) return VoidResult::Err(loaded.error);
     messages_.clear();
@@ -127,6 +138,20 @@ VoidResult Agent::restore(const std::string& sessionId) {
 void Agent::appendSession(const SessionEvent& ev) {
     if (opts_.sessionId.empty()) return;
     (void)sessionAppend(opts_.sessionId, ev);  // sessions are best-effort logs
+    // Piggyback cumulative counters on every event write: one call site,
+    // always current, still correct after a crash mid-turn.
+    SessionMeta m = sessionLoadMeta(opts_.sessionId).value;
+    m.turns = stats_.turns;
+    m.toolCalls = stats_.toolCalls;
+    m.compactions = stats_.compactions;
+    m.inTokens = stats_.inTokens;
+    m.outTokens = stats_.outTokens;
+    m.cacheHit = stats_.cacheHit;
+    m.cacheMiss = stats_.cacheMiss;
+    m.cost = stats_.cost;
+    m.cacheSeen = stats_.cacheSeen;
+    m.costSeen = stats_.costSeen;
+    sessionSaveMeta(opts_.sessionId, m);
 }
 
 long Agent::contextUsed() const {
@@ -178,14 +203,20 @@ std::string Agent::maybeCompact() {
     return compactNow();
 }
 
+size_t compactCutPoint(const std::vector<ChatMessage>& msgs, size_t keepLast) {
+    if (msgs.size() < 4) return msgs.size();  // nothing worth compacting
+    // Always cut at a plain user boundary so tool_use/tool_result pairing
+    // stays intact (agent invariant: results immediately follow their calls,
+    // no user text between).
+    size_t keepFrom = msgs.size() > keepLast ? msgs.size() - keepLast : 0;
+    while (keepFrom < msgs.size() && msgs[keepFrom].role != "user") ++keepFrom;
+    if (keepFrom == 0 || keepFrom >= msgs.size()) return msgs.size();
+    return keepFrom;
+}
+
 std::string Agent::compactNow() {
-    if (messages_.size() < 4) return "";  // nothing worth compacting
-    // Keep the most recent messages, but always cut at a plain user boundary
-    // so Anthropic tool_use/tool_result pairing stays intact (the agent
-    // invariant: results immediately follow their calls, no user text between).
-    size_t keepFrom = messages_.size() > 8 ? messages_.size() - 8 : 0;
-    while (keepFrom < messages_.size() && messages_[keepFrom].role != "user") ++keepFrom;
-    if (keepFrom == 0 || keepFrom >= messages_.size()) return "";
+    size_t keepFrom = compactCutPoint(messages_, 8);
+    if (keepFrom >= messages_.size()) return "";
     std::string old;
     for (size_t i = 0; i < keepFrom; ++i) {
         const auto& m = messages_[i];

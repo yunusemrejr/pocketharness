@@ -55,8 +55,13 @@ SessionEvent sessionEventFromJson(const json::Value& v);
 struct SessionMeta {
     std::string systemPrompt;  // frozen request prefix (system + instructions)
     std::string orSessionId;   // stable OpenRouter sticky-routing id
-    std::string modelSpec;     // informational: model active at creation
+    std::string modelSpec;     // model active at creation (restored on resume)
     std::string systemSource;  // "" = built-in base prompt, else override path
+    // Cumulative counters (restored on resume so /session tells the truth).
+    long turns = 0, toolCalls = 0, compactions = 0;
+    long inTokens = 0, outTokens = 0, cacheHit = 0, cacheMiss = 0;
+    double cost = 0;
+    bool cacheSeen = false, costSeen = false;
 };
 Result<SessionMeta> sessionLoadMeta(const std::string& id);  // missing => Ok(empty)
 VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m);

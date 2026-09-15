@@ -136,6 +136,16 @@ Result<SessionMeta> sessionLoadMeta(const std::string& id) {
     m.orSessionId = v.value.at("or_session_id").asStr();
     m.modelSpec = v.value.at("model").asStr();
     m.systemSource = v.value.at("system_source").asStr();
+    m.turns = v.value.at("turns").asInt(0);
+    m.toolCalls = v.value.at("tool_calls").asInt(0);
+    m.compactions = v.value.at("compactions").asInt(0);
+    m.inTokens = v.value.at("in_tokens").asInt(0);
+    m.outTokens = v.value.at("out_tokens").asInt(0);
+    m.cacheHit = v.value.at("cache_hit").asInt(0);
+    m.cacheMiss = v.value.at("cache_miss").asInt(0);
+    m.cost = v.value.at("cost").asNum(0);
+    m.cacheSeen = v.value.at("cache_seen").asBool(false);
+    m.costSeen = v.value.at("cost_seen").asBool(false);
     return Result<SessionMeta>::Ok(m);
 }
 
@@ -148,6 +158,16 @@ VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m) {
     o["or_session_id"] = json::Value(m.orSessionId);
     o["model"] = json::Value(m.modelSpec);
     o["system_source"] = json::Value(m.systemSource);
+    o["turns"] = json::Value((double)m.turns);
+    o["tool_calls"] = json::Value((double)m.toolCalls);
+    o["compactions"] = json::Value((double)m.compactions);
+    o["in_tokens"] = json::Value((double)m.inTokens);
+    o["out_tokens"] = json::Value((double)m.outTokens);
+    o["cache_hit"] = json::Value((double)m.cacheHit);
+    o["cache_miss"] = json::Value((double)m.cacheMiss);
+    o["cost"] = json::Value(m.cost);
+    o["cache_seen"] = json::Value(m.cacheSeen);
+    o["cost_seen"] = json::Value(m.costSeen);
     return atomicWriteFile(sessionDir() + "/" + id + ".meta.json",
                            json::stringify(json::Value(o), true) + "\n", 0600);
 }

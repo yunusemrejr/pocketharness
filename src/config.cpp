@@ -38,7 +38,7 @@ Config defaultConfig() {
     };
     c.models = {
         {"glm", "orcarouter", "glm-5.3-flash", "", 200000},
-        {"deepseek", "deepseek", "deepseek-flash", "", 128000},
+        {"deepseek", "deepseek", "deepseek-chat", "", 128000},
     };
     return c;
 }

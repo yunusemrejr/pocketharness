@@ -349,6 +349,18 @@ int pocketMain(int argc, char** argv) {
     if (resume) {
         auto r = agent.restore(sessionId);
         if (!r.ok) fprintf(stderr, "pocket: resume note: %s\n", r.error.c_str());
+        // A resumed session keeps the model it was created with (when that
+        // model still resolves); an explicit -m wins over history.
+        if (modelSpec.empty()) {
+            std::string sessModel = sessionLoadMeta(sessionId).value.modelSpec;
+            if (!sessModel.empty()) {
+                auto sm = resolveModel(cfg, sessModel);
+                if (sm.ok) {
+                    model = sm.value;
+                    agent.setModel(model, thinking);
+                }
+            }
+        }
     }
 
     std::string sysSrc = sessionLoadMeta(sessionId).value.systemSource;

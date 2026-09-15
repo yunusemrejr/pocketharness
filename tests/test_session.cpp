@@ -38,6 +38,36 @@ TEST(session_Append_Load_Crash_Safe) {
     return "";
 }
 
+TEST(session_Meta_Roundtrip) {
+    std::string home = makeTempDir("pocket-sessmeta");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    auto empty = sessionLoadMeta(id.value);
+    CHECK(empty.ok && empty.value.orSessionId.empty());
+    SessionMeta m;
+    m.systemPrompt = "SYS";
+    m.orSessionId = "OR123";
+    m.modelSpec = "p:model";
+    m.systemSource = "/tmp/sys.md";
+    m.turns = 3;
+    m.toolCalls = 7;
+    m.cacheHit = 100;
+    m.cacheSeen = true;
+    CHECK(sessionSaveMeta(id.value, m).ok);
+    auto back = sessionLoadMeta(id.value);
+    CHECK(back.ok);
+    CHECK_EQ(back.value.systemPrompt, std::string("SYS"));
+    CHECK_EQ(back.value.orSessionId, std::string("OR123"));
+    CHECK_EQ(back.value.turns, 3L);
+    CHECK_EQ(back.value.toolCalls, 7L);
+    CHECK_EQ(back.value.cacheHit, 100L);
+    CHECK(back.value.cacheSeen && !back.value.costSeen);
+    rmRf(home);
+    return "";
+}
+
 TEST(session_List_Resolve) {
     std::string home = makeTempDir("pocket-sess2");
     CHECK(!home.empty());

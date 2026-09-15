@@ -14,6 +14,11 @@
 
 namespace pocket {
 
+// Compaction cut point: index of the first message to KEEP, or msgs.size()
+// when compacting now would be wrong (too short, or no user boundary keeps
+// tool_use/tool_result pairing intact). Pure and unit-tested.
+size_t compactCutPoint(const std::vector<ChatMessage>& msgs, size_t keepLast = 8);
+
 // Small system prompt + project instructions (AGENTS.md / POCKET.md).
 // Pure enough to unit test: takes workspace, returns prompt text.
 // The base prompt is file-overridable: .pocket/system.md wins, then
