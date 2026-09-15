@@ -602,6 +602,18 @@ int landlockConfine(const ChildSpec& spec, uint64_t* handledOut) {
         int fd = open(path, O_PATH | O_CLOEXEC);
         if (fd < 0) return !required;
         bool ok = landlockAdd(rsfd, fd, access);
+        if (!ok && errno == EINVAL) {
+            // ponytail: Landlock rejects dir-only rights on non-dir nodes
+            // (/dev/null etc.); retry with the file-only subset.
+            uint64_t fileOnly = access & (LANDLOCK_ACCESS_FS_EXECUTE |
+                                          LANDLOCK_ACCESS_FS_WRITE_FILE |
+                                          LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_TRUNCATE
+#ifdef LANDLOCK_ACCESS_FS_IOCTL
+                                          | (uint64_t)LANDLOCK_ACCESS_FS_IOCTL
+#endif
+                                          );
+            if (fileOnly) ok = landlockAdd(rsfd, fd, fileOnly);
+        }
         close(fd);
         return ok || !required;
     };

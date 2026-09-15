@@ -240,6 +240,39 @@ TEST(sandbox_Child_Landlock_And_NoNewPrivs) {
     return "";
 }
 
+TEST(sandbox_Child_DevNodes_Usable) {
+    std::string e = setup();
+    CHECK(e.empty());
+    if (!sandboxCaps().landlock) {
+        printf("    [skip] Landlock unavailable on this kernel\n");
+        return "";
+    }
+    std::string tmp = makeTempDir("pocket-sbdev");
+    CHECK(ensureDir(tmp + "/home", 0700).ok);
+    ChildSpec cs;
+    cs.auth = &g_auth;
+    cs.workspace = g_auth.workspace;
+    cs.sessionTmp = tmp;
+    cs.allowNet = true;  // isolate the fs test from seccomp here
+    SpawnOpts o;
+    o.exe = "/bin/sh";
+    // /dev/null must open O_RDWR (git does this on every run), /dev/zero reads.
+    o.argv = {"sh", "-c",
+              "echo hi > /dev/null && echo RES-NULL-W-OK; "
+              "exec 3<>/dev/null && echo RES-NULL-RDWR-OK; "
+              "head -c 1 /dev/zero | wc -c | grep -q 1 && echo RES-ZERO-OK"};
+    o.env = buildChildEnv({}, g_auth.workspace, tmp, tmp + "/home", tmp + "/kf", "t", 1,
+                          true, false);
+    o.childSetup = [cs]() { childEnterSandbox(cs); };
+    SpawnResult r = spawn(o);
+    CHECK(r.ok && r.exitCode == 0);
+    CHECK(r.out.find("RES-NULL-W-OK") != std::string::npos);
+    CHECK(r.out.find("RES-NULL-RDWR-OK") != std::string::npos);
+    CHECK(r.out.find("RES-ZERO-OK") != std::string::npos);
+    rmRf(tmp);
+    return "";
+}
+
 TEST(sandbox_Child_Net_Denied) {
     std::string e = setup();
     CHECK(e.empty());
