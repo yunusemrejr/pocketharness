@@ -42,6 +42,7 @@ void usage() {
         "  --allow-read PATH    extra read root for native tools (repeatable)\n"
         "  --allow-write PATH   extra write root for native tools (repeatable)\n"
         "  --allow-destructive  -p mode: permit guard-flagged commands (explicit)\n"
+        "  --max-rounds N       cap model tool rounds per turn (default 100)\n"
         "  --unsafe             disable containment (conspicuous, never persisted)\n"
         "  --allow-root         permit agent execution as UID 0 (dangerous)\n"
         "  --help               this text\n"
@@ -110,6 +111,7 @@ int pocketMain(int argc, char** argv) {
     bool optNetwork = false, optUnsafe = false, optAllowRoot = false, optNoNetwork = false;
     bool optAllowDestructive = false;
     bool optHelp = false, optVersion = false;
+    int optMaxRounds = 0;  // 0 = no CLI override; config/default applies
     std::vector<std::string> allowRead, allowWrite;
 
     for (int i = 1; i < argc; ++i) {
@@ -135,7 +137,13 @@ int pocketMain(int argc, char** argv) {
         else if (a == "--unsafe") optUnsafe = true;
         else if (a == "--allow-root") optAllowRoot = true;
         else if (a == "--allow-destructive") optAllowDestructive = true;
-        else if (a == "--allow-read") allowRead.push_back(needVal("--allow-read"));
+        else if (a == "--max-rounds") {
+            optMaxRounds = atoi(needVal("--max-rounds").c_str());
+            if (optMaxRounds < 1 || optMaxRounds > 1000) {
+                fprintf(stderr, "pocket: --max-rounds needs 1..1000\n");
+                return 2;
+            }
+        } else if (a == "--allow-read") allowRead.push_back(needVal("--allow-read"));
         else if (a == "--allow-write") allowWrite.push_back(needVal("--allow-write"));
         else if (startsWithDash(a)) {
             fprintf(stderr, "pocket: unknown flag %s (see --help)\n", a.c_str());
@@ -354,6 +362,7 @@ int pocketMain(int argc, char** argv) {
     AgentOpts ao;
     ao.model = model;
     ao.thinking = thinking;
+    ao.maxRounds = optMaxRounds > 0 ? optMaxRounds : cfg.maxRounds;
     ao.tools = &tools;
     ao.sessionId = sessionId;
     Agent agent(ao);

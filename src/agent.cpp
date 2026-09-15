@@ -328,7 +328,7 @@ std::string Agent::runTurn(const std::string& userText) {
     appendSession(SessionEvent{"user", userText, "", "", "", true});
     stats_.turns++;
 
-    for (int round = 0; round < 50; ++round) {
+    for (int round = 0; round < opts_.maxRounds; ++round) {
         if (opts_.cancel && opts_.cancel->load()) return "cancelled";
         std::string cerr = maybeCompact();
         if (!cerr.empty() && opts_.onNotice) opts_.onNotice(cerr);
@@ -356,7 +356,8 @@ std::string Agent::runTurn(const std::string& userText) {
             appendSession(SessionEvent{"tool_result", content, tc.id, tc.name, "", tr.ok});
         }
     }
-    return "turn stopped after 50 tool rounds (please narrow the task)";
+    return "turn stopped after " + std::to_string(opts_.maxRounds) +
+           " tool rounds (partial work is saved; raise with --max-rounds N)";
 }
 
 }  // namespace pocket

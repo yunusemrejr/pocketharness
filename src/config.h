@@ -48,6 +48,7 @@ struct Config {
     // project config values for these are ignored (see config.cpp).
     bool toolNetwork = true;  // model tools may use the network unless denied
     int bashTimeoutSec = 120;
+    int maxRounds = 100;  // model<->tool rounds per user turn before stopping
     long outputLimitBytes = 262144;  // 256 KiB per tool result
     std::vector<std::string> allowRead;
     std::vector<std::string> allowWrite;

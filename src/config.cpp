@@ -185,6 +185,11 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
         if (t < 1 || t > 3600) return typeErr("bash_timeout", "1..3600 seconds");
         cfg.bashTimeoutSec = (int)t;
     }
+    if (secKey("max_rounds")) {
+        long m = o.at("max_rounds").asInt(-1);
+        if (m < 1 || m > 1000) return typeErr("max_rounds", "1..1000 rounds");
+        cfg.maxRounds = (int)m;
+    }
     if (secKey("output_limit")) {
         long t = o.at("output_limit").asInt(-1);
         if (t < 1024 || t > 8 * 1024 * 1024)

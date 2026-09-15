@@ -82,6 +82,28 @@ TEST(config_Invalid) {
     return "";
 }
 
+TEST(config_Max_Rounds_User_Only_And_Bounded) {
+    std::string home = makeTempDir("pocket-cfgrnd");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    std::string ws = home + "/ws";
+    CHECK(ensureDir(ws + "/.pocket", 0755).ok);
+    CHECK(ensureDir(userConfigDir(), 0755).ok);
+    CHECK_EQ(defaultConfig().maxRounds, 100);
+    // User value applies; project value is ignored (spend authority).
+    CHECK(atomicWriteFile(userConfigPath(), R"({"max_rounds":250})", 0644).ok);
+    CHECK(atomicWriteFile(projectConfigPath(ws), R"({"max_rounds":1000})", 0644).ok);
+    auto c = loadConfig(ws);
+    CHECK(c.ok && c.value.maxRounds == 250);
+    // Bounds enforced.
+    CHECK(atomicWriteFile(userConfigPath(), R"({"max_rounds":0})", 0644).ok);
+    CHECK(!loadConfig(ws).ok);
+    CHECK(atomicWriteFile(userConfigPath(), R"({"max_rounds":1001})", 0644).ok);
+    CHECK(!loadConfig(ws).ok);
+    rmRf(home);
+    return "";
+}
+
 TEST(config_Project_Providers_Ignored_And_Endpoints_Validated) {
     std::string home = makeTempDir("pocket-cfgprov");
     CHECK(!home.empty());

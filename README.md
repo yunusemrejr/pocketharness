@@ -135,6 +135,7 @@ One transparent user config, optional project overlay:
   "tool_network": true,
   "bash_timeout": 120,
   "output_limit": 262144,
+  "max_rounds": 100,
   "allow_read": [],
   "allow_write": [],
   "expose_env": []
@@ -142,7 +143,8 @@ One transparent user config, optional project overlay:
 ```
 
 Security-sensitive keys (`providers`, `tool_network`, `allow_read`,
-`allow_write`, `expose_env`, timeouts) from **project** config are ignored
+`allow_write`, `expose_env`, timeouts, `max_rounds`) from **project**
+config are ignored
 with a warning — a repository must never silently escalate its own authority,
 and especially never redirect provider endpoints (which decide where API
 keys are sent). Provider `base_url` must be `https`, or `http` loopback for

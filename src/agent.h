@@ -44,6 +44,7 @@ struct AgentOpts {
     ResolvedModel model;
     std::string thinking = "off";
     long maxTokens = 8192;     // completion budget; also the compaction reserve
+    int maxRounds = 100;       // model<->tool rounds per turn before stopping
     ToolEnv* tools = nullptr;  // not owned
     std::string sessionId;
     std::atomic<bool>* cancel = nullptr;
