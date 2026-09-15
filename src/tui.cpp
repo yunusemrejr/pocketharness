@@ -33,6 +33,7 @@ const char* C_YELLOW = "\033[33m";
 const char* C_MAGENTA = "\033[35m";
 const char* C_CYAN = "\033[36m";
 const char* C_RED = "\033[31m";
+const char* C_REV = "\033[7m";
 
 bool useColor() { return getenv("NO_COLOR") == nullptr && isatty(STDOUT_FILENO); }
 std::string col(const char* c) { return useColor() ? std::string(c) : std::string(); }
@@ -377,8 +378,17 @@ struct Editor {
     }
 };
 
+// Bytes read but not yet consumed (submit-chunk remainders). All raw-mode
+// readers go through readChunk so piped/scripted input is never lost.
+std::string g_stdinPend;
+
 // Read one input chunk (blocking). Returns false on EOF/error.
 bool readChunk(std::string& chunk) {
+    if (!g_stdinPend.empty()) {
+        chunk = std::move(g_stdinPend);
+        g_stdinPend.clear();
+        return true;
+    }
     char buf[128];
     ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
     if (n <= 0) return false;
@@ -532,6 +542,7 @@ std::optional<std::string> editLine(Editor& ed, const std::function<void()>& dra
                     if (trim(t).empty()) break;  // empty submit: ignore
                     if (ed.history.empty() || ed.history.back() != t) ed.history.push_back(t);
                     if (ed.history.size() > 200) ed.history.erase(ed.history.begin());
+                    g_stdinPend = chunk.substr(i + 1);  // keep typeahead for next reader
                     writeAll(STDOUT_FILENO, "\n");
                     return t;
                 }
@@ -704,6 +715,22 @@ std::string fmtK(long n) {
     char b[32];
     snprintf(b, sizeof(b), "%.1fM", n / 1000000.0);
     return b;
+}
+
+std::vector<size_t> pickFilter(const std::vector<std::string>& labels,
+                               const std::string& filter) {
+    std::vector<size_t> out;
+    std::string f = toLower(filter);
+    for (size_t i = 0; i < labels.size(); ++i)
+        if (f.empty() || toLower(labels[i]).find(f) != std::string::npos) out.push_back(i);
+    return out;
+}
+
+std::string cutBytes(const std::string& s, size_t maxB) {
+    if (s.size() <= maxB) return s;
+    size_t c = maxB;
+    while (c > 0 && ((unsigned char)s[c] & 0xC0) == 0x80) --c;
+    return s.substr(0, c);
 }
 
 bool askApprovalCli(const std::string& cmd, const std::string& reason) {
@@ -1048,6 +1075,210 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
 }
 
 // ---------------------------------------------------------------------------
+// Interactive picker: filter-as-you-type + arrow select, used by /model and
+// /thinking. Raw mode draws in place in the transcript; without a raw TTY it
+// degrades to a numbered list on cooked stdin.
+// ---------------------------------------------------------------------------
+struct PickResult {
+    bool submitted = false;
+    int index = -1;  // labels index, -1 = none
+    std::string filter;
+};
+
+PickResult pickCooked(const std::string& title, const std::vector<std::string>& labels,
+                      const std::string& initial) {
+    PickResult r;
+    writeAll(STDOUT_FILENO, sanitizeTerminal(title) + "\n");
+    for (size_t i = 0; i < labels.size(); ++i)
+        writeAll(STDOUT_FILENO,
+                 "  [" + std::to_string(i + 1) + "] " + sanitizeTerminal(labels[i]) + "\n");
+    writeAll(STDOUT_FILENO, "select number or type a value" +
+                                (initial.empty() ? "" : " [" + sanitizeTerminal(initial) + "]") +
+                                ": ");
+    std::string line;
+    if (!std::getline(std::cin, line)) return r;
+    line = trim(line);
+    if (line.empty()) line = initial;
+    bool num = !line.empty();
+    for (char c : line) num = num && c >= '0' && c <= '9';
+    if (num) {
+        long n = atol(line.c_str());
+        if (n >= 1 && (size_t)n <= labels.size()) {
+            r.submitted = true;
+            r.index = (int)n - 1;
+            return r;
+        }
+    }
+    if (line.empty()) return r;
+    r.submitted = true;
+    r.filter = line;
+    for (size_t i = 0; i < labels.size(); ++i)
+        if (labels[i] == line) r.index = (int)i;
+    return r;
+}
+
+PickResult pickRaw(const std::string& title, const std::vector<std::string>& labels,
+                   const std::string& initial) {
+    PickResult r;
+    std::string filter = initial, lastFilter = initial + "\n";  // force first refilter
+    size_t sel = 0, start = 0;
+    int lastRows = 0;
+    const int maxRows = 10;
+    std::vector<size_t> vis;
+    std::string esc;
+    bool inEsc = false, paste = false;
+    auto endEsc = [&]() {
+        inEsc = false;
+        esc.clear();
+    };
+    auto sync = [&] {  // refilter on change; callers must sync before using vis/sel
+        if (filter != lastFilter) {
+            vis = pickFilter(labels, filter);
+            sel = 0;
+            start = 0;
+            lastFilter = filter;
+        }
+        if (vis.empty()) sel = 0;
+        else if (sel >= vis.size()) sel = vis.size() - 1;
+    };
+    for (;;) {
+        if (g_winch) g_winch = 0;  // redrawn below with the fresh size anyway
+        sync();
+        if (sel < start) start = sel;
+        if (sel >= start + (size_t)maxRows) start = sel - maxRows + 1;
+        int W = termWidth();
+        size_t maxW = (size_t)(W > 8 ? W - 6 : 10);
+        std::string out = "\r\033[K";
+        for (int i = 1; i < lastRows; ++i) out += "\033[A\r\033[K";
+        out += col(C_BOLD) + cutBytes(sanitizeTerminal(title), maxW + 4) + col(C_RESET) +
+               "\033[K\n";
+        std::string fshow = filter;
+        if (fshow.size() > maxW) {  // show the tail while typing
+            size_t b = fshow.size() - maxW;
+            while (b < fshow.size() && ((unsigned char)fshow[b] & 0xC0) == 0x80) ++b;
+            fshow = "..." + fshow.substr(b);
+        }
+        out += "> " + sanitizeTerminal(fshow) + "\033[K\n";
+        size_t shown = 0;
+        for (size_t k = start; k < vis.size() && shown < (size_t)maxRows; ++k, ++shown) {
+            std::string lb = cutBytes(sanitizeTerminal(labels[vis[k]]), maxW);
+            if (k == sel)
+                out += col(C_BOLD) + "> " + col(C_REV) + lb + col(C_RESET) + "\033[K\n";
+            else
+                out += "  " + lb + "\033[K\n";
+        }
+        if (vis.empty()) {
+            out += col(C_DIM) + "  (no match — enter uses the typed text)" + col(C_RESET) +
+                   "\033[K\n";
+            shown = 1;
+        }
+        out += col(C_DIM) + "filter · up/down · enter · esc" + col(C_RESET) + "\033[K";
+        writeAll(STDOUT_FILENO, out);
+        lastRows = 2 + (int)shown + 1;
+        writeAll(STDOUT_FILENO, "\033[" + std::to_string(shown + 1) + "A\r\033[" +
+                                    std::to_string(2 + visibleWidth(fshow)) + "C");
+        auto finish = [&] {
+            std::string end = "\r";
+            for (size_t k = 0; k < shown + 1; ++k) end += "\033[B";
+            writeAll(STDOUT_FILENO, end + "\n");
+        };
+        std::string chunk;
+        if (inEsc && esc.empty()) {
+            if (!readMore(chunk, 40)) {
+                finish();
+                return r;  // lone ESC: cancel
+            }
+        } else if (!readChunk(chunk)) {
+            finish();
+            return r;  // EOF: cancel
+        }
+        for (size_t i = 0; i < chunk.size(); ++i) {
+            unsigned char c = (unsigned char)chunk[i];
+            if (inEsc) {
+                esc.push_back((char)c);
+                if (paste) {
+                    if (esc == "[201~") {
+                        paste = false;
+                        endEsc();
+                    } else if (std::string("[201~").compare(0, esc.size(), esc) != 0) {
+                        endEsc();
+                    }
+                    continue;
+                }
+                if (esc == "[200~") {
+                    paste = true;
+                    endEsc();
+                } else if (esc == "[A") {
+                    if (sel > 0) --sel;
+                    endEsc();
+                } else if (esc == "[B") {
+                    ++sel;
+                    endEsc();
+                } else if (esc.size() >= 6) {
+                    endEsc();
+                } else if (esc.size() >= 2 && esc[0] == '[' &&
+                           (isalpha((unsigned char)esc.back()) || esc.back() == '~')) {
+                    endEsc();
+                }
+                continue;
+            }
+            if (c == 0x1b) {
+                inEsc = true;
+                esc.clear();
+                continue;
+            }
+            if (paste) {
+                if (c != '\r' && c != '\n' && (c == '\t' || (c >= 0x20 && c != 0x7f)))
+                    filter.push_back((char)c);
+                continue;
+            }
+            switch (c) {
+                case '\r':
+                case '\n':
+                    sync();  // filter may have changed mid-chunk
+                    r.submitted = true;
+                    r.filter = filter;
+                    r.index = vis.empty() ? -1 : (int)vis[sel];
+                    g_stdinPend = chunk.substr(i + 1);
+                    finish();
+                    return r;
+                case 0x03:
+                case 0x04:
+                    g_stdinPend = chunk.substr(i + 1);
+                    finish();
+                    return r;
+                case 0x7f:
+                case 0x08:
+                    if (!filter.empty()) filter.erase(stepBack(filter, filter.size()));
+                    break;
+                case 0x15:
+                    filter.clear();
+                    break;
+                case 0x10:
+                    if (sel > 0) --sel;
+                    break;
+                case 0x0e:
+                    ++sel;
+                    break;
+                default:
+                    if (c >= 0x20 && c != 0x7f) filter.push_back((char)c);
+                    break;
+            }
+        }
+    }
+}
+
+PickResult pickOne(const std::string& title, const std::vector<std::string>& labels,
+                   const std::string& initial) {
+    if (g_term && g_term->active) return pickRaw(title, labels, initial);
+    return pickCooked(title, labels, initial);
+}
+
+bool validThinking(const std::string& t) {
+    return t == "off" || t == "low" || t == "medium" || t == "high" || t == "max";
+}
+
+// ---------------------------------------------------------------------------
 // Slash commands. Returns false when the session should end.
 // ---------------------------------------------------------------------------
 bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
@@ -1062,8 +1293,8 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
     if (cmd == "quit" || cmd == "exit" || cmd == "q") return false;
     if (cmd == "help") {
         say("commands:\n"
-            "  /model [spec]     show or switch model (provider:model[@routing] or alias)\n"
-            "  /thinking [level] show or set thinking (off/low/medium/high/max)\n"
+            "  /model [spec]     pick or switch model (filterable; provider:model works too)\n"
+            "  /thinking [level] pick or set thinking (off/low/medium/high/max)\n"
             "  /compact          summarize older context now\n"
             "  /skills [query]   list or search Markdown skills\n"
             "  /session          show session info and token usage\n"
@@ -1073,43 +1304,76 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             "keys: Enter submit · Ctrl-J/Alt-Enter newline · Up/Down history · Ctrl-C cancel/quit · Ctrl-D quit\n");
         return true;
     }
-    if (cmd == "model") {
-        if (args.empty()) {
-            std::string s = "current: " + opts.model.spec + " (" + opts.model.provider.protocol +
-                            " " + opts.model.provider.baseUrl + ")\naliases:\n";
-            for (const auto& m : opts.cfg->models)
-                s += "  " + m.alias + " = " + m.provider + ":" + m.model +
-                     (m.routing.empty() ? "" : "@" + m.routing) + "\n";
-            s += "providers:\n";
-            for (const auto& p : opts.cfg->providers) s += "  " + p.name + " (" + p.protocol + ")\n";
-            say(s);
-            return true;
-        }
-        auto rm = resolveModel(*opts.cfg, args);
+    auto useModel = [&](const std::string& spec) {
+        auto rm = resolveModel(*opts.cfg, spec);
         if (!rm.ok) {
             say(col(C_RED) + std::string("error: ") + rm.error + col(C_RESET) + "\n");
-            return true;
+            return;
         }
         opts.model = rm.value;
         agent.setModel(rm.value, opts.thinking);
-        saveUiState(UiState{rm.value.spec, opts.thinking});
+        SessionMeta m = sessionLoadMeta(opts.sessionId).value;
+        m.modelSpec = rm.value.spec;
+        sessionSaveMeta(opts.sessionId, m);
         say("model: " + rm.value.spec + "\n");
+    };
+    auto setLevel = [&](const std::string& t) {
+        opts.thinking = t;
+        agent.setModel(opts.model, t);
+        SessionMeta m = sessionLoadMeta(opts.sessionId).value;
+        m.thinking = t;
+        sessionSaveMeta(opts.sessionId, m);
+        say("thinking: " + t + "\n");
+    };
+    if (cmd == "model") {
+        if (!args.empty() && resolveModel(*opts.cfg, args).ok) {
+            useModel(args);  // exact spec: switch directly, no picker
+            return true;
+        }
+        std::vector<std::string> labels, specs;
+        for (const auto& m : opts.cfg->models) {
+            std::string lb = m.alias + " = " + m.provider + ":" + m.model +
+                             (m.routing.empty() ? "" : "@" + m.routing);
+            auto rm = resolveModel(*opts.cfg, m.alias);
+            if (rm.ok && rm.value.spec == opts.model.spec) lb += "  ●";
+            labels.push_back(lb);
+            specs.push_back(m.alias);
+        }
+        std::string provs;
+        for (const auto& p : opts.cfg->providers) provs += p.name + " ";
+        PickResult pr = pickOne("model — now: " + opts.model.spec + " (providers: " + trim(provs) +
+                                    "); type provider:model to use it directly",
+                                labels, args);
+        if (!pr.submitted) {
+            say("(cancelled)\n");
+            return true;
+        }
+        if (!pr.filter.empty() && resolveModel(*opts.cfg, pr.filter).ok) useModel(pr.filter);
+        else if (pr.index >= 0) useModel(specs[(size_t)pr.index]);
+        else useModel(pr.filter);  // invalid text: precise error, nothing switched
         return true;
     }
     if (cmd == "thinking") {
-        if (args.empty()) {
-            say("thinking: " + opts.thinking + " (off/low/medium/high/max)\n");
+        std::string t = toLower(args);
+        if (!args.empty() && validThinking(t)) {
+            setLevel(t);
             return true;
         }
-        std::string t = toLower(args);
-        if (t != "off" && t != "low" && t != "medium" && t != "high" && t != "max") {
+        if (!args.empty()) {
             say("usage: /thinking off|low|medium|high|max\n");
             return true;
         }
-        opts.thinking = t;
-        agent.setModel(opts.model, t);
-        saveUiState(UiState{opts.model.spec, t});
-        say("thinking: " + t + "\n");
+        static const std::vector<std::string> kLevels = {"off", "low", "medium", "high",
+                                                                 "max"};
+        PickResult pr = pickOne("thinking — now: " + opts.thinking, kLevels, "");
+        if (!pr.submitted) {
+            say("(cancelled)\n");
+            return true;
+        }
+        std::string f = toLower(pr.filter);
+        if (!f.empty() && validThinking(f)) setLevel(f);
+        else if (pr.index >= 0) setLevel(kLevels[(size_t)pr.index]);
+        else say("usage: /thinking off|low|medium|high|max\n");
         return true;
     }
     if (cmd == "compact") {

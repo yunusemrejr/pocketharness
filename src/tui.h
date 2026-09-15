@@ -46,4 +46,12 @@ size_t visibleWidth(const std::string& s);
 // Exposed for tests.
 std::string fmtK(long n);
 
+// Picker matching: indices of labels containing filter (case-insensitive;
+// empty filter matches all). Exposed for tests.
+std::vector<size_t> pickFilter(const std::vector<std::string>& labels,
+                               const std::string& filter);
+
+// Byte-truncate without splitting a UTF-8 sequence. Exposed for tests.
+std::string cutBytes(const std::string& s, size_t maxB);
+
 }  // namespace pocket

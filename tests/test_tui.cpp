@@ -51,3 +51,23 @@ TEST(tui_FmtK) {
     CHECK(fmtK(-5) == "0");
     return "";
 }
+
+TEST(tui_PickFilter) {
+    std::vector<std::string> labels = {"glm = orcarouter:z-ai/glm", "deepseek = deepseek:chat"};
+    CHECK(pickFilter(labels, "").size() == 2);
+    auto g = pickFilter(labels, "GLM");
+    CHECK(g.size() == 1 && g[0] == 0);  // case-insensitive
+    auto d = pickFilter(labels, "deep");
+    CHECK(d.size() == 1 && d[0] == 1);
+    CHECK(pickFilter(labels, "zzz").empty());
+    return "";
+}
+
+TEST(tui_CutBytes) {
+    CHECK(cutBytes("hello", 10) == "hello");
+    CHECK(cutBytes("hello", 3) == "hel");
+    // Never splits a UTF-8 sequence: "é" is 2 bytes, cut at 1 keeps nothing.
+    CHECK(cutBytes("a\xc3\xa9" "b", 2) == "a");
+    CHECK(cutBytes("a\xc3\xa9" "b", 3) == "a\xc3\xa9");
+    return "";
+}
