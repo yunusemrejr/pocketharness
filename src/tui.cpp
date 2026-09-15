@@ -1148,7 +1148,11 @@ PickResult pickRaw(const std::string& title, const std::vector<std::string>& lab
         if (sel >= start + (size_t)maxRows) start = sel - maxRows + 1;
         int W = termWidth();
         size_t maxW = (size_t)(W > 8 ? W - 6 : 10);
-        std::string out = "\r\033[K";
+        std::string out;
+        // Cursor rests on the filter row; drop to the last row before erasing,
+        // or each redraw paints a fresh copy below the stale one.
+        if (lastRows > 2) out += "\033[" + std::to_string(lastRows - 2) + "B";
+        out += "\r\033[K";
         for (int i = 1; i < lastRows; ++i) out += "\033[A\r\033[K";
         out += col(C_BOLD) + cutBytes(sanitizeTerminal(title), maxW + 4) + col(C_RESET) +
                "\033[K\n";
@@ -1489,14 +1493,15 @@ int tuiRun(TuiOpts& opts) {
         if (exitFlag || !input) break;
         std::string text = *input;
         if (trim(text).empty()) continue;
+        bar.draw();  // clear the submitted draft now; output follows below
         bar.toTranscript();
+        if (bar.active)  // pinned input isn't in the scrollback: echo it
+            writeAll(STDOUT_FILENO,
+                     col(C_BOLD) + "> " + col(C_RESET) + sanitizeTerminal(text) + "\n");
         if (text[0] == '/') {
             if (!runCommand(opts, agent, text)) break;
             continue;
         }
-        if (bar.active)  // pinned input isn't in the scrollback: echo it
-            writeAll(STDOUT_FILENO,
-                     col(C_BOLD) + "> " + col(C_RESET) + sanitizeTerminal(text) + "\n");
         runTurnInteractive(opts, agent, text, shared, cancel, &bar);
     }
 
