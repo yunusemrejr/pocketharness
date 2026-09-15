@@ -200,6 +200,56 @@ TEST(sandbox_Guard) {
     return "";
 }
 
+TEST(sandbox_Offline_Reasons_Are_Session_Final) {
+    // The model cannot lift --offline mid-session; the message must say so
+    // or agents burn rounds retrying blocked network commands.
+    GuardResult g = classifyCommand("curl https://x", "/ws", false);
+    CHECK(g.verdict == Verdict::Deny);
+    CHECK(g.reason.find("whole session") != std::string::npos);
+    CHECK(g.reason.find("do not retry") != std::string::npos);
+    g = classifyCommand("git push origin main", "/ws", false);
+    CHECK(g.verdict == Verdict::Deny);
+    CHECK(g.reason.find("whole session") != std::string::npos);
+    return "";
+}
+
+TEST(sandbox_Tmp_Readable_And_Addable_Root) {
+    std::string e = setup();
+    CHECK(e.empty());
+    // /tmp is an implicit read root: bash children already reach it, so
+    // `read` denying it only confused agents (e.g. files bash just wrote).
+    bool hasTmp = false;
+    for (const auto& r : g_auth.readRoots)
+        if (r == "/tmp") hasTmp = true;
+    CHECK(hasTmp);
+    std::string scratch = makeTempDir("pocket-sbtmp");
+    CHECK(!scratch.empty());
+    CHECK(atomicWriteFile(scratch + "/n.txt", "N\n", 0644).ok);
+    // scratch is under /tmp but outside the ws root: the /tmp root grants it.
+    CHECK(boxRead(g_auth, scratch + "/n.txt", 100).ok);
+    rmRf(scratch);
+    // authorityAddReadRoot grants one more root post-init (the session tmp
+    // dir, created after the authority). Fixture must live outside /tmp,
+    // which is now readable by default (same reason as g_outside).
+    std::string homeBase = homeDir() + "/.cache/pocket-test-" + randHex(3);
+    CHECK(ensureDir(homeBase + "/ws", 0755).ok);
+    CHECK(ensureDir(homeBase + "/sess", 0755).ok);
+    CHECK(atomicWriteFile(homeBase + "/sess/note.txt", "N\n", 0644).ok);
+    auto c = authorityInit(homeBase + "/ws", {}, {}, false);
+    CHECK(c.ok);
+    CHECK(!boxRead(c.value, homeBase + "/sess/note.txt", 100).ok);  // outside: denied
+    CHECK(authorityAddReadRoot(c.value, homeBase + "/sess").ok);
+    CHECK(boxRead(c.value, homeBase + "/sess/note.txt", 100).ok);  // now granted
+    CHECK(authorityAddReadRoot(c.value, homeBase + "/sess").ok);   // dedupe: no-op
+    CHECK(!authorityAddReadRoot(c.value, homeBase + "/missing").ok);
+    authorityClose(c.value);
+    auto u = authorityInit(homeBase + "/ws", {}, {}, true);  // unsafe: path tracked, no fd
+    CHECK(u.ok && authorityAddReadRoot(u.value, homeBase + "/sess").ok);
+    authorityClose(u.value);
+    rmRf(homeBase);
+    return "";
+}
+
 TEST(sandbox_Child_Landlock_And_NoNewPrivs) {
     std::string e = setup();
     CHECK(e.empty());

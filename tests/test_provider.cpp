@@ -178,6 +178,80 @@ TEST(provider_Models_Gemini_Shape) {
     return "";
 }
 
+TEST(provider_Retry_Policy) {
+    CHECK_EQ(kChatMaxAttempts, 4);
+    // Transport failures retry while the answer has not started.
+    CHECK(shouldRetryRequest(-1, true, false, false));
+    CHECK(shouldRetryRequest(0, true, false, false));
+    // Retryable HTTP statuses (rate limit / gateway trouble).
+    for (int c : {429, 500, 502, 503, 504}) CHECK(shouldRetryRequest(c, false, false, false));
+    // Client errors never retry: the payload is at fault, not the network.
+    for (int c : {200, 400, 401, 403, 404, 422}) CHECK(!shouldRetryRequest(c, false, false, false));
+    // No retry once tokens reached the UI (would duplicate output)...
+    CHECK(!shouldRetryRequest(503, false, false, true));
+    CHECK(!shouldRetryRequest(-1, true, false, true));
+    // ...or when curl hung past our own max-time (repeating a 10-minute
+    // hang is not a cooldown, it is a stall).
+    CHECK(!shouldRetryRequest(-1, true, true, false));
+    CHECK_EQ(retryDelayMs(1), 1000L);
+    CHECK_EQ(retryDelayMs(2), 2000L);
+    CHECK_EQ(retryDelayMs(3), 4000L);
+    CHECK(retryDelayMs(99) <= 30000L);  // capped
+    return "";
+}
+
+TEST(provider_OpenAi_Image_Body) {
+    ChatRequest req;
+    req.model = mkModel();
+    ChatMessage m{"user", "what is this?", {}, ""};
+    m.images = {{"image/png", "aGVsbG8="}};
+    req.messages = {m};
+    json::Value b = buildOpenAiBody(req);
+    const json::Value& c = b.at("messages").at(0).at("content");
+    CHECK(c.isArr() && c.size() == (size_t)2);
+    CHECK_EQ(c.at(0).at("type").asStr(), std::string("text"));
+    CHECK_EQ(c.at(0).at("text").asStr(), std::string("what is this?"));
+    CHECK_EQ(c.at(1).at("type").asStr(), std::string("image_url"));
+    CHECK_EQ(c.at(1).at("image_url").at("url").asStr(),
+             std::string("data:image/png;base64,aGVsbG8="));
+    // Plain messages keep the string form (no gratuitous reshaping).
+    req.messages = {{"user", "hi", {}, ""}};
+    CHECK(buildOpenAiBody(req).at("messages").at(0).at("content").isStr());
+    return "";
+}
+
+TEST(provider_Anthropic_Image_Body) {
+    ChatRequest req;
+    req.model = mkModel();
+    req.model.provider.protocol = "anthropic";
+    ChatMessage m{"user", "describe", {}, ""};
+    m.images = {{"image/jpeg", "QUJD"}};
+    req.messages = {m};
+    json::Value b = buildAnthropicBody(req);
+    const json::Value& c = b.at("messages").at(0).at("content");
+    CHECK(c.isArr() && c.size() == (size_t)2);
+    CHECK_EQ(c.at(1).at("type").asStr(), std::string("image"));
+    CHECK_EQ(c.at(1).at("source").at("media_type").asStr(), std::string("image/jpeg"));
+    CHECK_EQ(c.at(1).at("source").at("data").asStr(), std::string("QUJD"));
+    return "";
+}
+
+TEST(provider_ApiKey_Loopback_Keyless) {
+    // Loopback daemons run fine without auth: empty key, no error.
+    ProviderCfg local{"lm", "openai", "http://127.0.0.1:1234/v1", "POCKETTEST_MISSING_KEY"};
+    unsetenv("POCKETTEST_MISSING_KEY");
+    auto k = providerApiKey(local);
+    CHECK(k.ok && k.value.empty());
+    // Remote endpoints still demand a key.
+    ProviderCfg remote{"r", "openai", "https://api.example.com/v1", "POCKETTEST_MISSING_KEY"};
+    CHECK(!providerApiKey(remote).ok);
+    // ...unless one is actually configured.
+    EnvGuard g("POCKETTEST_MISSING_KEY", "k");
+    auto k2 = providerApiKey(remote);
+    CHECK(k2.ok && k2.value == "k");
+    return "";
+}
+
 TEST(provider_Stream_Reasoning_Captured) {
     OpenAiStreamAcc a;
     auto v = json::parse(R"({"choices":[{"delta":{"reasoning_content":"hmm"}}]})");

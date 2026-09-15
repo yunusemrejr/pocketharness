@@ -862,6 +862,13 @@ long cachePct(const AgentStats& st) {  // -1 when the provider doesn't report
     return st.cacheHit * 100 / denom;
 }
 
+long recentPct(const AgentStats& st) {  // steady-state rate, -1 until warm
+    if (st.cacheWindow.size() < 3) return -1;
+    long denom = st.recentHit + st.recentMiss;
+    if (denom <= 0) return -1;
+    return st.recentHit * 100 / denom;
+}
+
 std::string tpsText(const AgentStats& st) {
     if (st.genMs <= 0 || st.outTokens <= 0) return "— tok/s";
     char b[32];
@@ -876,7 +883,10 @@ std::string kpiText(TuiOpts& opts, Agent& agent, int cols) {
     long pct = max > 0 ? used * 100 / max : 0;
     std::string trio = "ctx " + fmtK(used) + "/" + fmtK(max) + " " + std::to_string(pct) + "%";
     trio += " · " + tpsText(st);
-    long cp = cachePct(st);
+    // Steady-state rate once warm (early cold requests would pin the
+    // cumulative average down for the whole session); else cumulative.
+    long cp = recentPct(st);
+    if (cp < 0) cp = cachePct(st);
     trio += cp < 0 ? " · cache —" : " · cache " + std::to_string(cp) + "%";
     std::string spec = sanitizeTerminal(shortModel(opts.model.spec));
     std::string full = trio + " · " + spec + " · " + sanitizeTerminal(opts.thinking);
@@ -1029,6 +1039,41 @@ void printBanner(TuiOpts& opts) {
         b += col(C_YELLOW) + std::string("note: openat2 unavailable — native file tools refuse symlinks entirely (strict fallback)") + col(C_RESET) + "\n";
     b += col(C_DIM) + "Enter submits · Ctrl-J newline · /help commands · Ctrl-C cancels · Ctrl-D quits" + col(C_RESET) + "\n";
     writeAll(STDOUT_FILENO, b);
+}
+
+// Pasted/dropped image paths in submitted input become vision attachments
+// for the turn; the tokens are rewritten to short markers. Callers keep
+// slash commands away (a command is never a message).
+std::string attachPastedImages(TuiOpts& opts, Agent& agent, const std::string& text) {
+    std::vector<ImageToken> found = collectImageTokens(text, opts.workspace);
+    if (found.empty()) return text;
+    auto note = [&](const std::string& s) {
+        writeAll(STDOUT_FILENO, col(C_DIM) + s + col(C_RESET) + "\n");
+    };
+    std::string out = text;
+    for (const auto& it : found) {
+        std::string err = agent.attachImage(it.path);
+        if (!err.empty()) {
+            note("(image skipped: " + sanitizeTerminal(err) + ")");
+            continue;
+        }
+        std::string mark = "[attached image: " + baseName(it.path) + "]";
+        // Replace the token as spelled (bare, quoted, or decorated with
+        // file://); the tokenizer strips quotes, so try those forms too.
+        bool done = false;
+        for (const std::string& form :
+             {it.token, "'" + it.token + "'", "\"" + it.token + "\"", it.path}) {
+            size_t at = out.find(form);
+            if (at != std::string::npos) {
+                out.replace(at, form.size(), mark);
+                done = true;
+                break;
+            }
+        }
+        if (!done) out += " " + mark;
+        note("(attached image: " + sanitizeTerminal(baseName(it.path)) + ")");
+    }
+    return out;
 }
 
 int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, SharedInput& shared,
@@ -1328,7 +1373,8 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             "  /security         show sandbox + authority state\n"
             "  /help             this text\n"
             "  /quit             exit\n"
-            "keys: Enter submit · Ctrl-J/Alt-Enter newline · Up/Down history · Ctrl-C cancel/quit · Ctrl-D quit\n");
+            "keys: Enter submit · Ctrl-J/Alt-Enter newline · Up/Down history · Ctrl-C cancel/quit · Ctrl-D quit\n"
+            "paste or drop an image file to attach it to the next message (vision models read it)\n");
         return true;
     }
     auto useModel = [&](const std::string& spec) {
@@ -1441,6 +1487,10 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             say("cache: " + std::to_string(st.cacheHit) + " hit / " +
                 std::to_string(st.cacheMiss) + " miss (" + std::to_string(cp) +
                 "% reported reuse)\n");
+            long rp = recentPct(st);
+            if (rp >= 0)
+                say("cache (last " + std::to_string(st.cacheWindow.size()) +
+                    " requests): " + std::to_string(rp) + "% reuse\n");
         } else {
             say("cache: unreported by provider\n");
         }
@@ -1523,6 +1573,7 @@ int tuiRun(TuiOpts& opts) {
         if (trim(text).empty()) continue;
         bar.draw();  // clear the submitted draft now; output follows below
         bar.toTranscript();
+        if (text[0] != '/') text = attachPastedImages(opts, agent, text);
         if (bar.active)  // pinned input isn't in the scrollback: echo it
             writeAll(STDOUT_FILENO,
                      col(C_BOLD) + "> " + col(C_RESET) + sanitizeTerminal(text) + "\n");
@@ -1604,6 +1655,7 @@ int lineRun(TuiOpts& opts) {
             if (!runCommand(opts, agent, line)) break;
             continue;
         }
+        line = attachPastedImages(opts, agent, line);
         rend = StreamRenderer{};
         g_endPartial = [&] { rend.endLine(); };
         if (!g_plain) writeAll(STDOUT_FILENO, "assistant:\n");

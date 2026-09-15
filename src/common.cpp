@@ -257,4 +257,21 @@ std::string baseName(const std::string& path) {
     return path.substr(i + 1);
 }
 
+std::string base64Encode(std::string_view in) {
+    static const char* kTab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < in.size(); i += 3) {
+        unsigned n = (unsigned char)in[i] << 16;
+        size_t len = in.size() - i;
+        if (len > 1) n |= (unsigned char)in[i + 1] << 8;
+        if (len > 2) n |= (unsigned char)in[i + 2];
+        out.push_back(kTab[(n >> 18) & 63]);
+        out.push_back(kTab[(n >> 12) & 63]);
+        out.push_back(len > 1 ? kTab[(n >> 6) & 63] : '=');
+        out.push_back(len > 2 ? kTab[n & 63] : '=');
+    }
+    return out;
+}
+
 }  // namespace pocket

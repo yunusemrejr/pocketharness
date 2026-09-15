@@ -35,6 +35,7 @@ void usage() {
         "  -m, --model SPEC     provider:model[@routing] or alias (default: config)\n"
         "  -t, --thinking LVL   off|low|medium|high|max\n"
         "  -p, --print PROMPT   non-interactive prompt (stdout = final answer)\n"
+        "  --image PATH         attach an image (PNG/JPEG/GIF/WebP, max 5 MiB, repeatable)\n"
         "  --resume [id]        resume a session (interactive unless -p)\n"
         "  --sessions           list sessions and exit\n"
         "  --network            allow network access for tools (on by default)\n"
@@ -112,7 +113,7 @@ int pocketMain(int argc, char** argv) {
     bool optAllowDestructive = false;
     bool optHelp = false, optVersion = false;
     int optMaxRounds = 0;  // 0 = no CLI override; config/default applies
-    std::vector<std::string> allowRead, allowWrite;
+    std::vector<std::string> allowRead, allowWrite, optImages;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -145,6 +146,7 @@ int pocketMain(int argc, char** argv) {
             }
         } else if (a == "--allow-read") allowRead.push_back(needVal("--allow-read"));
         else if (a == "--allow-write") allowWrite.push_back(needVal("--allow-write"));
+        else if (a == "--image") optImages.push_back(needVal("--image"));
         else if (startsWithDash(a)) {
             fprintf(stderr, "pocket: unknown flag %s (see --help)\n", a.c_str());
             return 2;
@@ -334,6 +336,10 @@ int pocketMain(int argc, char** argv) {
     std::string sessionTmp = tpl.data();
     std::string sandboxHome = sessionTmp + "/home";
     ensureDir(sandboxHome, 0700);
+    // The native `read` tool can see session scratch (pasted images land
+    // here too); model bash children already could.
+    if (auto rr = authorityAddReadRoot(auth, sessionTmp); !rr.ok)
+        fprintf(stderr, "pocket: note: %s\n", rr.error.c_str());
     // Parent-state file for a recursive `pocket` (depth/workspace/net grant).
     // Keys are deliberately NOT inherited: recursive instances authenticate
     // via explicit expose_env passthrough only.
@@ -369,6 +375,13 @@ int pocketMain(int argc, char** argv) {
     if (resume) {
         auto r = agent.restore(sessionId);
         if (!r.ok) fprintf(stderr, "pocket: resume note: %s\n", r.error.c_str());
+    }
+    for (const auto& img : optImages) {
+        std::string err = agent.attachImage(img);
+        if (!err.empty()) {
+            fprintf(stderr, "pocket: --image %s: %s\n", img.c_str(), err.c_str());
+            return 1;
+        }
     }
     if (!modelSpec.empty() || !thinkingCli.empty()) {
         SessionMeta m = sessionLoadMeta(sessionId).value;

@@ -14,7 +14,7 @@ std::vector<ToolDef> nativeToolDefs() {
     return {
         {"read",
          "Read a file (lines are 1-based, numbered). Paths relative to the workspace "
-         "or absolute inside allowed roots. Bounded output.",
+         "or absolute inside allowed roots (/tmp is readable too). Bounded output.",
          R"({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]})"},
         {"write",
          "Create or replace a file atomically. Parent directories are created inside "
@@ -25,9 +25,11 @@ std::vector<ToolDef> nativeToolDefs() {
          "(default 1), else the edit fails without touching the file.",
          R"({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"expected_matches":{"type":"integer"}},"required":["path","old_text","new_text"]})"},
         {"bash",
-         "Run a Linux command (bash -c) in the workspace with captured stdout/stderr, "
-         "timeout, filesystem sandboxing and network access. Use normal "
-         "programs (git, grep, make, ssh, ...) through this tool.",
+         "Run a Linux command (bash -c) with captured stdout/stderr, timeout, "
+         "filesystem sandboxing and network access. The workspace is already the "
+         "working directory: never cd there first. Use normal programs (git, grep, "
+         "make, ssh, ...) through this tool. When the session is offline, network "
+         "commands are blocked for the whole session: do not retry them.",
          R"({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]})"},
         {"skill",
          "Discover and load Markdown skills. Check the catalog (list) before domain "

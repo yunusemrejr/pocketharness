@@ -35,6 +35,10 @@ json::Value sessionEventToJson(const SessionEvent& ev) {
     if (!ev.toolName.empty()) o["name"] = json::Value(ev.toolName);
     if (!ev.toolArgs.empty()) o["args"] = json::Value(ev.toolArgs);
     if (ev.type == "tool_result") o["ok"] = json::Value(ev.toolOk);
+    if (ev.type == "image") {
+        o["file"] = json::Value(ev.imgFile);
+        o["mime"] = json::Value(ev.imgMime);
+    }
     return json::Value(o);
 }
 
@@ -46,6 +50,8 @@ SessionEvent sessionEventFromJson(const json::Value& v) {
     ev.toolName = v.at("name").asStr();
     ev.toolArgs = v.at("args").asStr();
     ev.toolOk = v.at("ok").asBool(true);
+    ev.imgFile = v.at("file").asStr();
+    ev.imgMime = v.at("mime").asStr();
     return ev;
 }
 

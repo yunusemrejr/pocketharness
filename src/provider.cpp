@@ -6,8 +6,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <time.h>
+
 #include <cstdio>
 #include <map>
+#include <optional>
 
 #include "process.h"
 #include "sandbox.h"
@@ -66,6 +69,22 @@ json::Value buildOpenAiBody(const ChatRequest& req) {
             json::Array tcs;
             for (const auto& tc : m.toolCalls) tcs.push_back(toolCallToOpenAi(tc));
             o["tool_calls"] = json::Value(tcs);
+        } else if (m.role == "user" && !m.images.empty()) {
+            o["role"] = json::Value("user");
+            json::Array parts;
+            json::Object t;
+            t["type"] = json::Value("text");
+            t["text"] = json::Value(m.content);
+            parts.push_back(json::Value(t));
+            for (const auto& img : m.images) {
+                json::Object u;
+                u["url"] = json::Value("data:" + img.mime + ";base64," + img.b64);
+                json::Object p;
+                p["type"] = json::Value("image_url");
+                p["image_url"] = json::Value(u);
+                parts.push_back(json::Value(p));
+            }
+            o["content"] = json::Value(parts);
         } else {
             o["role"] = json::Value(m.role);
             o["content"] = json::Value(m.content);
@@ -151,6 +170,24 @@ json::Value buildAnthropicBody(const ChatRequest& req) {
                 auto args = json::parse(tc.argsJson.empty() ? "{}" : tc.argsJson);
                 tu["input"] = args.ok ? args.value : json::Value(json::obj());
                 blocks.push_back(json::Value(tu));
+            }
+            o["content"] = json::Value(blocks);
+        } else if (m.role == "user" && !m.images.empty()) {
+            o["role"] = json::Value("user");
+            json::Array blocks;
+            json::Object t;
+            t["type"] = json::Value("text");
+            t["text"] = json::Value(m.content);
+            blocks.push_back(json::Value(t));
+            for (const auto& img : m.images) {
+                json::Object src;
+                src["type"] = json::Value("base64");
+                src["media_type"] = json::Value(img.mime);
+                src["data"] = json::Value(img.b64);
+                json::Object b;
+                b["type"] = json::Value("image");
+                b["source"] = json::Value(src);
+                blocks.push_back(json::Value(b));
             }
             o["content"] = json::Value(blocks);
         } else {
@@ -390,11 +427,30 @@ Result<std::string> providerApiKey(const ProviderCfg& prov) {
     // $keyEnv ONLY. No keyfile fallback: a recursive `pocket` inherits keys
     // solely through explicit expose_env passthrough in the user config, so
     // key flow is always a deliberate user decision, never ambient magic.
-    if (const char* v = getenv(prov.keyEnv.c_str())) {
-        if (v[0] != '\0') return Result<std::string>::Ok(v);
+    if (!prov.keyEnv.empty()) {
+        if (const char* v = getenv(prov.keyEnv.c_str())) {
+            if (v[0] != '\0') return Result<std::string>::Ok(v);
+        }
     }
+    // Local daemons usually run without auth; an empty key means "send no
+    // Authorization header at all" (never an empty bearer token).
+    if (prov.keyEnv.empty() || isLoopbackHttp(prov.baseUrl))
+        return Result<std::string>::Ok("");
     return Result<std::string>::Err("missing API key: export " + prov.keyEnv +
                                     " in your shell (recursive pocket: expose_env it)");
+}
+
+bool shouldRetryRequest(int httpCode, bool curlFailed, bool timedOut, bool emitted) {
+    if (emitted || timedOut) return false;  // visible output, or hung past max-time
+    if (curlFailed) return true;            // connect/DNS/reset: nothing answered
+    return httpCode == 429 || httpCode == 500 || httpCode == 502 || httpCode == 503 ||
+           httpCode == 504;
+}
+
+long retryDelayMs(int attempt) {
+    if (attempt < 1) attempt = 1;
+    long ms = 1000L << (attempt - 1);  // 1s, 2s, 4s, ...
+    return ms > 30000 ? 30000 : ms;
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +498,17 @@ int readHttpStatus(const std::string& hdrPath) {
         }
     }
     return code;
+}
+
+// Sleep ms in short slices so Ctrl-C also cancels a retry cooldown.
+bool sleepCancellable(long ms, std::atomic<bool>* cancel) {
+    int64_t end = nowMs() + ms;
+    struct timespec ts{0, 50 * 1000 * 1000};
+    for (;;) {
+        if (cancel && cancel->load()) return false;
+        if (nowMs() >= end) return true;
+        nanosleep(&ts, nullptr);
+    }
 }
 
 }  // namespace
@@ -496,14 +563,22 @@ long fetchModelContext(const ProviderCfg& prov, const std::string& modelId) {
         std::string stage = provStaging(tag);
         if (!stage.empty()) {
             std::string cfgPath = stage + "/curl.conf";
+            bool useKey = !k.value.empty();  // loopback daemons may run without auth
             std::string hdr =
                 prov.protocol == "anthropic" ? "x-api-key: " : "Authorization: Bearer ";
-            if (atomicWriteFile(cfgPath, "header = \"" + hdr + k.value + "\"\n", 0600).ok) {
+            bool staged =
+                !useKey ||
+                atomicWriteFile(cfgPath, "header = \"" + hdr + k.value + "\"\n", 0600).ok;
+            if (staged) {
                 std::string url = joinUrl(prov.baseUrl, "/models");
                 SpawnOpts o;
                 o.exe = "curl";
                 o.argv = {"curl", "-sS", "--no-progress-meter", "--connect-timeout", "8",
-                          "--max-time", "20", "--location", "-K", cfgPath, url};
+                          "--max-time", "20", "--location", url};
+                if (useKey) {
+                    o.argv.insert(o.argv.end() - 1, cfgPath);
+                    o.argv.insert(o.argv.end() - 1, "-K");
+                }
                 if (prov.protocol == "anthropic") {
                     o.argv.insert(o.argv.end() - 1, "-H");
                     o.argv.insert(o.argv.end() - 1, "anthropic-version: 2023-06-01");
@@ -549,170 +624,206 @@ Result<ChatResponse> chatRequest(const ChatRequest& req, const ChatCallbacks& cb
     }
     std::string url = isOpenAi ? joinUrl(req.model.provider.baseUrl, "/chat/completions")
                                : joinUrl(req.model.provider.baseUrl, "/messages");
+    std::string bodyJson = json::stringify(body);
+    bool useKey = !key.value.empty();  // loopback daemons may run without auth
 
-    // All staging lives in the per-request parent-only dir: the confined
-    // provider curl is granted exactly this dir, nothing else. (The
-    // child-visible session tmp is deliberately unreachable to it.)
-    std::string tag = randHex(4);
-    std::string stage = provStaging(tag);
-    if (stage.empty()) return Result<ChatResponse>::Err("cannot stage request");
-    std::string bodyPath = stage + "/req.json";
-    std::string hdrPath = stage + "/resp.hdr";
-    std::string cfgPath = stage + "/curl.conf";
-    {
-        auto w = atomicWriteFile(bodyPath, json::stringify(body), 0600);
-        if (!w.ok) return Result<ChatResponse>::Err("cannot stage request: " + w.error);
-        // curl -K config carries the secret header so the key never appears
-        // in argv (visible via /proc) or shell history.
-        std::string conf;
-        if (isOpenAi)
-            conf = "header = \"Authorization: Bearer " + key.value + "\"\n";
-        else
-            conf = "header = \"x-api-key: " + key.value + "\"\n";
-        auto w2 = atomicWriteFile(cfgPath, conf, 0600);
-        if (!w2.ok) return Result<ChatResponse>::Err("cannot stage request: " + w2.error);
-    }
-
-    SpawnOpts o;
-    o.exe = "curl";
-    o.argv = {"curl",
-              "-sS",
-              "-N",  // no buffering: SSE chunks must reach us as generated
-              "--no-progress-meter",
-              "--connect-timeout",
-              "25",
-              "--max-time",
-              "600",
-              "-X",
-              "POST",
-              "-K",
-              cfgPath,
-              "-H",
-              "Content-Type: application/json",
-              "-H",
-              "Accept: application/json",
-              "--data-binary",
-              "@" + bodyPath,
-              "-D",
-              hdrPath,
-              url};
-    if (isOpenAi) {
-        o.argv.insert(o.argv.end() - 1, "-H");
-        o.argv.insert(o.argv.end() - 1, "HTTP-Referer: https://github.com/yunusemrejr/pocketharness");
-    } else {
-        o.argv.insert(o.argv.end() - 1, "-H");
-        o.argv.insert(o.argv.end() - 1, "anthropic-version: 2023-06-01");
-    }
-    lockTransport(o.argv, url);
-    o.timeoutMs = 620000;
-    o.outLimit = 32 << 20;
-    o.cancel = cb.cancel;
-    ChildSpec cs;
-    cs.providerCurl = true;
-    cs.providerTmp = stage;
-    o.childSetup = [cs]() { childEnterSandbox(cs); };
-
-    std::string sseCarry;
-    OpenAiStreamAcc oacc;
-    AnthropicStreamAcc aacc;
-    std::string rawBody;  // non-streaming accumulator
-    o.onChunk = [&](std::string_view chunk, bool isErr) {
-        if (isErr) return;
-        if (!req.stream) {
-            rawBody.append(chunk.data(), chunk.size());
-            return;
-        }
-        for (const std::string& payload : sseSplit(chunk, sseCarry)) {
-            if (payload.empty() || payload == "[DONE]") continue;
-            auto v = json::parse(payload);
-            if (!v.ok) continue;  // keep-alive / partial: ignore
-            size_t before = isOpenAi ? oacc.text.size() : aacc.text.size();
-            size_t rBefore = isOpenAi ? oacc.reasoning.size() : aacc.reasoning.size();
-            if (isOpenAi)
-                oacc.feed(v.value);
-            else
-                aacc.feed(v.value);
-            size_t after = isOpenAi ? oacc.text.size() : aacc.text.size();
-            if (cb.onToken && after > before) {
-                const std::string& t = isOpenAi ? oacc.text : aacc.text;
-                cb.onToken(std::string_view(t.data() + before, after - before));
+    for (int attempt = 0;; ++attempt) {
+        if (cb.cancel && cb.cancel->load()) return Result<ChatResponse>::Err("cancelled");
+        // All staging lives in a per-attempt parent-only dir: the confined
+        // provider curl is granted exactly this dir, nothing else. (The
+        // child-visible session tmp is deliberately unreachable to it.)
+        std::string tag = randHex(4);
+        std::string stage = provStaging(tag);
+        if (stage.empty()) return Result<ChatResponse>::Err("cannot stage request");
+        std::string bodyPath = stage + "/req.json";
+        std::string hdrPath = stage + "/resp.hdr";
+        std::string cfgPath = stage + "/curl.conf";
+        {
+            auto w = atomicWriteFile(bodyPath, bodyJson, 0600);
+            if (!w.ok) {
+                rmdir(stage.c_str());
+                return Result<ChatResponse>::Err("cannot stage request: " + w.error);
             }
-            size_t rAfter = isOpenAi ? oacc.reasoning.size() : aacc.reasoning.size();
-            if (cb.onReasoning && rAfter > rBefore) {
-                const std::string& t = isOpenAi ? oacc.reasoning : aacc.reasoning;
-                cb.onReasoning(std::string_view(t.data() + rBefore, rAfter - rBefore));
-            }
-        }
-    };
-
-    SpawnResult r = spawn(o);
-    unlink(bodyPath.c_str());
-    unlink(cfgPath.c_str());
-    int http = readHttpStatus(hdrPath);
-    unlink(hdrPath.c_str());
-    rmdir(stage.c_str());  // last: only succeeds once the dir is empty
-
-    if (r.cancelled) return Result<ChatResponse>::Err("cancelled");
-    if (r.timedOut) return Result<ChatResponse>::Err("provider request timed out");
-    if (!r.ok || r.exitCode != 0) {
-        std::string msg = trim(r.err);
-        if (msg.size() > 500) msg = msg.substr(0, 500);
-        if (msg.empty()) msg = "curl failed (exit " + std::to_string(r.exitCode) + ")";
-        return Result<ChatResponse>::Err(msg);
-    }
-    if (http != -1 && (http < 200 || http >= 300)) {
-        std::string msg = "HTTP " + std::to_string(http);
-        // Error bodies may be JSON or SSE; extract a message cheaply.
-        std::string blob = req.stream ? std::string() : rawBody;
-        if (req.stream) {
-            // Re-scan stdout for an error payload.
-            std::string carry2;
-            for (const std::string& p : sseSplit(r.out, carry2)) {
-                if (p.empty() || p == "[DONE]") continue;
-                blob = p;
-                break;
-            }
-            if (blob.empty()) blob = r.out.substr(0, 2000);
-        }
-        auto v = json::parse(blob);
-        if (v.ok) {
-            std::string em = v.value.at("error").at("message").asStr();
-            if (em.empty()) em = v.value.at("message").asStr();
-            if (!em.empty()) msg += ": " + em.substr(0, 500);
-        } else if (!blob.empty()) {
-            msg += ": " + trim(blob).substr(0, 300);
-        }
-        return Result<ChatResponse>::Err(msg);
-    }
-
-    if (req.stream) {
-        // Flush any trailing payload without a newline.
-        if (!sseCarry.empty()) {
-            std::string line = trim(sseCarry);
-            if (startsWith(line, "data:")) {
-                auto v = json::parse(trim(line.substr(5)));
-                if (v.ok) {
-                    if (isOpenAi)
-                        oacc.feed(v.value);
-                    else
-                        aacc.feed(v.value);
+            // curl -K config carries the secret header so the key never
+            // appears in argv (visible via /proc) or shell history.
+            if (useKey) {
+                std::string conf;
+                if (isOpenAi)
+                    conf = "header = \"Authorization: Bearer " + key.value + "\"\n";
+                else
+                    conf = "header = \"x-api-key: " + key.value + "\"\n";
+                auto w2 = atomicWriteFile(cfgPath, conf, 0600);
+                if (!w2.ok) {
+                    unlink(bodyPath.c_str());
+                    rmdir(stage.c_str());
+                    return Result<ChatResponse>::Err("cannot stage request: " + w2.error);
                 }
             }
-            sseCarry.clear();
         }
-        ChatResponse resp = isOpenAi ? oacc.finish() : aacc.finish();
-        if (resp.text.empty() && resp.calls.empty() && !r.out.empty()) {
-            // Some gateways ignore stream:true and return plain JSON.
-            auto v = json::parse(r.out);
-            if (v.ok)
-                return isOpenAi ? parseOpenAiResponse(v.value) : parseAnthropicResponse(v.value);
-            return Result<ChatResponse>::Err("empty response from provider");
+
+        SpawnOpts o;
+        o.exe = "curl";
+        o.argv = {"curl",
+                  "-sS",
+                  "-N",  // no buffering: SSE chunks must reach us as generated
+                  "--no-progress-meter",
+                  "--connect-timeout",
+                  "25",
+                  "--max-time",
+                  "600",
+                  "-X",
+                  "POST",
+                  "-H",
+                  "Content-Type: application/json",
+                  "-H",
+                  "Accept: application/json",
+                  "--data-binary",
+                  "@" + bodyPath,
+                  "-D",
+                  hdrPath,
+                  url};
+        if (useKey) {
+            o.argv.insert(o.argv.begin() + 1, cfgPath);
+            o.argv.insert(o.argv.begin() + 1, "-K");
         }
-        return Result<ChatResponse>::Ok(std::move(resp));
+        if (isOpenAi) {
+            o.argv.insert(o.argv.end() - 1, "-H");
+            o.argv.insert(o.argv.end() - 1,
+                          "HTTP-Referer: https://github.com/yunusemrejr/pocketharness");
+        } else {
+            o.argv.insert(o.argv.end() - 1, "-H");
+            o.argv.insert(o.argv.end() - 1, "anthropic-version: 2023-06-01");
+        }
+        lockTransport(o.argv, url);
+        o.timeoutMs = 620000;
+        o.outLimit = 32 << 20;
+        o.cancel = cb.cancel;
+        ChildSpec cs;
+        cs.providerCurl = true;
+        cs.providerTmp = stage;
+        o.childSetup = [cs]() { childEnterSandbox(cs); };
+
+        std::string sseCarry;
+        OpenAiStreamAcc oacc;
+        AnthropicStreamAcc aacc;
+        std::string rawBody;  // non-streaming accumulator
+        bool emitted = false;  // any token reached the UI: retries would duplicate it
+        o.onChunk = [&](std::string_view chunk, bool isErr) {
+            if (isErr) return;
+            if (!req.stream) {
+                rawBody.append(chunk.data(), chunk.size());
+                return;
+            }
+            for (const std::string& payload : sseSplit(chunk, sseCarry)) {
+                if (payload.empty() || payload == "[DONE]") continue;
+                auto v = json::parse(payload);
+                if (!v.ok) continue;  // keep-alive / partial: ignore
+                size_t before = isOpenAi ? oacc.text.size() : aacc.text.size();
+                size_t rBefore = isOpenAi ? oacc.reasoning.size() : aacc.reasoning.size();
+                if (isOpenAi)
+                    oacc.feed(v.value);
+                else
+                    aacc.feed(v.value);
+                size_t after = isOpenAi ? oacc.text.size() : aacc.text.size();
+                if (cb.onToken && after > before) {
+                    const std::string& t = isOpenAi ? oacc.text : aacc.text;
+                    cb.onToken(std::string_view(t.data() + before, after - before));
+                    emitted = true;
+                }
+                size_t rAfter = isOpenAi ? oacc.reasoning.size() : aacc.reasoning.size();
+                if (cb.onReasoning && rAfter > rBefore) {
+                    const std::string& t = isOpenAi ? oacc.reasoning : aacc.reasoning;
+                    cb.onReasoning(std::string_view(t.data() + rBefore, rAfter - rBefore));
+                    emitted = true;
+                }
+            }
+        };
+
+        SpawnResult r = spawn(o);
+        unlink(bodyPath.c_str());
+        unlink(cfgPath.c_str());
+        int http = readHttpStatus(hdrPath);
+        unlink(hdrPath.c_str());
+        rmdir(stage.c_str());  // last: only succeeds once the dir is empty
+
+        if (r.cancelled) return Result<ChatResponse>::Err("cancelled");
+        bool transportFailed = !r.ok || r.exitCode != 0;
+        std::string failMsg;
+        if (r.timedOut) {
+            failMsg = "provider request timed out";
+        } else if (transportFailed) {
+            failMsg = trim(r.err);
+            if (failMsg.size() > 500) failMsg = failMsg.substr(0, 500);
+            if (failMsg.empty())
+                failMsg = "curl failed (exit " + std::to_string(r.exitCode) + ")";
+        } else if (http != -1 && (http < 200 || http >= 300)) {
+            failMsg = "HTTP " + std::to_string(http);
+            // Error bodies may be JSON or SSE; extract a message cheaply.
+            std::string blob = req.stream ? std::string() : rawBody;
+            if (req.stream) {
+                // Re-scan stdout for an error payload.
+                std::string carry2;
+                for (const std::string& p : sseSplit(r.out, carry2)) {
+                    if (p.empty() || p == "[DONE]") continue;
+                    blob = p;
+                    break;
+                }
+                if (blob.empty()) blob = r.out.substr(0, 2000);
+            }
+            auto v = json::parse(blob);
+            if (v.ok) {
+                std::string em = v.value.at("error").at("message").asStr();
+                if (em.empty()) em = v.value.at("message").asStr();
+                if (!em.empty()) failMsg += ": " + em.substr(0, 500);
+            } else if (!blob.empty()) {
+                failMsg += ": " + trim(blob).substr(0, 300);
+            }
+        }
+        if (!failMsg.empty()) {
+            bool retry = attempt + 1 < kChatMaxAttempts &&
+                         shouldRetryRequest(http, transportFailed, r.timedOut, emitted);
+            if (!retry) return Result<ChatResponse>::Err(failMsg);
+            long ms = retryDelayMs(attempt + 1);
+            if (cb.onNotice)
+                cb.onNotice("request failed (" + failMsg.substr(0, 120) + "); retry " +
+                            std::to_string(attempt + 2) + "/" +
+                            std::to_string(kChatMaxAttempts) + " in " +
+                            std::to_string(ms / 1000) + "s");
+            if (!sleepCancellable(ms, cb.cancel))
+                return Result<ChatResponse>::Err("cancelled");
+            continue;
+        }
+
+        if (req.stream) {
+            // Flush any trailing payload without a newline.
+            if (!sseCarry.empty()) {
+                std::string line = trim(sseCarry);
+                if (startsWith(line, "data:")) {
+                    auto v = json::parse(trim(line.substr(5)));
+                    if (v.ok) {
+                        if (isOpenAi)
+                            oacc.feed(v.value);
+                        else
+                            aacc.feed(v.value);
+                    }
+                }
+                sseCarry.clear();
+            }
+            ChatResponse resp = isOpenAi ? oacc.finish() : aacc.finish();
+            if (resp.text.empty() && resp.calls.empty() && !r.out.empty()) {
+                // Some gateways ignore stream:true and return plain JSON.
+                auto v = json::parse(r.out);
+                if (v.ok)
+                    return isOpenAi ? parseOpenAiResponse(v.value)
+                                    : parseAnthropicResponse(v.value);
+                return Result<ChatResponse>::Err("empty response from provider");
+            }
+            return Result<ChatResponse>::Ok(std::move(resp));
+        }
+        auto v = json::parse(rawBody.empty() ? r.out : rawBody);
+        if (!v.ok) return Result<ChatResponse>::Err("invalid JSON from provider: " + v.error);
+        return isOpenAi ? parseOpenAiResponse(v.value) : parseAnthropicResponse(v.value);
     }
-    auto v = json::parse(rawBody.empty() ? r.out : rawBody);
-    if (!v.ok) return Result<ChatResponse>::Err("invalid JSON from provider: " + v.error);
-    return isOpenAi ? parseOpenAiResponse(v.value) : parseAnthropicResponse(v.value);
 }
 
 }  // namespace pocket

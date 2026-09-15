@@ -43,6 +43,15 @@ Config defaultConfig() {
     return c;
 }
 
+bool isLoopbackHttp(const std::string& u) {
+    if (!startsWith(u, "http://")) return false;
+    std::string host = u.substr(7);
+    size_t end = host.find_first_of("/:");
+    if (end != std::string::npos) host = host.substr(0, end);
+    return host == "localhost" || startsWith(host, "127.") || host == "::1" ||
+           host == "[::1]";
+}
+
 namespace {
 
 const ProviderCfg* findProvider(const Config& c, const std::string& name) {
@@ -61,12 +70,7 @@ bool validEnvName(const std::string& n) {
 // https anywhere; plain http only for loopback (local Ollama-style daemons).
 bool validProviderUrl(const std::string& u) {
     if (startsWith(u, "https://")) return true;
-    if (!startsWith(u, "http://")) return false;
-    std::string host = u.substr(7);
-    size_t end = host.find_first_of("/:");
-    if (end != std::string::npos) host = host.substr(0, end);
-    return host == "localhost" || startsWith(host, "127.") || host == "::1" ||
-           host == "[::1]";
+    return isLoopbackHttp(u);
 }
 
 // Parse one config JSON object into cfg. If isProject is true, security
@@ -120,9 +124,13 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
                                            "\": base_url must be https, or http loopback "
                                            "(localhost/127./::1 for local daemons)");
                 pc.keyEnv = kv.second.at("key_env").asStr();
-                if (pc.keyEnv.empty())
-                    return VoidResult::Err("provider \"" + kv.first + "\" needs \"key_env\"");
-                if (!validEnvName(pc.keyEnv))
+                if (pc.keyEnv.empty()) {
+                    // Local daemons (LM Studio, Ollama, llama.cpp) usually run
+                    // without auth; remote endpoints always need a key.
+                    if (!isLoopbackHttp(pc.baseUrl))
+                        return VoidResult::Err("provider \"" + kv.first +
+                                               "\" needs \"key_env\"");
+                } else if (!validEnvName(pc.keyEnv))
                     return VoidResult::Err("provider \"" + kv.first +
                                            "\": key_env must be a shell variable name");
                 bool replaced = false;

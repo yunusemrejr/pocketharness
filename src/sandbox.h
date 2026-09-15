@@ -43,6 +43,9 @@ Result<Authority> authorityInit(const std::string& workspace,
                                 const std::vector<std::string>& allowWrite,
                                 bool unsafe);
 void authorityClose(Authority& a);
+// Grant one more read root after init (the session tmp dir, created after
+// the authority). Dedupes; unsafe mode skips fds exactly like init.
+VoidResult authorityAddReadRoot(Authority& a, const std::string& path);
 
 // Contained file operations for the native tools.
 Result<std::string> boxRead(const Authority& a, const std::string& path, size_t maxBytes);

@@ -10,12 +10,17 @@
 namespace pocket {
 
 struct SessionEvent {
-    std::string type;  // user|assistant|tool_call|tool_result|system|compact
+    std::string type;  // user|assistant|tool_call|tool_result|system|compact|image
     std::string text;
     std::string toolId;
     std::string toolName;
     std::string toolArgs;
     bool toolOk = true;
+    // "image" events only: persisted attachment (0600, under the session
+    // dir) reloaded on --resume. The JSONL line stays small; the bytes
+    // live in the file, never inline.
+    std::string imgFile{};
+    std::string imgMime{};
 };
 
 struct SessionInfo {

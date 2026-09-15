@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <string>
 #include <vector>
@@ -33,10 +34,40 @@ std::string buildSystemPrompt(const std::string& workspace);
 // Which base prompt is active: "" = built-in, else the override file path.
 std::string systemPromptSource(const std::string& workspace);
 
-// Wire copy of history for a request: all but the last 3 tool results are
-// cut to 500 chars (pairing ids intact). History on disk stays full.
-// contextUsed() mirrors this rule; keep the constants in sync.
+// Wire copy of history for a request: the last 3 tool results ride along
+// nearly whole (capped at kWireRecentCap), older ones are cut to
+// kWireOldCap chars (pairing ids intact). History on disk stays full.
+// contextUsed() mirrors this rule exactly; both go through wireCappedLen().
+// Small stable tails also keep provider prefix caches hot: only genuinely
+// new bytes re-cache instead of megabytes of shifting offsets.
+inline constexpr size_t kWireRecentFull = 3;
+inline constexpr size_t kWireRecentCap = 12000;
+inline constexpr size_t kWireOldCap = 500;
 std::vector<ChatMessage> trimWireHistory(const std::vector<ChatMessage>& msgs);
+// Exact on-wire length of a tool result under the trim rule (recent = one
+// of the last kWireRecentFull). Unit-tested against trimWireHistory.
+size_t wireCappedLen(size_t len, bool recent);
+
+// Vision attachments. Pasted/dropped image paths are detected in TUI input
+// (or given via --image), staged under the session dir + session tmp, and
+// sent inline with the next user message as OpenAI image_url / Anthropic
+// image blocks. Providers decide vision support; an attached image is
+// explicit user intent, so it is always sent.
+inline constexpr size_t kMaxImageBytes = 5 << 20;  // per image, raw file bytes
+inline constexpr size_t kMaxImagesPerMessage = 4;
+inline constexpr long kImageEstTokens = 2048;  // context estimate per image
+// MIME from magic bytes (PNG/JPEG/GIF/WebP), or "" when not an image.
+std::string sniffImageMime(std::string_view bytes);
+// Read + validate + base64 one image file. Error text on failure.
+Result<ChatImage> loadImageFile(const std::string& path);
+// Quote-aware path tokens from free text that resolve to existing image
+// files (token = original spelling for input rewriting, path = resolved).
+struct ImageToken {
+    std::string token;
+    std::string path;
+};
+std::vector<ImageToken> collectImageTokens(const std::string& text,
+                                           const std::string& workspace);
 
 // The conversation driver. Owns message history; ToolEnv drives tools;
 // session persistence happens here (one place, always consistent).
@@ -67,7 +98,17 @@ struct AgentStats {
     double cost = 0;
     bool cacheSeen = false;
     bool costSeen = false;
+    // Rolling window over the last kCacheWindow requests that reported
+    // cache usage: the steady-state hit rate once the prefix is warm.
+    // In-memory only (not persisted); cumulative counters stay in the sidecar.
+    std::deque<std::pair<long, long>> cacheWindow;
+    long recentHit = 0;
+    long recentMiss = 0;
 };
+
+inline constexpr size_t kCacheWindow = 20;
+// Record one request's reported (hit, miss) pair; negative = unreported.
+void noteCacheSample(AgentStats& st, long hit, long miss);
 
 class Agent {
   public:
@@ -83,6 +124,12 @@ class Agent {
 
     // Force compaction now (used by /compact). Error text or "".
     std::string compactNow();
+
+    // Queue an image file for the next user message ("", or error text).
+    // Persists bytes under the session dir (resume-safe) plus a working
+    // copy in the session tmp dir (visible to model tools).
+    std::string attachImage(const std::string& path);
+    size_t pendingImages() const { return pendingImages_.size(); }
 
     void setModel(const ResolvedModel& m, const std::string& thinking) {
         opts_.model = m;
@@ -117,6 +164,7 @@ class Agent {
     std::string system_;
     std::string orSessionId_;
     std::vector<ChatMessage> messages_;
+    std::vector<ChatImage> pendingImages_;
     AgentStats stats_;
     std::vector<ToolDef> toolDefs_;
 };

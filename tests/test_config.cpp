@@ -26,6 +26,39 @@ TEST(config_ResolveModel) {
     return "";
 }
 
+TEST(config_Loopback_Keyless) {
+    CHECK(isLoopbackHttp("http://127.0.0.1:1234/v1"));
+    CHECK(isLoopbackHttp("http://localhost:11434/v1"));
+    CHECK(isLoopbackHttp("http://127.9.9.9/x"));
+    CHECK(!isLoopbackHttp("https://127.0.0.1/v1"));  // loopback, but not plain http
+    CHECK(!isLoopbackHttp("http://api.example.com/v1"));
+    CHECK(!isLoopbackHttp("https://api.example.com/v1"));
+    std::string home = makeTempDir("pocket-cfglocal");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    std::string ws = home + "/ws";
+    CHECK(ensureDir(ws, 0755).ok);
+    CHECK(ensureDir(userConfigDir(), 0755).ok);
+    // Loopback provider without key_env: fine (local daemons run keyless).
+    CHECK(atomicWriteFile(userConfigPath(),
+                          R"({"providers":{"lmstudio":{"protocol":"openai",)"
+                          R"("base_url":"http://127.0.0.1:1234/v1"}}})",
+                          0644)
+              .ok);
+    auto c = loadConfig(ws);
+    CHECK(c.ok);
+    // Remote provider without key_env: still rejected.
+    CHECK(atomicWriteFile(userConfigPath(),
+                          R"({"providers":{"r":{"protocol":"openai",)"
+                          R"("base_url":"https://api.example.com/v1"}}})",
+                          0644)
+              .ok);
+    c = loadConfig(ws);
+    CHECK(!c.ok);
+    rmRf(home);
+    return "";
+}
+
 TEST(config_Project_Cannot_Escalate) {
     std::string home = makeTempDir("pocket-cfg");
     CHECK(!home.empty());

@@ -204,6 +204,140 @@ TEST(agent_Restore_Pairs_Tools) {
     return "";
 }
 
+TEST(agent_Wire_Trim_Caps) {
+    // Old tool results cut to 500, recent ones ride nearly whole (12000).
+    std::string big(20000, 'x');
+    std::vector<ChatMessage> msgs;
+    for (int i = 0; i < 5; ++i)
+        msgs.push_back(ChatMessage{"tool", big, {}, "c" + std::to_string(i)});
+    std::vector<ChatMessage> w = trimWireHistory(msgs);
+    CHECK_EQ(w.size(), (size_t)5);
+    for (int i = 0; i < 2; ++i) {  // aged out: 500 + marker
+        CHECK(w[i].content.find("wire-trimmed") != std::string::npos);
+        CHECK_EQ(w[i].content.size(), wireCappedLen(big.size(), false));
+    }
+    for (int i = 2; i < 5; ++i) {  // last 3: 12000 + marker
+        CHECK(w[i].content.find("wire-capped") != std::string::npos);
+        CHECK_EQ(w[i].content.size(), wireCappedLen(big.size(), true));
+    }
+    // Under the caps nothing is touched, and the contextUsed() mirror is
+    // exact everywhere: trimmed length always equals wireCappedLen().
+    for (size_t len : {(size_t)0, (size_t)1, (size_t)499, (size_t)500, (size_t)501,
+                       (size_t)11999, (size_t)12000, (size_t)12001, (size_t)100000}) {
+        std::vector<ChatMessage> one = {{"tool", std::string(len, 'y'), {}, "c0"}};
+        CHECK_EQ(trimWireHistory(one)[0].content.size(), wireCappedLen(len, true));
+        std::vector<ChatMessage> five;
+        for (int i = 0; i < 5; ++i) five.push_back({"tool", std::string(len, 'y'), {}, "c"});
+        CHECK_EQ(trimWireHistory(five)[0].content.size(), wireCappedLen(len, false));
+    }
+    std::vector<ChatMessage> small = {{"tool", "tiny", {}, "c0"}};
+    CHECK_EQ(trimWireHistory(small)[0].content, std::string("tiny"));
+    return "";
+}
+
+TEST(agent_Cache_Window) {
+    AgentStats st;
+    noteCacheSample(st, -1, -1);  // unreported: not a sample
+    CHECK(st.cacheWindow.empty() && st.recentHit == 0 && st.recentMiss == 0);
+    noteCacheSample(st, 90, 10);
+    noteCacheSample(st, 99, 1);
+    CHECK_EQ(st.cacheWindow.size(), (size_t)2);
+    CHECK_EQ(st.recentHit, 189L);
+    CHECK_EQ(st.recentMiss, 11L);
+    // Hit-only reporting (no miss counter) still samples.
+    noteCacheSample(st, 50, -1);
+    CHECK_EQ(st.recentMiss, 11L);
+    // Window evicts the oldest past 20.
+    for (int i = 0; i < 25; ++i) noteCacheSample(st, 100, 0);
+    CHECK_EQ(st.cacheWindow.size(), kCacheWindow);
+    CHECK_EQ(st.recentHit, 2000L);  // 20 x 100, the early samples evicted
+    CHECK_EQ(st.recentMiss, 0L);
+    return "";
+}
+
+TEST(agent_Image_Sniff_And_Load) {
+    CHECK_EQ(sniffImageMime("\x89PNG\r\n\x1a\n...."), std::string("image/png"));
+    CHECK_EQ(sniffImageMime("\xff\xd8\xff...."), std::string("image/jpeg"));
+    CHECK_EQ(sniffImageMime("GIF89a...."), std::string("image/gif"));
+    CHECK_EQ(sniffImageMime("GIF87a...."), std::string("image/gif"));
+    CHECK_EQ(sniffImageMime("RIFF....WEBP"), std::string("image/webp"));
+    CHECK(sniffImageMime("hello world, not an image").empty());
+    CHECK(sniffImageMime("").empty());
+    CHECK(sniffImageMime("\x89PNG").empty());  // truncated magic
+    std::string ws = makeTempDir("pocket-aimg");
+    CHECK(!ws.empty());
+    std::string png("\x89PNG\r\n\x1a\nPAYLOAD", 15);
+    CHECK(atomicWriteFile(ws + "/a.png", png, 0644).ok);
+    CHECK(atomicWriteFile(ws + "/t.txt", "just text", 0644).ok);
+    auto img = loadImageFile(ws + "/a.png");
+    CHECK(img.ok);
+    CHECK_EQ(img.value.mime, std::string("image/png"));
+    CHECK_EQ(img.value.b64, base64Encode(png));
+    CHECK(!loadImageFile(ws + "/t.txt").ok);    // not an image
+    CHECK(!loadImageFile(ws + "/missing").ok);  // not a file
+    rmRf(ws);
+    return "";
+}
+
+TEST(agent_Collect_Image_Tokens) {
+    std::string ws = makeTempDir("pocket-atok");
+    CHECK(!ws.empty());
+    CHECK(ensureDir(ws + "/proj", 0755).ok);
+    std::string png("\x89PNG\r\n\x1a\nPAYLOAD", 15);
+    CHECK(atomicWriteFile(ws + "/proj/shot.png", png, 0644).ok);
+    CHECK(atomicWriteFile(ws + "/proj/notes.txt", "hi", 0644).ok);
+    // Absolute, quoted-with-spaces, file:// and relative spellings.
+    CHECK(atomicWriteFile(ws + "/proj/my pic.png", png, 0644).ok);
+    std::string text = "look at " + ws + "/proj/shot.png and '" + ws + "/proj/my pic.png' plus " +
+                       "file://" + ws + "/proj/shot.png and notes.txt";
+    auto found = collectImageTokens(text, ws + "/proj");
+    CHECK_EQ(found.size(), (size_t)2);  // shot.png deduped (bare + file://)
+    CHECK_EQ(found[0].path, ws + "/proj/shot.png");
+    CHECK_EQ(found[1].path, ws + "/proj/my pic.png");
+    // Plain prose collects nothing; missing files are ignored.
+    CHECK(collectImageTokens("hello world, no paths here", ws + "/proj").empty());
+    CHECK(collectImageTokens("see /tmp/does-not-exist.png thanks", ws + "/proj").empty());
+    rmRf(ws);
+    return "";
+}
+
+TEST(agent_Attach_Restore_Images) {
+    std::string home = makeTempDir("pocket-aattach");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    std::string ws = home + "/ws";
+    CHECK(ensureDir(ws, 0755).ok);
+    std::string png("\x89PNG\r\n\x1a\nPAYLOAD", 15);
+    CHECK(atomicWriteFile(ws + "/s.png", png, 0644).ok);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    ToolEnv env;
+    env.workspace = ws;
+    env.sessionTmp = home + "/tmp";
+    CHECK(ensureDir(env.sessionTmp, 0700).ok);
+    AgentOpts ao;
+    ao.model = resolveModel(defaultConfig(), "glm").value;
+    ao.tools = &env;
+    ao.sessionId = id.value;
+    Agent a(ao);
+    CHECK(a.attachImage(ws + "/s.png").empty());
+    CHECK_EQ(a.pendingImages(), (size_t)1);
+    CHECK(a.attachImage(ws + "/s.png").empty());  // second attach still fine
+    CHECK_EQ(a.pendingImages(), (size_t)2);
+    // Simulate the turn's user event, then resume elsewhere: images reload.
+    CHECK(sessionAppend(id.value, SessionEvent{"user", "see [attached image: s.png]", "", "", "",
+                                              true})
+              .ok);
+    Agent b(ao);
+    CHECK(b.restore(id.value).ok);
+    CHECK_EQ(b.messageCount(), (size_t)1);
+    CHECK_EQ(b.messages()[0].images.size(), (size_t)2);
+    CHECK_EQ(b.messages()[0].images[0].mime, std::string("image/png"));
+    CHECK_EQ(b.messages()[0].images[0].b64, base64Encode(png));
+    rmRf(home);
+    return "";
+}
+
 TEST(agent_Restore_Compact_Boundary) {
     std::string home = makeTempDir("pocket-acompact");
     CHECK(!home.empty());

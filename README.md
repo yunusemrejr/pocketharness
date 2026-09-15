@@ -69,6 +69,9 @@ Slash commands: `/model` `/thinking` `/compact` `/skills` `/session`
 Up/Down history, Ctrl-C cancels (empty prompt quits), Ctrl-D quits.
 Paste is bracketed (multi-line paste never submits early); the pinned bottom
 bar always shows the input box plus context/tok-s/cache KPIs.
+Paste or drop an image file (PNG/JPEG/GIF/WebP, max 5 MiB) to attach it to
+the next message — vision models read it inline (`--image PATH` does the
+same for `-p`).
 
 ## Recursive agency (no orchestration framework)
 
@@ -98,7 +101,8 @@ compilers, test runners, todos, memory, or background jobs — the model uses
 normal programs through `bash`. Every wrapper would be another schema,
 authority boundary, test surface, and context cost.
 
-- **read** — bounded file reads (1-based, line-numbered, offset/limit).
+- **read** — bounded file reads (1-based, line-numbered, offset/limit)
+  from the workspace, allowed roots, the session tmp dir, and `/tmp`.
 - **write** — atomic create/replace (tmp file + rename), parents created
   inside allowed roots, never through symlinks.
 - **edit** — exact replacement; fails unless `old_text` occurs exactly
@@ -148,8 +152,25 @@ config are ignored
 with a warning — a repository must never silently escalate its own authority,
 and especially never redirect provider endpoints (which decide where API
 keys are sent). Provider `base_url` must be `https`, or `http` loopback for
-local daemons; `key_env` must be a shell variable name. Invalid config
+local daemons; `key_env` must be a shell variable name, and may be omitted
+entirely for loopback providers (LM Studio / Ollama / llama.cpp run keyless
+by default — no dummy key needed). Invalid config
 produces precise errors, never silent guesses.
+
+```json
+{
+  "providers": {
+    "lmstudio": { "protocol": "openai", "base_url": "http://127.0.0.1:1234/v1" }
+  },
+  "models": {
+    "local": { "provider": "lmstudio", "model": "<model-id-as-shown-in-lm-studio>" }
+  }
+}
+```
+
+Use the model id LM Studio shows in its server panel; the context window
+resolves live from the daemon's `/models` listing when published. Start the
+LM Studio server (default `127.0.0.1:1234`) before running pocket.
 
 ## Providers: wire protocols, not brands
 
@@ -179,6 +200,12 @@ bearer (`-K` config, 0600) in a fresh parent-only directory under the state
 dir; the key never appears in argv, logs, sessions, child environments, or
 any child-visible filesystem. The staging dir is unlinked after each
 request. PocketHarness ships no TLS/HTTP stack of its own.
+
+Failed requests retry with backoff instead of failing the turn: transport
+errors and HTTP 429/5xx are retried up to 4 attempts (1s/2s/4s cooldowns,
+announced in the UI, cancellable with Ctrl-C). Retries happen only while
+the answer has not started streaming — once tokens are visible, a failure
+fails fast rather than duplicating output. HTTP 4xx never retries.
 
 Thinking levels (`off/low/medium/high/max`, `/thinking`) map to
 `reasoning_effort` / Anthropic thinking budgets, and are omitted entirely
@@ -212,6 +239,13 @@ PocketHarness treats cache reuse as an invariant, not luck:
 Compaction legitimately establishes a new prefix; afterwards the new prefix
 stays stable again. There is no cache manager, daemon, or subsystem — just a
 stable prefix and honest counters.
+
+Two details keep the steady-state rate high: old tool results are trimmed
+on the wire (recent three capped at 12k chars, older at 500 — history on
+disk stays full), so each request re-caches only genuinely new bytes; and
+the TUI shows the rolling rate over the last 20 requests once warm, since
+early cold requests would otherwise pin the cumulative average down all
+session (`/session` prints both).
 
 ## System prompt
 

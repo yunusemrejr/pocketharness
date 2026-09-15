@@ -167,6 +167,14 @@ Result<Authority> authorityInit(const std::string& workspace,
                 a.readRoots.push_back(c.value);
         }
     }
+    // /tmp is world-readable scratch that model bash commands already reach
+    // (Landlock grants it); letting `read` see it too keeps the tools
+    // consistent instead of denying what bash just wrote. Best effort: a
+    // missing /tmp never fails startup.
+    if (auto c = canonicalDir("/tmp"); c.ok) {
+        if (std::find(a.readRoots.begin(), a.readRoots.end(), c.value) == a.readRoots.end())
+            a.readRoots.push_back(c.value);
+    }
     if (!unsafe) {
         for (const auto& r : a.readRoots) {
             int fd = openRootFd(r);
@@ -202,6 +210,20 @@ void authorityClose(Authority& a) {
         if (fd >= 0) close(fd);
     a.readFds.clear();
     a.writeFds.clear();
+}
+
+VoidResult authorityAddReadRoot(Authority& a, const std::string& path) {
+    auto c = canonicalDir(expandHome(path));
+    if (!c.ok) return VoidResult::Err(c.error);
+    if (std::find(a.readRoots.begin(), a.readRoots.end(), c.value) != a.readRoots.end())
+        return VoidResult::Ok();
+    if (!a.unsafe) {
+        int fd = openRootFd(c.value);
+        if (fd < 0) return VoidResult::Err("cannot open root fd for " + c.value);
+        a.readFds.push_back(fd);
+    }
+    a.readRoots.push_back(c.value);
+    return VoidResult::Ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,7 +1110,8 @@ GuardResult classifyCommand(const std::string& cmd, const std::string& workspace
             if (hasWord(c, *p)) {
                 r.verdict = Verdict::Deny;
                 r.reason = std::string("tool networking is disabled; command uses '") + *p +
-                           "' (drop --offline to allow, or use skills/files instead)";
+                           "'. It stays off for this whole session: do not retry network "
+                           "commands, continue offline with skills/files instead.";
                 return r;
             }
         }
@@ -1096,7 +1119,8 @@ GuardResult classifyCommand(const std::string& cmd, const std::string& workspace
             (hasWord(c, "clone") || hasWord(c, "push") || hasWord(c, "pull") ||
              hasWord(c, "fetch") || hasWord(c, "ls-remote"))) {
             r.verdict = Verdict::Deny;
-            r.reason = "tool networking is disabled; git remote operation blocked";
+            r.reason = "tool networking is disabled; git remote operation blocked. It stays "
+                       "off for this whole session: do not retry, continue offline.";
             return r;
         }
     }

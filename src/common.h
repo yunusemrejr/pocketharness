@@ -14,7 +14,7 @@
 namespace pocket {
 
 // Version of the harness binary.
-inline constexpr const char* kVersion = "0.1.0";
+inline constexpr const char* kVersion = "0.2.0";
 
 // ---------------------------------------------------------------------------
 // Result<T>: minimal error-or-value. Errors are human-readable strings.
@@ -83,5 +83,9 @@ std::string randHex(size_t bytes);
 
 // Basename of a path.
 std::string baseName(const std::string& path);
+
+// Standard base64 encoding (RFC 4648, with padding). Used for vision
+// image payloads; the harness never needs to decode base64.
+std::string base64Encode(std::string_view in);
 
 }  // namespace pocket

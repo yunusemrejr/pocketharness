@@ -75,6 +75,11 @@ Result<ResolvedModel> resolveModel(const Config& cfg, const std::string& spec);
 bool hasExplicitContext(const Config& cfg, const std::string& provider,
                         const std::string& model);
 
+// True for plain-http loopback URLs (local daemons: LM Studio, Ollama,
+// llama.cpp). Loopback providers need no API key: nothing secret crosses
+// a trust boundary when the server is on this machine.
+bool isLoopbackHttp(const std::string& url);
+
 // Built-in provider defaults used when no user config exists.
 Config defaultConfig();
 

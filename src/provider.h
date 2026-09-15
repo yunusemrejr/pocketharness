@@ -25,11 +25,19 @@ struct ToolDef {
     std::string paramsJson;  // JSON Schema object (serialized)
 };
 
+// One vision payload: raw bytes are base64'd once at attach time and the
+// data URL is rebuilt byte-identically on every request (cache-stable).
+struct ChatImage {
+    std::string mime;  // image/png|image/jpeg|image/gif|image/webp
+    std::string b64;   // base64-encoded file bytes
+};
+
 struct ChatMessage {
     std::string role;  // user|assistant|tool
     std::string content;
     std::vector<ToolCall> toolCalls;  // assistant messages only
     std::string toolCallId;           // tool messages only
+    std::vector<ChatImage> images{};  // user messages only (empty by default)
 };
 
 struct ChatRequest {
@@ -61,8 +69,19 @@ struct ChatResponse {
 struct ChatCallbacks {
     std::function<void(std::string_view token)> onToken;
     std::function<void(std::string_view chunk)> onReasoning;  // thinking preview
+    std::function<void(const std::string& note)> onNotice;    // retry cooldowns
     std::atomic<bool>* cancel = nullptr;
 };
+
+// Retry policy (pure, unit-tested). A failed request is retried only while
+// the answer has not started (emitted=false): once tokens reached the UI,
+// retrying would duplicate visible output. Retried: curl transport failures
+// and HTTP 429/5xx. Never retried: HTTP 4xx (the payload is at fault),
+// our own timeout, cancellation, and empty/unparseable 200s.
+inline constexpr int kChatMaxAttempts = 4;  // 1 initial + 3 retries
+bool shouldRetryRequest(int httpCode, bool curlFailed, bool timedOut, bool emitted);
+// Cooldown before attempt N (N>=1): 1s, 2s, 4s, ... capped at 30s.
+long retryDelayMs(int attempt);
 
 // Request-body builders (pure, unit-tested).
 json::Value buildOpenAiBody(const ChatRequest& req);
