@@ -1,0 +1,17 @@
+# Build products
+pocket
+src/*.o
+src/*.d
+tests/*.o
+tests/*.d
+tests/run_tests
+
+# Local dev scratch
+*.tmp.*
+*~
+
+# Never commit credentials, sessions, or private state
+*.key
+*.pem
+.env
+config.json
