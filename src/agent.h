@@ -19,6 +19,12 @@ namespace pocket {
 // tool_use/tool_result pairing intact). Pure and unit-tested.
 size_t compactCutPoint(const std::vector<ChatMessage>& msgs, size_t keepLast = 8);
 
+// History invariant: every tool message must answer a tool_call id issued by
+// a PRECEDING assistant message. Returns "" when valid, else a description.
+// Checked before every provider request so a corrupt history fails locally
+// with a clear message instead of a provider 400.
+std::string validateHistory(const std::vector<ChatMessage>& msgs);
+
 // Small system prompt + project instructions (AGENTS.md / POCKET.md).
 // Pure enough to unit test: takes workspace, returns prompt text.
 // The base prompt is file-overridable: .pocket/system.md wins, then
@@ -83,6 +89,7 @@ class Agent {
     long contextMax() const { return opts_.model.context; }
     const AgentStats& stats() const { return stats_; }
     size_t messageCount() const { return messages_.size(); }
+    const std::vector<ChatMessage>& messages() const { return messages_; }
     // The frozen request prefix and sticky routing tag for this session.
     const std::string& systemPrompt() const { return system_; }
     const std::string& sessionTag() const { return orSessionId_; }

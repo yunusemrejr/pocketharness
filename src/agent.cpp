@@ -118,12 +118,19 @@ VoidResult Agent::restore(const std::string& sessionId) {
         } else if (ev.type == "assistant") {
             messages_.push_back(ChatMessage{"assistant", ev.text, {}, ""});
         } else if (ev.type == "tool_call") {
-            if (!messages_.empty() && messages_.back().role == "assistant") {
-                ToolCall tc;
-                tc.id = ev.toolId;
-                tc.name = ev.toolName;
-                tc.argsJson = ev.toolArgs;
-                messages_.back().toolCalls.push_back(std::move(tc));
+            // Attach to the owning assistant message, scanning back past
+            // earlier results of the SAME round (one assistant message can
+            // carry several calls). Never cross a user boundary.
+            for (auto it = messages_.rbegin(); it != messages_.rend(); ++it) {
+                if (it->role == "assistant") {
+                    ToolCall tc;
+                    tc.id = ev.toolId;
+                    tc.name = ev.toolName;
+                    tc.argsJson = ev.toolArgs;
+                    it->toolCalls.push_back(std::move(tc));
+                    break;
+                }
+                if (it->role == "user") break;
             }
         } else if (ev.type == "tool_result") {
             messages_.push_back(ChatMessage{"tool", ev.text, {}, ev.toolId});
@@ -165,7 +172,27 @@ long Agent::contextUsed() const {
     return n;
 }
 
+std::string validateHistory(const std::vector<ChatMessage>& msgs) {
+    std::vector<std::string> issued;
+    for (const auto& m : msgs) {
+        if (m.role == "assistant") {
+            for (const auto& tc : m.toolCalls) issued.push_back(tc.id);
+        } else if (m.role == "tool") {
+            bool found = false;
+            for (const auto& id : issued)
+                if (id == m.toolCallId) {
+                    found = true;
+                    break;
+                }
+            if (!found) return "orphan tool result '" + m.toolCallId + "' (no preceding call)";
+        }
+    }
+    return "";
+}
+
 std::string Agent::requestOnce(std::vector<ToolCall>& callsOut, std::string& textOut) {
+    std::string bad = validateHistory(messages_);
+    if (!bad.empty()) return "corrupt conversation history: " + bad;
     ChatRequest req;
     req.model = opts_.model;
     req.system = system_;  // frozen prefix: byte-identical every request

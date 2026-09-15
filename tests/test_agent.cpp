@@ -139,6 +139,47 @@ TEST(agent_Compact_Cut_Points) {
     return "";
 }
 
+TEST(agent_History_Invariant) {
+    CHECK(validateHistory({{"user", "q", {}, ""}}).empty());
+    ChatMessage a{"assistant", "", {{"c1", "bash", "{}"}, {"c2", "read", "{}"}}, ""};
+    CHECK(validateHistory({{"user", "q", {}, ""}, a, {"tool", "o1", {}, "c1"},
+                           {"tool", "o2", {}, "c2"}})
+              .empty());
+    CHECK(!validateHistory({{"user", "q", {}, ""}, a, {"tool", "o1", {}, "c1"},
+                            {"tool", "oX", {}, "cX"}})
+              .empty());  // orphan result
+    CHECK(!validateHistory({{"tool", "early", {}, "c1"}, a}).empty());  // result first
+    return "";
+}
+
+TEST(agent_Restore_Multi_Call_Round) {
+    // Regression: one assistant message with TWO calls must restore both
+    // (interleaved call/result/call/result events).
+    std::string home = makeTempDir("pocket-amulti");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    CHECK(sessionAppend(id.value, SessionEvent{"user", "q", "", "", "", true}).ok);
+    CHECK(sessionAppend(id.value, SessionEvent{"assistant", "a", "", "", "", true}).ok);
+    CHECK(sessionAppend(id.value, SessionEvent{"tool_call", "", "c1", "bash", "{}", true}).ok);
+    CHECK(sessionAppend(id.value, SessionEvent{"tool_result", "o1", "c1", "", "", true}).ok);
+    CHECK(sessionAppend(id.value, SessionEvent{"tool_call", "", "c2", "read", "{}", true}).ok);
+    CHECK(sessionAppend(id.value, SessionEvent{"tool_result", "o2", "c2", "", "", true}).ok);
+    ToolEnv env;
+    env.workspace = home;
+    AgentOpts ao;
+    ao.model = resolveModel(defaultConfig(), "glm").value;
+    ao.tools = &env;
+    Agent agent(ao);
+    CHECK(agent.restore(id.value).ok);
+    CHECK_EQ(agent.messageCount(), (size_t)4);  // user, assistant+2calls, tool, tool
+    CHECK_EQ(agent.messages()[1].toolCalls.size(), (size_t)2);  // both calls kept
+    CHECK(validateHistory(agent.messages()).empty());  // provider-acceptable
+    rmRf(home);
+    return "";
+}
+
 TEST(agent_Restore_Pairs_Tools) {
     std::string home = makeTempDir("pocket-arestore");
     CHECK(!home.empty());
