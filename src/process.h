@@ -20,8 +20,9 @@ struct SpawnOpts {
     std::string stdinData;                 // fed to child stdin, then EOF
     long timeoutMs = 0;                    // 0 = no timeout
     size_t outLimit = 1 << 20;             // per-stream capture cap
+    bool stopOnLimit = false;             // provider streams: reject oversized responses
     std::function<void()> childSetup;      // runs in child before exec (async-safe only)
-    std::function<void(std::string_view, bool isErr)> onChunk;  // streaming callback
+    std::function<void(std::string_view, bool isErr)> onChunk;  // capped at outLimit per stream
     std::atomic<bool>* cancel = nullptr;   // set true to kill child
 };
 
@@ -40,7 +41,8 @@ struct SpawnResult {
 // Run a child synchronously. Never invokes a shell.
 SpawnResult spawn(const SpawnOpts& opts);
 
-// Resolve an executable via PATH (for display/validation only).
-std::string whichExe(const std::string& name);
+// Resolve PATH in the child's environment and working directory, before fork.
+std::string whichExe(const std::string& name, const std::string& workdir = "",
+                     const std::vector<std::string>& env = {});
 
 }  // namespace pocket

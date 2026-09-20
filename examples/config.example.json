@@ -1,0 +1,51 @@
+{
+  "default_model": "glm",
+  "thinking": "auto",
+  "providers": {
+    "orcarouter": {
+      "protocol": "openai",
+      "base_url": "https://api.orcarouter.ai/v1",
+      "key_env": "ORCAROUTER_API_KEY"
+    },
+    "openrouter": {
+      "protocol": "openai",
+      "base_url": "https://openrouter.ai/api/v1",
+      "key_env": "OPENROUTER_API_KEY"
+    },
+    "deepseek": {
+      "protocol": "openai",
+      "base_url": "https://api.deepseek.com/v1",
+      "key_env": "DEEPSEEK_API_KEY"
+    }
+  },
+  "models": {
+    "glm": {
+      "provider": "orcarouter",
+      "model": "z-ai/glm-5.3-flash"
+    },
+    "deepseek": {
+      "provider": "deepseek",
+      "model": "deepseek-flash"
+    },
+    "local": {
+      "provider": "ollama",
+      "model": "qwen3:8b",
+      "context": 8192,
+      "max_tokens": 2048,
+      "reasoning": "effort"
+    },
+    "claude": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "max_tokens": 8192,
+      "reasoning": "adaptive"
+    }
+  },
+  "tool_network": false,
+  "bash_timeout": 120,
+  "output_limit": 262144,
+  "allow_read": [],
+  "allow_write": [],
+  "expose_env": [],
+  "max_rounds": 100
+}

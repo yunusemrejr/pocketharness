@@ -1,5 +1,6 @@
 // PocketHarness tests - native tools end to end (contained temp workspace).
 #include "mini.h"
+#include <sys/stat.h>
 
 #include "../src/config.h"
 #include "../src/sandbox.h"
@@ -122,5 +123,52 @@ TEST(tools_Skill_List_Load) {
     r = runTool(f.env, "skill", R"({"action":"load","name":"nope"})");
     CHECK(!r.ok);
     rmRf(home);
+    return "";
+}
+
+TEST(tools_Batched_Edit_Is_Atomic) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(boxWrite(f.auth, "a", "alpha beta").ok);
+    auto r = runTool(f.env, "edit", R"({"path":"a","edits":[{"old_text":"alpha","new_text":"A"},{"old_text":"missing","new_text":"B"}]})");
+    CHECK(!r.ok);
+    CHECK_EQ(boxRead(f.auth, "a", 100).value, std::string("alpha beta"));
+    r = runTool(f.env, "edit", R"({"path":"a","edits":[{"old_text":"alpha","new_text":"A"},{"old_text":"beta","new_text":"B"}]})");
+    CHECK(r.ok);
+    CHECK_EQ(boxRead(f.auth, "a", 100).value, std::string("A B"));
+    // A wrong type must not silently become an empty replacement or empty file.
+    CHECK(!runTool(f.env, "write", R"({"path":"a","content":null})").ok);
+    CHECK(!runTool(f.env, "edit", R"({"path":"a","old_text":"A","new_text":false})").ok);
+    CHECK_EQ(boxRead(f.auth, "a", 100).value, std::string("A B"));
+    return "";
+}
+
+TEST(tools_Large_File_Ranges_And_Edit_Limit) {
+    ToolFixture f;
+    CHECK(f.ok);
+    std::string large;
+    for (int i = 0; i < 50000; ++i) large += std::string(100, 'x') + "\n";
+    large += "TAIL\n";
+    CHECK(boxWrite(f.auth, "large", large).ok);
+    auto r = runTool(f.env, "read", R"({"path":"large","offset":50001,"limit":1})");
+    CHECK(r.ok && r.output.find("50001| TAIL") != std::string::npos);
+    CHECK(r.output.size() < 100);
+    r = runTool(f.env, "edit", R"({"path":"large","old_text":"xxx","new_text":"X"})");
+    CHECK(!r.ok);
+    CHECK_EQ(readFileBounded(f.ws + "/large", 8 << 20).value, large);
+    CHECK(mkfifo((f.ws + "/fifo").c_str(), 0600) == 0);
+    CHECK(!runTool(f.env, "read", R"({"path":"fifo"})").ok);  // must not block
+    return "";
+}
+
+TEST(tools_Pipelines_And_Command_Validation) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(!runTool(f.env, "bash", R"({"command":"false | cat"})").ok);
+    CHECK(!runTool(f.env, "bash", R"({"command":"echo OK\u0000; echo HIDDEN"})").ok);
+    CHECK(!runTool(f.env, "bash", R"({"command":"echo OK","timeout":1.2})").ok);
+    CHECK(!runTool(f.env, "read", R"({"path":"a","limti":4})").ok);
+    for (const char* command : {"/bin/rm -rf /", "/sbin/mkfs.ext4 /dev/sda", "/usr/bin/curl https://x"})
+        CHECK(classifyCommand(command, f.ws, false).verdict == Verdict::Deny);
     return "";
 }

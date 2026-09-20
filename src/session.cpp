@@ -2,6 +2,8 @@
 #include "session.h"
 
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -30,6 +32,7 @@ bool validId(const std::string& id) {
 json::Value sessionEventToJson(const SessionEvent& ev) {
     json::Object o;
     o["t"] = json::Value(ev.type);
+    if (!ev.replay.isNull()) o["replay"] = ev.replay;
     if (!ev.text.empty()) o["text"] = json::Value(ev.text);
     if (!ev.toolId.empty()) o["id"] = json::Value(ev.toolId);
     if (!ev.toolName.empty()) o["name"] = json::Value(ev.toolName);
@@ -45,6 +48,7 @@ json::Value sessionEventToJson(const SessionEvent& ev) {
 SessionEvent sessionEventFromJson(const json::Value& v) {
     SessionEvent ev;
     ev.type = v.at("t").asStr();
+    ev.replay = v.at("replay");
     ev.text = v.at("text").asStr();
     ev.toolId = v.at("id").asStr();
     ev.toolName = v.at("name").asStr();
@@ -73,7 +77,38 @@ Result<std::string> sessionCreate() {
 
 VoidResult sessionAppend(const std::string& id, const SessionEvent& ev) {
     if (!validId(id)) return VoidResult::Err("bad session id");
+    // Remove an uncommitted tail before appending the next durable event.
+    int fd = open(sessionPath(id).c_str(), O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return VoidResult::Err("cannot open session " + id);
+    off_t end = lseek(fd, 0, SEEK_END);
+    char c = '\n';
+    bool ok = end >= 0 && (end == 0 || pread(fd, &c, 1, end - 1) == 1);
+    if (ok && c != '\n') {
+        char buf[4096];
+        while (ok && end > 0) {
+            size_t n = std::min((off_t)sizeof(buf), end);
+            end -= n;
+            ok = pread(fd, buf, n, end) == (ssize_t)n;
+            if (!ok) break;
+            std::string_view chunk(buf, n);
+            size_t nl = chunk.rfind('\n');
+            if (nl != std::string_view::npos) { end += nl + 1; break; }
+        }
+        if (ok) ok = ftruncate(fd, end) == 0;
+    }
+    close(fd);
+    if (!ok) return VoidResult::Err("cannot repair session tail");
     return appendLine(sessionPath(id), json::stringify(sessionEventToJson(ev)));
+}
+
+Result<int> sessionLock(const std::string& id) {
+    if (!validId(id)) return Result<int>::Err("bad session id");
+    int fd = open((sessionDir() + "/" + id + ".lock").c_str(),
+                  O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return Result<int>::Err("cannot lock session " + id);
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) return Result<int>::Ok(fd);
+    close(fd);
+    return Result<int>::Err("session " + id + " is active in another process");
 }
 
 Result<SessionLoad> sessionLoad(const std::string& id) {
@@ -81,10 +116,16 @@ Result<SessionLoad> sessionLoad(const std::string& id) {
     auto t = readFileBounded(sessionPath(id), 64 << 20);
     if (!t.ok) return Result<SessionLoad>::Err(t.error);
     SessionLoad out;
+    // Even valid JSON without a newline is an uncommitted/torn event.
+    if (!t.value.empty() && t.value.back() != '\n') {
+        size_t nl = t.value.rfind('\n');
+        t.value.resize(nl == std::string::npos ? 0 : nl + 1);
+        ++out.skipped;
+    }
     for (const std::string& line : splitLines(t.value)) {
         if (trim(line).empty()) continue;
         auto v = json::parse(line);
-        if (!v.ok) {
+        if (!v.ok || !v.value.isObj() || !v.value.at("t").isStr()) {
             // Partial final line from a crash, or corruption: skip, keep going.
             out.skipped++;
             continue;
@@ -94,7 +135,7 @@ Result<SessionLoad> sessionLoad(const std::string& id) {
     return Result<SessionLoad>::Ok(std::move(out));
 }
 
-std::vector<SessionInfo> sessionList(size_t max) {
+std::vector<SessionInfo> sessionList(size_t max, const std::string& workspace) {
     std::vector<SessionInfo> out;
     DIR* d = opendir(sessionDir().c_str());
     if (!d) return out;
@@ -110,13 +151,27 @@ std::vector<SessionInfo> sessionList(size_t max) {
     std::sort(names.begin(), names.end(), std::greater<std::string>());
     for (const auto& id : names) {
         if (out.size() >= max) break;
+        auto meta = sessionLoadMeta(id);
+        if (!meta.ok || (!workspace.empty() && meta.value.workspace != workspace)) continue;
         SessionInfo si;
         si.id = id;
         si.path = sessionPath(id);
-        auto loaded = sessionLoad(id);
-        if (!loaded.ok) continue;
-        si.events = (long)loaded.value.events.size();
-        for (const auto& ev : loaded.value.events) {
+        si.workspace = meta.value.workspace;
+        auto lock = sessionLock(id);
+        si.active = !lock.ok;
+        if (lock.ok) close(lock.value);
+        // Listing never parses a whole multi-megabyte conversation. The first
+        // 64 KiB is enough for a preview; resume still reads the complete log.
+        int fd = open(si.path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) continue;
+        char prefix[65536];
+        ssize_t n = read(fd, prefix, sizeof(prefix));
+        close(fd);
+        if (n < 0) continue;
+        for (const auto& line : splitLines(std::string(prefix, n))) {
+            auto parsed = json::parse(line);
+            if (!parsed.ok) continue;
+            auto ev = sessionEventFromJson(parsed.value);
             if (ev.type == "user" && !ev.text.empty()) {
                 si.firstLine = ev.text.substr(0, 80);
                 for (char& c : si.firstLine)
@@ -133,16 +188,17 @@ Result<SessionMeta> sessionLoadMeta(const std::string& id) {
     SessionMeta m;
     if (!validId(id)) return Result<SessionMeta>::Err("bad session id");
     std::string p = sessionDir() + "/" + id + ".meta.json";
-    if (access(p.c_str(), R_OK) != 0) return Result<SessionMeta>::Ok(m);  // none yet
+    if (access(p.c_str(), F_OK) != 0 && errno == ENOENT) return Result<SessionMeta>::Ok(m);
     auto t = readFileBounded(p, 1 << 20);
-    if (!t.ok) return Result<SessionMeta>::Ok(m);
+    if (!t.ok) return Result<SessionMeta>::Err(t.error);
     auto v = json::parse(t.value);
-    if (!v.ok) return Result<SessionMeta>::Ok(m);
+    if (!v.ok || !v.value.isObj()) return Result<SessionMeta>::Err("invalid session metadata: " + id);
     m.systemPrompt = v.value.at("system_prompt").asStr();
     m.orSessionId = v.value.at("or_session_id").asStr();
     m.modelSpec = v.value.at("model").asStr();
     m.systemSource = v.value.at("system_source").asStr();
     m.thinking = v.value.at("thinking").asStr();
+    m.workspace = v.value.at("workspace").asStr();
     m.turns = v.value.at("turns").asInt(0);
     m.toolCalls = v.value.at("tool_calls").asInt(0);
     m.compactions = v.value.at("compactions").asInt(0);
@@ -168,6 +224,7 @@ VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m) {
     o["model"] = json::Value(m.modelSpec);
     o["system_source"] = json::Value(m.systemSource);
     o["thinking"] = json::Value(m.thinking);
+    o["workspace"] = json::Value(m.workspace);
     o["turns"] = json::Value((double)m.turns);
     o["tool_calls"] = json::Value((double)m.toolCalls);
     o["compactions"] = json::Value((double)m.compactions);
@@ -184,11 +241,13 @@ VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m) {
                            json::stringify(json::Value(o), true) + "\n", 0600);
 }
 
-Result<std::string> sessionResolve(const std::string& idOrEmpty) {
+Result<std::string> sessionResolve(const std::string& idOrEmpty, const std::string& workspace) {
     if (idOrEmpty.empty() || idOrEmpty == "last") {
-        auto list = sessionList(1);
+        auto list = sessionList(30, workspace);
         if (list.empty()) return Result<std::string>::Err("no sessions yet");
-        return Result<std::string>::Ok(list[0].id);
+        for (const auto& si : list)
+            if (!si.active) return Result<std::string>::Ok(si.id);
+        return Result<std::string>::Err("all recent sessions are active");
     }
     if (!validId(idOrEmpty)) return Result<std::string>::Err("bad session id");
     if (access(sessionPath(idOrEmpty).c_str(), R_OK) != 0)

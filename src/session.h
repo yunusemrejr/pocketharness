@@ -21,13 +21,15 @@ struct SessionEvent {
     // live in the file, never inline.
     std::string imgFile{};
     std::string imgMime{};
+    json::Value replay{};  // provider continuation data on assistant events
 };
 
 struct SessionInfo {
     std::string id;
     std::string path;
     std::string firstLine;  // short summary for --sessions
-    long events = 0;
+    std::string workspace;
+    bool active = false;
 };
 
 // Create a new session file, return its id.
@@ -46,10 +48,14 @@ struct SessionLoad {
 Result<SessionLoad> sessionLoad(const std::string& id);
 
 // Newest-first list of sessions (bounded).
-std::vector<SessionInfo> sessionList(size_t max = 30);
+std::vector<SessionInfo> sessionList(size_t max = 30, const std::string& workspace = "");
 
 // Resolve "" or "last" to the newest session id, or validate a given id.
-Result<std::string> sessionResolve(const std::string& idOrEmpty);
+Result<std::string> sessionResolve(const std::string& idOrEmpty, const std::string& workspace = "");
+
+// One writer per session. CLOEXEC lock survives crashes without stale PID files.
+// Caller owns the returned fd until session exit; no lock file is unlinked.
+Result<int> sessionLock(const std::string& id);
 
 json::Value sessionEventToJson(const SessionEvent& ev);
 SessionEvent sessionEventFromJson(const json::Value& v);
@@ -63,6 +69,7 @@ struct SessionMeta {
     std::string modelSpec;     // model active at creation (restored on resume)
     std::string systemSource;  // "" = built-in base prompt, else override path
     std::string thinking;  // this session's level ("" = config default)
+    std::string workspace;
     // Cumulative counters (restored on resume so /session tells the truth).
     long turns = 0, toolCalls = 0, compactions = 0;
     long inTokens = 0, outTokens = 0, cacheHit = 0, cacheMiss = 0, genMs = 0;

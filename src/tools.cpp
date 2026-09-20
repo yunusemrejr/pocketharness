@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <cmath>
 
 #include "process.h"
 #include "skills.h"
@@ -21,9 +22,9 @@ std::vector<ToolDef> nativeToolDefs() {
          "allowed roots. Refuses to follow symlinks.",
          R"({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]})"},
         {"edit",
-         "Exact text replacement. old_text must occur exactly expected_matches times "
+         "Atomic exact replacement(s). Supply old_text/new_text OR edits array. Each old_text must occur exactly expected_matches times "
          "(default 1), else the edit fails without touching the file.",
-         R"({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"expected_matches":{"type":"integer"}},"required":["path","old_text","new_text"]})"},
+         R"({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"expected_matches":{"type":"integer"},"edits":{"type":"array","items":{"type":"object","properties":{"old_text":{"type":"string"},"new_text":{"type":"string"},"expected_matches":{"type":"integer"}},"required":["old_text","new_text"]}}},"required":["path"]})"},
         {"bash",
          "Run a Linux command (bash -c) with captured stdout/stderr, timeout, "
          "filesystem sandboxing and network access. The workspace is already the "
@@ -71,49 +72,39 @@ std::string replaceAll(const std::string& hay, const std::string& needle,
 }
 
 ToolResult toolRead(ToolEnv& env, const json::Value& args) {
-    ToolResult r;
     std::string path = args.at("path").asStr();
-    long offset = args.at("offset").asInt(1);
-    long limit = args.at("limit").asInt(2000);
-    if (path.empty()) {
-        r.output = "read: missing path";
-        return r;
-    }
-    if (offset < 1) offset = 1;
-    if (limit < 1) limit = 1;
-    if (limit > 20000) limit = 20000;
-    size_t cap = env.cfg ? (size_t)env.cfg->outputLimitBytes : 262144;
-    auto data = boxRead(*env.auth, path, cap);
-    if (!data.ok) {
-        r.output = data.error;
-        return r;
-    }
-    std::vector<std::string> lines = splitLines(data.value);
-    long total = (long)lines.size();
-    if (offset > total) {
-        r.output = path + ": offset " + std::to_string(offset) + " beyond EOF (" +
-                   std::to_string(total) + " lines)";
-        return r;
-    }
-    long end = offset + limit - 1;
-    if (end > total) end = total;
-    std::string out = path + " (lines " + std::to_string(offset) + "-" + std::to_string(end) +
-                      " of " + std::to_string(total) + "):\n";
-    char num[32];
-    for (long i = offset; i <= end; ++i) {
-        snprintf(num, sizeof(num), "%6ld| ", i);
-        out += num;
-        out += lines[(size_t)i - 1];
-        out += "\n";
-        if (out.size() > cap) {
-            out += "[... truncated ...]\n";
-            break;
+    long offset = args.at("offset").asInt(1), limit = args.at("limit").asInt(200);
+    if (offset < 1 || limit < 1 || limit > 20000) return {false, "read: invalid offset/limit"};
+    auto fd = boxOpenRead(*env.auth, path);
+    if (!fd.ok) return {false, fd.error};
+    struct Close { int fd; ~Close() { close(fd); } } closer{fd.value};
+    size_t cap = env.cfg ? env.cfg->outputLimitBytes : 262144;
+    std::string out = path + " (from line " + std::to_string(offset) + "):\n";
+    long line = 1, emitted = 0;
+    size_t scanned = 0;
+    bool start = true;
+    char buf[16384];
+    while (line - offset < limit) {
+        if (env.cancel && env.cancel->load()) return {false, "cancelled"};
+        ssize_t n = read(fd.value, buf, sizeof(buf));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return {false, "read failed"};
+        if (!n) break;
+        scanned += n;
+        if (scanned > (64u << 20)) return {false, "read scan exceeds 64 MiB; use a targeted bash command"};
+        for (ssize_t i = 0; i < n && line - offset < limit; ++i) {
+            if (line >= offset) {
+                if (start) { out += std::to_string(line) + "| "; ++emitted; }
+                out += buf[i];
+                if (out.size() + 64 >= cap) { out += "\n[... output truncated; narrow the range ...]\n"; return {true, out}; }
+            }
+            start = buf[i] == '\n';
+            if (start) ++line;
         }
     }
-    emit(env, "read " + path + " (" + std::to_string(end - offset + 1) + " lines)");
-    r.ok = true;
-    r.output = out;
-    return r;
+    if (!emitted) return {false, "read: offset beyond EOF (or empty file)"};
+    emit(env, "read " + path + " (" + std::to_string(emitted) + " lines)");
+    return {true, out};
 }
 
 ToolResult toolWrite(ToolEnv& env, const json::Value& args) {
@@ -140,46 +131,34 @@ ToolResult toolWrite(ToolEnv& env, const json::Value& args) {
 }
 
 ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
-    ToolResult r;
-    std::string path = args.at("path").asStr();
-    std::string oldText = args.at("old_text").asStr();
-    std::string newText = args.at("new_text").asStr();
-    long expected = args.at("expected_matches").asInt(1);
-    if (path.empty() || !args.has("old_text") || !args.has("new_text")) {
-        r.output = "edit: need path, old_text, new_text";
-        return r;
-    }
-    if (oldText.empty()) {
-        r.output = "edit: old_text must not be empty";
-        return r;
-    }
-    if (expected < 1 || expected > 100000) {
-        r.output = "edit: expected_matches out of range";
-        return r;
-    }
+    const std::string& path = args.at("path").asStr();
+    json::Array edits = args.has("edits") ? args.at("edits").asArr() : json::Array{args};
+    if (edits.empty() || edits.size() > 64) return {false, "edit: need 1..64 replacements"};
+    if (args.has("edits") && (args.has("old_text") || args.has("new_text")))
+        return {false, "edit: use edits OR old_text/new_text"};
     auto data = boxRead(*env.auth, path, 4 << 20);
-    if (!data.ok) {
-        r.output = data.error;  // absent target fails here, clearly
-        return r;
+    if (!data.ok) return {false, data.error};
+    std::string updated = data.value;
+    for (const auto& edit : edits) {
+        const std::string& oldText = edit.at("old_text").asStr();
+        const std::string& newText = edit.at("new_text").asStr();
+        double count = edit.at("expected_matches").asNum(1);
+        if (oldText.empty() || !edit.at("new_text").isStr() || count < 1 || count > 100000 ||
+            count != std::floor(count) || (edit.has("expected_matches") && !edit.at("expected_matches").isNum()))
+            return {false, "edit: need nonempty old_text, string new_text, positive integer expected_matches"};
+        long found = countOccurrences(updated, oldText);
+        if (found != (long)count)
+            return {false, "edit: found " + std::to_string(found) + " occurrence(s), expected " +
+                    std::to_string((long)count) + "; file untouched. Read exact content first."};
+        if (newText.size() > oldText.size() && newText.size() - oldText.size() >
+            ((4u << 20) - updated.size()) / (size_t)found)
+            return {false, "edit: result exceeds 4 MiB; file untouched"};
+        updated = replaceAll(updated, oldText, newText);
     }
-    long found = countOccurrences(data.value, oldText);
-    if (found != expected) {
-        r.output = "edit: found " + std::to_string(found) + " occurrence(s), expected " +
-                   std::to_string(expected) + "; file untouched. " +
-                   (found == 0 ? "Check exact whitespace/content with read first."
-                               : "Refine old_text or set expected_matches.");
-        return r;
-    }
-    std::string updated = replaceAll(data.value, oldText, newText);
     auto w = boxWrite(*env.auth, path, updated, 0644);
-    if (!w.ok) {
-        r.output = w.error;
-        return r;
-    }
-    emit(env, "edit " + path + " (" + std::to_string(found) + " match)");
-    r.ok = true;
-    r.output = "edited " + path + " (" + std::to_string(found) + " replacement)";
-    return r;
+    if (!w.ok) return {false, w.error};
+    emit(env, "edit " + path);
+    return {true, "edited " + path + " (" + std::to_string(edits.size()) + " replacement step(s))"};
 }
 
 ToolResult toolBash(ToolEnv& env, const json::Value& args) {
@@ -224,7 +203,7 @@ ToolResult toolBash(ToolEnv& env, const json::Value& args) {
 
     SpawnOpts o;
     o.exe = "/bin/bash";
-    o.argv = {"bash", "-c", cmd};
+    o.argv = {"bash", "--noprofile", "--norc", "-o", "pipefail", "-c", cmd};
     o.env = buildChildEnv(env.cfg ? env.cfg->exposeEnv : std::vector<std::string>(), env.workspace,
                           env.sessionTmp, env.sandboxHome);
     o.workdir = env.workspace;
@@ -330,6 +309,24 @@ ToolResult runTool(ToolEnv& env, const std::string& name, const std::string& arg
         }
         args = v.value;
     }
+    static const auto schemas = [] {
+        std::map<std::string, json::Value> out;
+        for (const auto& def : nativeToolDefs()) out[def.name] = json::parse(def.paramsJson).value;
+        return out;
+    }();
+    auto schema = schemas.find(name);
+    if (schema == schemas.end()) return {false, "unknown tool: " + name};
+    for (const auto& key : schema->second.at("required").asArr())
+        if (!args.has(key.asStr())) return {false, name + ": missing " + key.asStr()};
+    for (const auto& [key, value] : args.asObj()) {
+        std::string type = schema->second.at("properties").at(key).at("type").asStr();
+        bool valid = type == "string" ? value.isStr() : type == "array" ? value.isArr() :
+                     type == "integer" && value.isNum() && value.asNum() == std::floor(value.asNum()) &&
+                     value.asNum() >= 1 && value.asNum() <= 1000000000;
+        if (!valid) return {false, name + ": invalid argument " + key};
+    }
+    if (env.cancel && env.cancel->load()) return {false, "cancelled"};
+    if (name != "skill" && !env.auth) return {false, "tool authority unavailable"};
     ToolResult done;
     bool dispatched = true;
     if (name == "read") done = toolRead(env, args);

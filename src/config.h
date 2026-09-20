@@ -30,6 +30,15 @@ struct ProviderCfg {
     std::string keyEnv;  // env var holding the API key (never the key itself)
 };
 
+// Protocol differences stay data, not vendor classes. Overrides are explicit.
+struct ModelOptions {
+    long maxTokens = 8192;
+    std::string reasoning = "auto";  // auto|effort|budget|adaptive|none
+    std::string tokenParameter = "max_tokens";
+    bool streamUsage = true;
+    bool promptCache = true;
+};
+
 struct ModelCfg {
     std::string alias;      // short name, e.g. "glm"
     std::string provider;   // provider name
@@ -37,11 +46,12 @@ struct ModelCfg {
     std::string routing;    // e.g. "deepinfra" for OpenRouter order ("" = auto)
     long context = 200000;  // context window tokens (guess unless contextSet)
     bool contextSet = false;  // true only when "context" appears in config
+    ModelOptions options{};
 };
 
 struct Config {
     std::string defaultModel;  // model spec, e.g. "orcarouter:glm-5.3-flash"
-    std::string thinking = "medium";
+    std::string thinking = "auto";
     std::vector<ProviderCfg> providers;
     std::vector<ModelCfg> models;
     // Security-relevant knobs. Only the USER config may grant authority;
@@ -61,7 +71,10 @@ struct ResolvedModel {
     std::string routing;  // "" = automatic
     long context = 200000;
     std::string spec;     // canonical spec string for display/state
+    ModelOptions options{};
 };
+
+bool validThinking(const std::string& level);
 
 // Load user config (missing file => built-in defaults) then overlay the
 // project config's NON-security keys. Precise errors on invalid JSON.

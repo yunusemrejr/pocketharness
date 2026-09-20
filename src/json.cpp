@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 namespace pocket {
 namespace json {
@@ -23,7 +24,11 @@ double Value::asNum(double def) const {
 }
 
 long Value::asInt(long def) const {
-    if (isNum()) return (long)std::get<double>(data);
+    if (isNum()) {
+        double n = std::get<double>(data);
+        if (std::isfinite(n) && n >= (double)std::numeric_limits<long>::min() &&
+            n < (double)std::numeric_limits<long>::max()) return (long)n;
+    }
     return def;
 }
 

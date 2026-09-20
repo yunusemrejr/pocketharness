@@ -15,7 +15,7 @@ BIN := pocket
 TEST_SRC := tests/test_main.cpp tests/test_json.cpp tests/test_common.cpp tests/test_config.cpp \
             tests/test_session.cpp tests/test_skills.cpp tests/test_sandbox.cpp \
             tests/test_provider.cpp tests/test_tools.cpp tests/test_agent.cpp \
-            tests/test_tui.cpp tests/test_process.cpp
+            tests/test_tui.cpp tests/test_process.cpp tests/test_transport.cpp
 TEST_OBJ := $(TEST_SRC:.cpp=.o)
 TEST_LIB := $(filter-out src/main.o,$(OBJ))
 TEST_BIN := tests/run_tests

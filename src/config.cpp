@@ -1,6 +1,8 @@
 // PocketHarness - configuration implementation.
 #include "config.h"
 
+#include <arpa/inet.h>
+#include <cmath>
 #include <unistd.h>
 
 namespace pocket {
@@ -33,6 +35,10 @@ Config defaultConfig() {
         {"together", "openai", "https://api.together.xyz/v1", "TOGETHER_API_KEY"},
         {"deepinfra", "openai", "https://api.deepinfra.com/v1/openai", "DEEPINFRA_API_KEY"},
         {"anthropic", "anthropic", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY"},
+        {"openai", "openai", "https://api.openai.com/v1", "OPENAI_API_KEY"},
+        {"ollama", "openai", "http://127.0.0.1:11434/v1", ""},
+        {"lmstudio", "openai", "http://127.0.0.1:1234/v1", ""},
+        {"llamacpp", "openai", "http://127.0.0.1:8080/v1", ""},
     };
     // Built-in ids + windows verified against live provider /models listings
     // and the OpenRouter catalog (ids must exist; windows must match).
@@ -45,11 +51,25 @@ Config defaultConfig() {
 
 bool isLoopbackHttp(const std::string& u) {
     if (!startsWith(u, "http://")) return false;
-    std::string host = u.substr(7);
-    size_t end = host.find_first_of("/:");
-    if (end != std::string::npos) host = host.substr(0, end);
-    return host == "localhost" || startsWith(host, "127.") || host == "::1" ||
-           host == "[::1]";
+    std::string host = u.substr(7, u.find('/', 7) - 7);
+    if (host.empty()) return false;
+    if (host.find_first_of("@?#\\ \t\r\n") != std::string::npos) return false;
+    size_t end = host[0] == '[' ? host.find(']') + 1 : host.find(':');
+    if (end != std::string::npos && end < host.size()) {
+        std::string port = host.substr(end);
+        if (port.size() < 2 || port[0] != ':' ||
+            port.substr(1).find_first_not_of("0123456789") != std::string::npos ||
+            port.size() > 6 || std::stol(port.substr(1)) > 65535) return false;
+        host.resize(end);
+    }
+    if (host == "localhost" || host == "[::1]") return true;
+    struct in_addr addr{};
+    return inet_pton(AF_INET, host.c_str(), &addr) == 1 && (ntohl(addr.s_addr) >> 24) == 127;
+}
+
+bool validThinking(const std::string& t) {
+    return t == "auto" || t == "off" || t == "none" || t == "minimal" || t == "low" ||
+           t == "medium" || t == "high" || t == "xhigh" || t == "max";
 }
 
 namespace {
@@ -69,7 +89,13 @@ bool validEnvName(const std::string& n) {
 
 // https anywhere; plain http only for loopback (local Ollama-style daemons).
 bool validProviderUrl(const std::string& u) {
-    if (startsWith(u, "https://")) return true;
+    if (u.find_first_of("\r\n\t \\?#") != std::string::npos || u.find('\0') != std::string::npos)
+        return false;
+    if (startsWith(u, "https://")) {
+        std::string host = u.substr(8, u.find('/', 8) - 8);
+        return !host.empty() && host.find_first_of("@?#") == std::string::npos &&
+               u.find_first_of("?#") == std::string::npos;
+    }
     return isLoopbackHttp(u);
 }
 
@@ -84,6 +110,10 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
     auto typeErr = [](const std::string& k, const char* want) {
         return VoidResult::Err("config key \"" + k + "\" must be " + want);
     };
+    auto integer = [](const json::Value& v) {
+        double n = v.asNum(-1);
+        return n == std::floor(n) ? v.asInt(-1) : -1L;
+    };
 
     if (v.has("default_model")) {
         if (!o.at("default_model").isStr()) return typeErr("default_model", "a string");
@@ -92,8 +122,8 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
     if (v.has("thinking")) {
         if (!o.at("thinking").isStr()) return typeErr("thinking", "a string");
         std::string t = toLower(o.at("thinking").asStr());
-        if (t != "off" && t != "low" && t != "medium" && t != "high" && t != "max")
-            return VoidResult::Err("config key \"thinking\" must be one of off/low/medium/high/max");
+        if (!validThinking(t))
+            return VoidResult::Err("invalid thinking level (auto/off/none/minimal/low/medium/high/xhigh/max)");
         cfg.thinking = t;
     }
     if (v.has("providers")) {
@@ -155,8 +185,38 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
             mc.model = kv.second.at("model").asStr();
             mc.routing = kv.second.at("routing").asStr();
             if (kv.second.has("context")) {
-                mc.context = kv.second.at("context").asInt(200000);
+                double n = kv.second.at("context").asNum(-1);
+                if (n < 512 || n > 10000000 || n != std::floor(n))
+                    return VoidResult::Err("model context must be an integer in 512..10000000");
+                mc.context = (long)n;
                 mc.contextSet = true;
+            }
+            const auto& v = kv.second;
+            if (mc.provider == "openai") mc.options.tokenParameter = "max_completion_tokens";
+            if (v.has("max_tokens")) {
+                double n = v.at("max_tokens").asNum(-1);
+                if (n < 1 || n > 1048576 || n != std::floor(n))
+                    return VoidResult::Err("model max_tokens must be an integer in 1..1048576");
+                mc.options.maxTokens = (long)n;
+            }
+            if (v.has("reasoning")) {
+                std::string mode = v.at("reasoning").asStr();
+                if (mode != "auto" && mode != "effort" && mode != "budget" &&
+                    mode != "adaptive" && mode != "none")
+                    return VoidResult::Err("model reasoning must be auto/effort/budget/adaptive/none");
+                mc.options.reasoning = mode;
+            }
+            if (v.has("token_parameter")) {
+                std::string p = v.at("token_parameter").asStr();
+                if (p != "max_tokens" && p != "max_completion_tokens")
+                    return VoidResult::Err("model token_parameter must be max_tokens/max_completion_tokens");
+                mc.options.tokenParameter = p;
+            }
+            for (auto [key, dst] : {std::pair{"stream_usage", &mc.options.streamUsage},
+                                   std::pair{"prompt_cache", &mc.options.promptCache}}) {
+                if (!v.has(key)) continue;
+                if (!v.at(key).isBool()) return typeErr(key, "a boolean");
+                *dst = v.at(key).asBool();
             }
             if (mc.provider.empty() || mc.model.empty())
                 return VoidResult::Err("model \"" + kv.first +
@@ -189,17 +249,17 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
         cfg.toolNetwork = o.at("tool_network").asBool();
     }
     if (secKey("bash_timeout")) {
-        long t = o.at("bash_timeout").asInt(-1);
+        long t = integer(o.at("bash_timeout"));
         if (t < 1 || t > 3600) return typeErr("bash_timeout", "1..3600 seconds");
         cfg.bashTimeoutSec = (int)t;
     }
     if (secKey("max_rounds")) {
-        long m = o.at("max_rounds").asInt(-1);
+        long m = integer(o.at("max_rounds"));
         if (m < 1 || m > 1000) return typeErr("max_rounds", "1..1000 rounds");
         cfg.maxRounds = (int)m;
     }
     if (secKey("output_limit")) {
-        long t = o.at("output_limit").asInt(-1);
+        long t = integer(o.at("output_limit"));
         if (t < 1024 || t > 8 * 1024 * 1024)
             return typeErr("output_limit", "1024..8388608 bytes");
         cfg.outputLimitBytes = t;
@@ -281,10 +341,13 @@ Result<ResolvedModel> resolveModel(const Config& cfg, const std::string& spec) {
         if (rm.model.empty()) return Result<ResolvedModel>::Err("empty model id in \"" + s + "\"");
         rm.spec = s;
         rm.context = 200000;  // last resort; dynamic /models lookup refines this
+        if (isLoopbackHttp(p->baseUrl)) rm.context = 32768;  // conservative local fallback
+        if (pname == "openai") rm.options.tokenParameter = "max_completion_tokens";
         // Inherit context size from a matching alias with explicit context.
         for (const auto& m : cfg.models)
-            if (m.contextSet && m.provider == pname && m.model == rm.model) {
-                rm.context = m.context;
+            if (m.provider == pname && m.model == rm.model) {
+                if (m.contextSet) rm.context = m.context;
+                rm.options = m.options;
                 break;
             }
         return Result<ResolvedModel>::Ok(std::move(rm));
@@ -298,6 +361,8 @@ Result<ResolvedModel> resolveModel(const Config& cfg, const std::string& spec) {
             rm.model = m.model;
             rm.routing = m.routing;
             rm.context = m.context;
+            if (!m.contextSet && isLoopbackHttp(p->baseUrl)) rm.context = 32768;
+            rm.options = m.options;
             rm.spec = s;
             return Result<ResolvedModel>::Ok(std::move(rm));
         }

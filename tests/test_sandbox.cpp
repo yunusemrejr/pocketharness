@@ -23,7 +23,9 @@ std::string setup() {
     // NOTE: the Landlock policy deliberately allows /tmp (shared scratch that
     // normal toolchains need), so the "outside" fixture must live outside
     // /tmp for the kernel-confinement test to be meaningful.
-    std::string homeBase = homeDir() + "/.cache/pocket-test-" + randHex(3);
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof(cwd))) return "getcwd";
+    std::string homeBase = std::string(cwd) + "/.pocket-test-" + randHex(3);
     if (!ensureDir(homeBase, 0700).ok) return "mkdir homebase";
     static std::string g_homeBase = homeBase;
     static bool cleaned = false;
@@ -231,7 +233,9 @@ TEST(sandbox_Tmp_Readable_And_Addable_Root) {
     // authorityAddReadRoot grants one more root post-init (the session tmp
     // dir, created after the authority). Fixture must live outside /tmp,
     // which is now readable by default (same reason as g_outside).
-    std::string homeBase = homeDir() + "/.cache/pocket-test-" + randHex(3);
+    char cwd[4096];
+    CHECK(getcwd(cwd, sizeof(cwd)));
+    std::string homeBase = std::string(cwd) + "/.pocket-test-" + randHex(3);
     CHECK(ensureDir(homeBase + "/ws", 0755).ok);
     CHECK(ensureDir(homeBase + "/sess", 0755).ok);
     CHECK(atomicWriteFile(homeBase + "/sess/note.txt", "N\n", 0644).ok);
