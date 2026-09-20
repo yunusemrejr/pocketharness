@@ -134,8 +134,8 @@ TEST(agent_Compact_Cut_Points) {
     chain.push_back(msg("user"));
     chain.push_back(msg("assistant"));  // size 11
     size_t cut = compactCutPoint(chain);
-    CHECK_EQ(chain[cut].role, std::string("user"));
-    CHECK(cut == 5);  // skipped assistant@3 + tool@4, kept pair intact in summary zone
+    CHECK_EQ(chain[cut].role, std::string("assistant"));
+    CHECK(cut == 3);  // skipped assistant@3 + tool@4, kept pair intact in summary zone
     return "";
 }
 
@@ -205,33 +205,17 @@ TEST(agent_Restore_Pairs_Tools) {
 }
 
 TEST(agent_Wire_Trim_Caps) {
-    // Old tool results cut to 500, recent ones ride nearly whole (12000).
     std::string big(20000, 'x');
-    std::vector<ChatMessage> msgs;
-    for (int i = 0; i < 5; ++i)
-        msgs.push_back(ChatMessage{"tool", big, {}, "c" + std::to_string(i)});
-    std::vector<ChatMessage> w = trimWireHistory(msgs);
-    CHECK_EQ(w.size(), (size_t)5);
-    for (int i = 0; i < 2; ++i) {  // aged out: 500 + marker
-        CHECK(w[i].content.find("wire-trimmed") != std::string::npos);
-        CHECK_EQ(w[i].content.size(), wireCappedLen(big.size(), false));
-    }
-    for (int i = 2; i < 5; ++i) {  // last 3: 12000 + marker
-        CHECK(w[i].content.find("wire-capped") != std::string::npos);
-        CHECK_EQ(w[i].content.size(), wireCappedLen(big.size(), true));
-    }
-    // Under the caps nothing is touched, and the contextUsed() mirror is
-    // exact everywhere: trimmed length always equals wireCappedLen().
-    for (size_t len : {(size_t)0, (size_t)1, (size_t)499, (size_t)500, (size_t)501,
-                       (size_t)11999, (size_t)12000, (size_t)12001, (size_t)100000}) {
-        std::vector<ChatMessage> one = {{"tool", std::string(len, 'y'), {}, "c0"}};
-        CHECK_EQ(trimWireHistory(one)[0].content.size(), wireCappedLen(len, true));
-        std::vector<ChatMessage> five;
-        for (int i = 0; i < 5; ++i) five.push_back({"tool", std::string(len, 'y'), {}, "c"});
-        CHECK_EQ(trimWireHistory(five)[0].content.size(), wireCappedLen(len, false));
-    }
-    std::vector<ChatMessage> small = {{"tool", "tiny", {}, "c0"}};
-    CHECK_EQ(trimWireHistory(small)[0].content, std::string("tiny"));
+    big.replace(big.size() - 10, 10, "last-error");
+    std::vector<ChatMessage> msgs = {{"tool", big, {}, "c1"}};
+    auto before = trimWireHistory(msgs);
+    CHECK(before[0].content.size() <= kWireToolCap);
+    CHECK(before[0].content.find("last-error") != std::string::npos);
+    for (int i = 0; i < 10; ++i) msgs.push_back({"tool", big, {}, "next"});
+    auto after = trimWireHistory(msgs);
+    CHECK_EQ(before[0].content, after[0].content);  // aging never invalidates the prefix
+    CHECK_EQ(trimWireHistory(after)[0].content, after[0].content);  // idempotent
+    CHECK_EQ(msgs[0].content, big);  // raw history preserved
     return "";
 }
 
@@ -367,5 +351,142 @@ TEST(agent_Restore_Compact_Boundary) {
     CHECK_EQ(a.messages()[1].content, std::string("new q"));
     CHECK_EQ(a.messages()[2].content, std::string("new a"));
     rmRf(home);
+    return "";
+}
+
+TEST(agent_Cancelled_Batch_And_Resume_Are_Paired) {
+    std::string dir = makeTempDir("pocket-cancelbatch");
+    HomeGuard hg(dir);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    std::atomic<bool> cancel{false};
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    opts.cancel = &cancel;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        r.calls = {{"one", "bash", "{}"}, {"two", "write", "{}"}};
+        cancel.store(true);
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    CHECK_EQ(agent.runTurn("work"), std::string("cancelled"));
+    CHECK(validateHistory(agent.messages()).empty());
+    CHECK_EQ(agent.stats().toolCalls, 0);
+    Agent resumed(opts);
+    CHECK(resumed.restore(id.value).ok);
+    CHECK_EQ(resumed.messages()[1].toolCalls.size(), (size_t)2);
+    CHECK(validateHistory(resumed.messages()).empty());
+    rmRf(dir);
+    return "";
+}
+
+TEST(agent_Crash_Closes_Unknown_Tool_Outcome) {
+    std::string dir = makeTempDir("pocket-crashbatch");
+    HomeGuard hg(dir);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    CHECK(sessionAppend(id.value, {"user", "work", "", "", "", true}).ok);
+    SessionEvent event{"assistant", "", "", "", "", true};
+    event.replay = json::Object{{"calls", json::Array{
+        json::Object{{"id", "c1"}, {"name", "bash"}, {"args", "{}"}},
+        json::Object{{"id", "c2"}, {"name", "edit"}, {"args", "{}"}}}}};
+    CHECK(sessionAppend(id.value, event).ok);
+    CHECK(sessionAppend(id.value, {"tool_result", "done", "c1", "bash", "", true}).ok);
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    Agent a(opts);
+    CHECK(a.restore(id.value).ok);
+    CHECK(validateHistory(a.messages()).empty());
+    CHECK(a.messages().back().content.find("outcome unknown") != std::string::npos);
+    Agent b(opts);
+    CHECK(b.restore(id.value).ok);
+    CHECK_EQ(a.messageCount(), b.messageCount());  // repair once, never execute a call
+    rmRf(dir);
+    return "";
+}
+
+TEST(agent_Compaction_Retains_Tail_On_Every_Resume) {
+    std::string dir = makeTempDir("pocket-compact-replay");
+    HomeGuard hg(dir);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    AgentOpts opts;
+    opts.sessionId = id.value;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.request = [](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        r.text = req.stream ? "answer" : "summary";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent live(opts);
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int i = 0; i < 7; ++i) CHECK(live.runTurn("question " + std::to_string(i)).empty());
+        CHECK(live.compactNow().empty());
+        Agent resumed(opts);
+        CHECK(resumed.restore(id.value).ok);
+        CHECK_EQ(live.messageCount(), resumed.messageCount());
+        for (size_t i = 0; i < live.messageCount(); ++i) {
+            CHECK_EQ(live.messages()[i].content, resumed.messages()[i].content);
+            CHECK_EQ(live.messages()[i].role, resumed.messages()[i].role);
+        }
+        CHECK(validateHistory(resumed.messages()).empty());
+    }
+    rmRf(dir);
+    return "";
+}
+
+TEST(agent_New_Tokens_And_Model_Change_Invalidate_Usage) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.request = [](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        r.text = std::string(4000, 'x');
+        r.inTokens = 5000;
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runTurn("hi").empty());
+    CHECK(a.contextUsed() > 5000);  // includes the response added after prompt_tokens
+    a.setModel(opts.model, "none");
+    CHECK(a.stats().lastPrompt == -1);
+    CHECK(a.contextUsed() < 5000);
+    return "";
+}
+
+TEST(agent_No_Progress_And_Persistence_Stop_Before_More_Work) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    int requests = 0;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ++requests;
+        ChatResponse r;
+        r.calls = {{"c", "unknown", "{}"}};
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runTurn("do it").find("no progress") != std::string::npos);
+    CHECK_EQ(requests, 3);
+    CHECK(validateHistory(a.messages()).empty());
+    std::string dir = makeTempDir("pocket-writefail");
+    HomeGuard hg(dir);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    opts.sessionId = id.value;
+    Agent b(opts);
+    CHECK(unlink((sessionDir() + "/" + id.value + ".jsonl").c_str()) == 0);
+    CHECK(b.runTurn("do it").find("persistence failed") != std::string::npos);
+    CHECK_EQ(requests, 3);
+    rmRf(dir);
+    return "";
+}
+
+TEST(agent_Image_Detection_Reads_Only_The_Header) {
+    std::string dir = makeTempDir("pocket-image-header");
+    CHECK(atomicWriteFile(dir + "/picture.png", std::string("\x89PNG\r\n\x1a\n", 8) + std::string(10000, 'p')).ok);
+    auto images = collectImageTokens("picture.png", dir);
+    CHECK(images.size() == 1 && images[0].path == dir + "/picture.png");
+    rmRf(dir);
     return "";
 }

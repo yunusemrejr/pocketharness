@@ -1,5 +1,6 @@
 // PocketHarness tests - sessions (incl. crash-safe partial lines).
 #include "mini.h"
+#include <sys/stat.h>
 
 #include "../src/config.h"
 #include "../src/session.h"
@@ -92,5 +93,46 @@ TEST(session_List_Resolve) {
     auto missing = sessionResolve("nope-nope");
     CHECK(!missing.ok);
     rmRf(home);
+    return "";
+}
+
+TEST(session_Single_Writer_And_Workspace_Selection) {
+    std::string dir = makeTempDir("pocket-lock");
+    HomeGuard hg(dir);
+    auto a = sessionCreate(), b = sessionCreate();
+    CHECK(a.ok && b.ok);
+    SessionMeta meta;
+    meta.workspace = "/project-a";
+    CHECK(sessionSaveMeta(a.value, meta).ok);
+    meta.workspace = "/project-b";
+    CHECK(sessionSaveMeta(b.value, meta).ok);
+    auto lock = sessionLock(a.value);
+    CHECK(lock.ok);
+    CHECK(!sessionLock(a.value).ok);
+    CHECK(sessionList(30, "/project-a")[0].active);
+    CHECK(!sessionResolve("last", "/project-a").ok);
+    CHECK_EQ(sessionResolve("last", "/project-b").value, b.value);
+    close(lock.value);
+    CHECK_EQ(sessionResolve("last", "/project-a").value, a.value);
+    rmRf(dir);
+    return "";
+}
+
+TEST(session_Append_After_Torn_Tail) {
+    std::string dir = makeTempDir("pocket-torn");
+    HomeGuard hg(dir);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    auto path = sessionDir() + "/" + id.value + ".jsonl";
+    FILE* f = fopen(path.c_str(), "a");
+    CHECK(f);
+    fputs("{\"t\":\"assistant\",\"text\":\"torn", f);
+    fclose(f);
+    CHECK(sessionAppend(id.value, {"user", "kept", "", "", "", true}).ok);
+    auto loaded = sessionLoad(id.value);
+    CHECK(loaded.ok && loaded.value.events.back().text == "kept");
+    struct stat st{};
+    CHECK(stat(path.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600);
+    rmRf(dir);
     return "";
 }

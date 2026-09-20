@@ -23,7 +23,7 @@ terminal → agent loop → model provider → optional tool call → Linux/file
 ```
 
 One competent engineer should be able to understand essentially the entire
-architecture in an afternoon. (~5k lines of C++, ~10 translation units.)
+architecture in an afternoon. (About 8k lines of C++ including headers, 12 translation units.)
 
 ## Install
 
@@ -52,9 +52,10 @@ cd ~/projects/foo
 pocket                  # interactive agent, workspace = current directory
 pocket /some/project    # explicit workspace
 pocket -p "Review src/network.cpp for concurrency problems."
-pocket -p -m orcarouter:glm-5.3-flash "Review src/network.cpp."
-pocket --resume         # continue the newest session
-pocket --sessions       # list sessions
+pocket -m glm -p "Review src/network.cpp."
+pocket -m ollama:qwen3:8b -t none --max-tokens 2048 -p "Explain this project."
+pocket --resume         # newest idle session in this workspace
+pocket --sessions       # list workspaces, active/idle sessions, previews
 ```
 
 Set provider keys as environment variables (never in files that get committed):
@@ -96,6 +97,10 @@ cannot be shed — under `--offline` the whole subtree loses `AF_INET`.
 
 The model-facing surface is exactly: `read` `write` `edit` `bash` `skill`.
 
+Sessions work autonomously by default: implement, verify, and continue up to the
+configured round limit. Three identical tool batches stop a stuck loop. Routine
+commands need no approval; the destructive-command guard still applies.
+
 There are intentionally no tools for git, grep, find, curl, npm, python,
 compilers, test runners, todos, memory, or background jobs — the model uses
 normal programs through `bash`. Every wrapper would be another schema,
@@ -103,19 +108,25 @@ authority boundary, test surface, and context cost.
 
 - **read** — bounded file reads (1-based, line-numbered, offset/limit)
   from the workspace, allowed roots, the session tmp dir, and `/tmp`.
+  Streams the requested range with a 200-line default; large files need not fit
+  in memory. FIFOs and devices are refused, and scanning is bounded to 64 MiB.
 - **write** — atomic create/replace (tmp file + rename), parents created
   inside allowed roots, never through symlinks.
 - **edit** — exact replacement; fails unless `old_text` occurs exactly
-  `expected_matches` times (default 1). Never edits a surprise match.
+  `expected_matches` times (default 1). An `edits` array applies up to 64
+  sequential replacements with one atomic write: any mismatch leaves the file
+  untouched. Files/results over 4 MiB fail before writing; truncated reads can
+  never become edits.
 - **bash** — normal Linux commands with captured stdout/stderr, exit status,
-  timeout, cancellation, sandboxing, and network access on by default
+  timeout, cancellation, `pipefail`, sandboxing, and network access on by default
   (`--offline` denies it: guard fails fast, seccomp blocks the sockets).
 - **skill** — `list` / `search` / `load` Markdown skills (metadata first,
   full text only when deliberately loaded).
 
 ## Configuration
 
-One transparent user config, optional project overlay:
+One transparent user config, optional project overlay. See
+[the example config](examples/config.example.json) for cloud and local model aliases:
 
 ```
 ~/.config/pocketharness/config.json
@@ -124,8 +135,8 @@ One transparent user config, optional project overlay:
 
 ```json
 {
-  "default_model": "orcarouter:glm-5.3-flash",
-  "thinking": "off",
+  "default_model": "glm",
+  "thinking": "auto",
   "providers": {
     "orcarouter": {
       "protocol": "openai",
@@ -134,7 +145,7 @@ One transparent user config, optional project overlay:
     }
   },
   "models": {
-    "glm": { "provider": "orcarouter", "model": "glm-5.3-flash", "context": 200000 }
+    "glm": { "provider": "orcarouter", "model": "z-ai/glm-5.3-flash" }
   },
   "tool_network": true,
   "bash_timeout": 120,
@@ -154,7 +165,8 @@ and especially never redirect provider endpoints (which decide where API
 keys are sent). Provider `base_url` must be `https`, or `http` loopback for
 local daemons; `key_env` must be a shell variable name, and may be omitted
 entirely for loopback providers (LM Studio / Ollama / llama.cpp run keyless
-by default — no dummy key needed). Invalid config
+by default — no dummy key needed). IPv4 loopback addresses and `[::1]` are
+validated as addresses; names such as `127.attacker.example` are rejected. Invalid config
 produces precise errors, never silent guesses.
 
 ```json
@@ -167,6 +179,43 @@ produces precise errors, never silent guesses.
   }
 }
 ```
+
+Built-in provider names also include `openai`, `ollama`, `lmstudio`, and
+`llamacpp`; use `provider:model-id` directly. The local presets point to loopback
+ports 11434, 1234, and 8080 respectively. Install/load the model in your server;
+PocketHarness does not start a model daemon or allocate its GPU memory.
+
+Model aliases can tune compatibility without another provider implementation:
+
+```json
+{
+  "models": {
+    "small": {
+      "provider": "ollama", "model": "qwen3:8b",
+      "context": 8192, "max_tokens": 2048,
+      "reasoning": "effort", "stream_usage": true
+    },
+    "claude": {
+      "provider": "anthropic", "model": "claude-sonnet-4-6",
+      "max_tokens": 8192, "reasoning": "adaptive", "prompt_cache": true
+    }
+  }
+}
+```
+
+`reasoning` accepts `auto`, `effort`, `budget`, `adaptive`, or `none` (omit
+reasoning controls for models that reject them). `budget`/`adaptive` apply to
+Anthropic; OpenAI-compatible servers use effort. `token_parameter` chooses
+`max_tokens` or `max_completion_tokens` (the built-in OpenAI provider uses the
+latter). Set `stream_usage: false` for older compatible servers. `prompt_cache`
+controls Anthropic automatic caching and OpenAI cache keys; it defaults to true.
+Matching explicit `provider:model` specs inherit the alias settings too.
+
+`--max-tokens N` overrides the model's completion budget for this invocation.
+The effective budget is capped at a quarter of the context window; unpublished
+local windows default conservatively to 32k. Pin `context` to your daemon's
+**loaded** context size, which can be smaller than the model's advertised limit.
+For economy, start with `-t none --max-tokens 2048` on models that support `none`.
 
 Use the model id LM Studio shows in its server panel; the context window
 resolves live from the daemon's `/models` listing when published. Start the
@@ -203,26 +252,37 @@ request. PocketHarness ships no TLS/HTTP stack of its own.
 
 Failed requests retry with backoff instead of failing the turn: transport
 errors and HTTP 429/5xx are retried up to 4 attempts (1s/2s/4s cooldowns,
-announced in the UI, cancellable with Ctrl-C). Retries happen only while
+announced in the UI, cancellable with Ctrl-C). Numeric `Retry-After` headers are honored, capped at 60 seconds. Retries happen only while
 the answer has not started streaming — once tokens are visible, a failure
-fails fast rather than duplicating output. HTTP 4xx never retries.
+fails fast rather than duplicating output. Other HTTP 4xx responses never retry.
 
-Thinking levels (`off/low/medium/high/max`, `/thinking`) map to
-`reasoning_effort` / Anthropic thinking budgets, and are omitted entirely
-when `off` for maximum endpoint compatibility. When the provider streams
-thinking (`reasoning_content` / `reasoning_details` / `thinking_delta`),
-it renders live and dim — inline in the TUI, on `-p` stderr — while the
-answer streams normally.
+Thinking levels: `auto/off/none/minimal/low/medium/high/xhigh/max` (`/thinking`
+or `-t`). The default `auto` and compatibility setting `off` omit effort controls;
+`none` explicitly disables reasoning where supported. DeepSeek also receives
+its thinking toggle. `max` is sent as `max`; use `xhigh` when that is the model's
+supported maximum. Each endpoint decides which levels its model supports.
+Anthropic manual budgets always stay below the output limit; use
+`reasoning: "adaptive"` for models using adaptive thinking.
+
+Reasoning streams dimly in the TUI and to stderr in `-p`. Continuation data
+(DeepSeek reasoning, OpenRouter reasoning details, Anthropic signed thinking
+blocks) survives tool calls and resume, and is only replayed to its originating
+provider/model. This data is stored in the private session log. Multiple
+Anthropic tool results are grouped into one user message.
+
+Malformed, errored, empty, incomplete, or oversized streams fail locally; partial
+tool calls are never executed. Servers returning ordinary JSON despite
+`stream: true` are supported. Transport responses are bounded to 8 MiB.
 
 Context windows resolve live: unless a model pins `"context"` explicitly,
-the harness `GET`s `{base}/models` once per process (`{"data"}`, bare
+the harness `GET`s `{base}/models` once per endpoint per process (`{"data"}`, bare
 arrays, and Gemini `{"models"}` shapes) and adopts the published window
 for that exact model id. Anything unpublished or unreachable keeps the
 configured default; the probe never fails a run.
 
 ### Prompt caching
 
-PocketHarness treats cache reuse as an invariant, not luck:
+PocketHarness keeps prompt prefixes stable by design:
 
 - The system prompt is **frozen** at session start (sidecar
   `<id>.meta.json`) and reused byte-identically on `--resume`.
@@ -230,8 +290,8 @@ PocketHarness treats cache reuse as an invariant, not luck:
 - Messages are append-only; skills arrive as tool results at the tail, never
   spliced into the prefix. No timestamps, metrics, or dynamic data pollute
   the prefix. Serialization is deterministic.
-- Every request in a session carries a stable `session_id` (OpenRouter) for
-  sticky routing to the warm-cache endpoint.
+- OpenRouter requests carry a stable `session_id`; OpenAI requests carry a
+  stable `prompt_cache_key`. Anthropic requests enable automatic caching.
 - DeepSeek `prompt_cache_hit/miss_tokens`, OpenRouter `cached_tokens`/`cost`,
   and Anthropic cache reads are parsed and shown in `/session` and `-p`
   stderr output. Unreported = unknown, never inferred.
@@ -240,12 +300,21 @@ Compaction legitimately establishes a new prefix; afterwards the new prefix
 stays stable again. There is no cache manager, daemon, or subsystem — just a
 stable prefix and honest counters.
 
-Two details keep the steady-state rate high: old tool results are trimmed
-on the wire (recent three capped at 12k chars, older at 500 — history on
-disk stays full), so each request re-caches only genuinely new bytes; and
-the TUI shows the rolling rate over the last 20 requests once warm, since
-early cold requests would otherwise pin the cumulative average down all
-session (`/session` prints both).
+Tool results are capped **once**, keeping their head and tail within 12k bytes.
+Appending more messages never shrinks or rewrites earlier results. Full results
+stay on disk, while bounded copies keep memory and subsequent requests small.
+Actual reuse still depends on the provider, cache lifetime, and minimum prefix
+size; no cache-hit rate is promised.
+
+Cache percentages use only samples with a known denominator. OpenAI-style
+uncached tokens are total input minus reported cached input; Anthropic total
+input includes uncached input, cache writes, and cache reads. The TUI shows a
+rolling window over 20 complete samples. Compaction requests count toward usage.
+
+Wire behavior follows the official [OpenAI Chat API](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create),
+[Anthropic caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching),
+[DeepSeek thinking](https://api-docs.deepseek.com/guides/thinking_mode/), and
+[Ollama compatibility](https://docs.ollama.com/api/openai-compatibility) contracts.
 
 ## System prompt
 
@@ -296,16 +365,26 @@ data, never harness authority.
 ## Sessions & context
 
 Append-only JSONL under `~/.local/share/pocketharness/sessions/` — one event
-per line, fsync'd, tolerant of a torn last line after a crash. No SQLite, no
-indexing, no daemons. Keys never touch session files.
+per line, fsync'd, with 0600 permissions. A torn final record is discarded before
+new events are appended. A nonblocking `flock` allows one process to own a session;
+other sessions remain independent. Locks release on exit/crash. `--resume` selects
+an idle session in the current workspace; an explicit id from another workspace
+fails with its location. Legacy sessions without workspace metadata can be
+resumed by explicit id. Session listing reads only a small preview of each log.
 
-Context: provider-reported prompt tokens when available, else estimated
-usage vs the (possibly live-resolved) window. `/compact` on demand plus
+Tool batches are persisted before execution. Cancellation closes all outstanding
+calls; after a crash, unanswered calls get an “outcome unknown” result and are
+never automatically rerun. Persistence errors stop further side effects. No
+SQLite, indexing, or daemons. Keys never touch session files.
+
+Context: the last provider token count plus estimated additions since that
+request, compared with the (possibly live-resolved) window. `/compact` on demand plus
 automatic summarization at ~90%, or whenever the next completion would no
 longer fit (a full `maxTokens` of headroom is reserved for the answer).
 Compaction summarizes older turns and keeps recent raw turns with tool
-pairs intact; `--resume` replays from the last summary, so a resumed
-session sees exactly what the live session saw — never history twice.
+pairs intact, including within long autonomous turns. Compaction checkpoints
+record the cut point so resume reconstructs the summary **and retained tail**.
+If compaction cannot make the next request fit, the harness stops locally.
 No memory graphs, no governors, no injected observations. Durable knowledge
 belongs in project files or skills.
 
@@ -339,10 +418,13 @@ Mechanisms (a few Linux primitives, not a policy framework):
   + session tmp + `/tmp`. The state dir, `~/.ssh`, shell configs, sibling
   projects, and cloud credentials are simply unreachable. Provider `curl`
   gets its own tighter profile: system RO, per-request staging dir RW,
-  network allowed, foreign-arch syscalls killed, tight rlimits.
+  network allowed, foreign-arch syscalls killed, tight rlimits. Its environment
+  excludes unrelated secrets; only proxy and CA configuration is retained.
+  Ambient curl config files and authenticated redirects are disabled, and
+  loopback connections bypass proxies.
 - **Key broker, not key sharing**: provider keys live only in the parent's
   environment and per-request 0600 staging. No keyfile is ever handed to a
-  child, no session id / depth / parent flag travels via env (a recursive
+  model tool child, no session id / depth / parent flag travels via env (a recursive
   `pocket` reads those from `$TMPDIR/pocket.parent`), and keys never appear
   in argv, logs, or session files.
 - **NO_NEW_PRIVS** on every model child; setuid/sudo gains impossible.
@@ -361,7 +443,7 @@ Mechanisms (a few Linux primitives, not a policy framework):
   pushing over ssh. The fake `$HOME` carries no keys either way.
 - **Destructive-command guard**: last-resort screening (`rm -rf .`, `git
   reset --hard`, `git clean -f`, `mkfs`, `dd of=/dev`, fork bombs,
-  `chmod -R /`, ...) → human `[y/N]` approval in the TUI, fail-closed in
+  `chmod -R /`, computed recursive-delete targets, force-pushes, ...) → human `[y/N]` approval in the TUI, fail-closed in
   `-p` unless `--allow-destructive`. The model can never approve itself.
 - **Terminal sanitization**: ESC/CSI/OSC/C0 stripped from all untrusted
   output before rendering.
@@ -383,6 +465,8 @@ and provider keys stay out of the model environment.
   always show what is actually enforced.
 - The workspace itself is writable by design — the guard catches only
   obviously catastrophic classes, not all bad edits. Git is your undo.
+- Different sessions may edit the same workspace. Session locks prevent log
+  corruption; they are not workspace-wide transaction locks.
 - This is a mistake-tolerant harness, not a hostile-code sandbox.
 
 ## Layout
@@ -397,11 +481,16 @@ and provider keys stay out of the model environment.
 
 ```bash
 make               # build ./pocket
-make test          # build + run the suite (functional + security)
+make test          # functional + security + localhost curl integration tests
+make sanitize      # AddressSanitizer + UndefinedBehaviorSanitizer
 make install       # install to ~/.local/bin
 make install-skills  # copy bundled skills to ~/.config/pocketharness/skills
 make clean
 ```
+
+Tests require localhost sockets and a writable checkout for isolated fixtures.
+They use synthetic provider responses and make no paid model calls. CI builds
+with GCC and Clang, then runs the sanitizer suite.
 
 ## Anti-goals (the constitution)
 

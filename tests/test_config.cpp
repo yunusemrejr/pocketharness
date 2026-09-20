@@ -194,3 +194,39 @@ TEST(config_Project_Providers_Ignored_And_Endpoints_Validated) {
 }
 
 
+TEST(config_Rejects_Loopback_Impostors) {
+    for (const char* u : {"http://127.attacker.test/v1", "http://127.0.0.1.evil/v1",
+                          "http://localhost@evil/v1", "http://127.0.0.1:80@evil/v1",
+                          "http://", "http://[::1]:bad/v1", "http://127.0.0.1:99999/v1"})
+        CHECK(!isLoopbackHttp(u));
+    CHECK(isLoopbackHttp("http://[::1]:8080/v1"));
+    CHECK(isLoopbackHttp("http://[::1]/v1"));
+    return "";
+}
+
+TEST(config_Model_Compatibility_Options) {
+    std::string dir = makeTempDir("pocket-options");
+    HomeGuard hg(dir);
+    CHECK(ensureDir(userConfigDir(), 0700).ok);
+    CHECK(atomicWriteFile(userConfigPath(), R"({"thinking":"minimal","models":{"small":{
+        "provider":"ollama","model":"custom:4b","context":8192,"max_tokens":1024,
+        "reasoning":"none","stream_usage":false,"prompt_cache":false,
+        "token_parameter":"max_completion_tokens"}}})").ok);
+    auto cfg = loadConfig(dir);
+    CHECK(cfg.ok);
+    auto m = resolveModel(cfg.value, "small");
+    auto explicitId = resolveModel(cfg.value, "ollama:custom:4b");
+    CHECK(m.ok && explicitId.ok);
+    CHECK_EQ(m.value.context, 8192L);
+    CHECK_EQ(explicitId.value.options.maxTokens, 1024L);
+    CHECK(!m.value.options.streamUsage && !m.value.options.promptCache);
+    CHECK_EQ(resolveModel(defaultConfig(), "ollama:other").value.context, 32768L);
+    for (const char* value : {"-1", "512.5", "1e300", "\"large\""}) {
+        CHECK(atomicWriteFile(userConfigPath(), std::string("{\"models\":{\"x\":{\"provider\":\"ollama\",\"model\":\"m\",\"context\":") + value + "}}}").ok);
+        CHECK(!loadConfig(dir).ok);
+    }
+    for (const char* level : {"auto", "off", "none", "minimal", "low", "medium", "high", "xhigh", "max"})
+        CHECK(validThinking(level));
+    rmRf(dir);
+    return "";
+}

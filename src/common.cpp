@@ -141,11 +141,12 @@ Result<std::string> readFileBounded(const std::string& path, size_t maxBytes) {
 
 VoidResult atomicWriteFile(const std::string& path, const std::string& data, mode_t mode) {
     std::string tmp = path + ".tmp." + randHex(4);
-    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
     if (fd < 0) return VoidResult::Err("cannot write temp file for " + path);
     size_t off = 0;
     while (off < data.size()) {
         ssize_t n = write(fd, data.data() + off, data.size() - off);
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
             close(fd);
             unlink(tmp.c_str());
@@ -167,20 +168,22 @@ VoidResult atomicWriteFile(const std::string& path, const std::string& data, mod
 }
 
 VoidResult appendLine(const std::string& path, const std::string& line) {
-    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) return VoidResult::Err("cannot open session file " + path);
     std::string rec = line + "\n";
     size_t off = 0;
     while (off < rec.size()) {
         ssize_t n = write(fd, rec.data() + off, rec.size() - off);
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
             close(fd);
             return VoidResult::Err("session write failed");
         }
         off += (size_t)n;
     }
-    fsync(fd);
+    int synced = fsync(fd);
     close(fd);
+    if (synced != 0) return VoidResult::Err("session fsync failed");
     return VoidResult::Ok();
 }
 

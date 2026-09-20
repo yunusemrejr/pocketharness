@@ -48,6 +48,7 @@ void authorityClose(Authority& a);
 VoidResult authorityAddReadRoot(Authority& a, const std::string& path);
 
 // Contained file operations for the native tools.
+Result<int> boxOpenRead(const Authority& a, const std::string& path);  // owned fd, regular files only
 Result<std::string> boxRead(const Authority& a, const std::string& path, size_t maxBytes);
 // Atomic write (tmp + rename). Creates parent dirs inside the owning root.
 // Preserves the owner-execute bit when overwriting an executable file.

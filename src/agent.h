@@ -16,7 +16,7 @@
 namespace pocket {
 
 // Compaction cut point: index of the first message to KEEP, or msgs.size()
-// when compacting now would be wrong (too short, or no user boundary keeps
+// when compacting now would be wrong (too short, or no message boundary keeps
 // tool_use/tool_result pairing intact). Pure and unit-tested.
 size_t compactCutPoint(const std::vector<ChatMessage>& msgs, size_t keepLast = 8);
 
@@ -34,19 +34,9 @@ std::string buildSystemPrompt(const std::string& workspace);
 // Which base prompt is active: "" = built-in, else the override file path.
 std::string systemPromptSource(const std::string& workspace);
 
-// Wire copy of history for a request: the last 3 tool results ride along
-// nearly whole (capped at kWireRecentCap), older ones are cut to
-// kWireOldCap chars (pairing ids intact). History on disk stays full.
-// contextUsed() mirrors this rule exactly; both go through wireCappedLen().
-// Small stable tails also keep provider prefix caches hot: only genuinely
-// new bytes re-cache instead of megabytes of shifting offsets.
-inline constexpr size_t kWireRecentFull = 3;
-inline constexpr size_t kWireRecentCap = 12000;
-inline constexpr size_t kWireOldCap = 500;
+// Cap each result identically forever: aging must never rewrite a cached prefix.
+inline constexpr size_t kWireToolCap = 12000;
 std::vector<ChatMessage> trimWireHistory(const std::vector<ChatMessage>& msgs);
-// Exact on-wire length of a tool result under the trim rule (recent = one
-// of the last kWireRecentFull). Unit-tested against trimWireHistory.
-size_t wireCappedLen(size_t len, bool recent);
 
 // Vision attachments. Pasted/dropped image paths are detected in TUI input
 // (or given via --image), staged under the session dir + session tmp, and
@@ -74,7 +64,7 @@ std::vector<ImageToken> collectImageTokens(const std::string& text,
 struct AgentOpts {
     ResolvedModel model;
     std::string thinking = "off";
-    long maxTokens = 8192;     // completion budget; also the compaction reserve
+    long maxTokens = 0;        // 0 = model config; also the compaction reserve
     int maxRounds = 100;       // model<->tool rounds per turn before stopping
     ToolEnv* tools = nullptr;  // not owned
     std::string sessionId;
@@ -82,6 +72,7 @@ struct AgentOpts {
     std::function<void(std::string_view token)> onToken;
     std::function<void(std::string_view chunk)> onReasoning;  // live thinking preview
     std::function<void(const std::string&)> onNotice;  // compaction, retries, etc.
+    std::function<Result<ChatResponse>(const ChatRequest&, const ChatCallbacks&)> request = chatRequest;
 };
 
 struct AgentStats {
@@ -134,6 +125,8 @@ class Agent {
     void setModel(const ResolvedModel& m, const std::string& thinking) {
         opts_.model = m;
         opts_.thinking = thinking;
+        stats_.lastPrompt = -1;
+        lastEstimate_ = 0;
     }
     void setCallbacks(std::function<void(std::string_view)> tok,
                       std::function<void(const std::string&)> notice,
@@ -153,9 +146,13 @@ class Agent {
     const std::string& sessionTag() const { return orSessionId_; }
 
   private:
-    std::string requestOnce(std::vector<ToolCall>& callsOut, std::string& textOut);
+    Result<ChatResponse> requestOnce();
     std::string maybeCompact();
+    long completionBudget() const;
+    long estimateContext() const;
+    void recordResponse(const ChatResponse& response, long elapsedMs);
     void appendSession(const SessionEvent& ev);
+    void saveStats();
     // Load the frozen prefix from the session sidecar, or freeze it now.
     // Empty sessionId (unit tests) skips persistence but still builds once.
     void ensureMeta();
@@ -167,6 +164,8 @@ class Agent {
     std::vector<ChatImage> pendingImages_;
     AgentStats stats_;
     std::vector<ToolDef> toolDefs_;
+    long lastEstimate_ = 0;
+    std::string persistenceError_;
 };
 
 }  // namespace pocket

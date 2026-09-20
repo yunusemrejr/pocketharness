@@ -1346,10 +1346,6 @@ PickResult pickOne(const std::string& title, const std::vector<std::string>& lab
     return pickCooked(title, labels, initial);
 }
 
-bool validThinking(const std::string& t) {
-    return t == "off" || t == "low" || t == "medium" || t == "high" || t == "max";
-}
-
 // ---------------------------------------------------------------------------
 // Slash commands. Returns false when the session should end.
 // ---------------------------------------------------------------------------
@@ -1366,7 +1362,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
     if (cmd == "help") {
         say("commands:\n"
             "  /model [spec]     pick or switch model (filterable; provider:model works too)\n"
-            "  /thinking [level] pick or set thinking (off/low/medium/high/max)\n"
+            "  /thinking [level] auto/off/none/minimal/low/medium/high/xhigh/max\n"
             "  /compact          summarize older context now\n"
             "  /skills [query]   list or search Markdown skills\n"
             "  /session          show session info and token usage\n"
@@ -1437,11 +1433,10 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             return true;
         }
         if (!args.empty()) {
-            say("usage: /thinking off|low|medium|high|max\n");
+            say("usage: /thinking auto|off|none|minimal|low|medium|high|xhigh|max\n");
             return true;
         }
-        static const std::vector<std::string> kLevels = {"off", "low", "medium", "high",
-                                                                 "max"};
+        static const std::vector<std::string> kLevels = {"auto", "off", "none", "minimal", "low", "medium", "high", "xhigh", "max"};
         PickResult pr = pickOne("thinking — now: " + opts.thinking, kLevels, "");
         if (!pr.submitted) {
             say("(cancelled)\n");
@@ -1450,7 +1445,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         std::string f = toLower(pr.filter);
         if (!f.empty() && validThinking(f)) setLevel(f);
         else if (pr.index >= 0) setLevel(kLevels[(size_t)pr.index]);
-        else say("usage: /thinking off|low|medium|high|max\n");
+        else say("usage: /thinking auto|off|none|minimal|low|medium|high|xhigh|max\n");
         return true;
     }
     if (cmd == "compact") {

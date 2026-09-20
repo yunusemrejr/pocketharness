@@ -42,7 +42,7 @@ TEST(provider_OpenAi_Body) {
     req.thinking = "high";
     CHECK_EQ(buildOpenAiBody(req).at("reasoning_effort").asStr(), std::string("high"));
     req.thinking = "max";
-    CHECK_EQ(buildOpenAiBody(req).at("reasoning_effort").asStr(), std::string("xhigh"));
+    CHECK_EQ(buildOpenAiBody(req).at("reasoning_effort").asStr(), std::string("max"));
     return "";
 }
 
@@ -83,7 +83,7 @@ TEST(provider_Anthropic_Body) {
 
 TEST(provider_Sse_Split) {
     std::string carry;
-    auto p = sseSplit("event: message\ndata: {\"a\":1}\n: keepalive\n\ndata: [DONE]\n", carry);
+    auto p = sseSplit("event: message\ndata: {\"a\":1}\n: keepalive\n\ndata: [DONE]\n\n", carry);
     CHECK_EQ(p.size(), (size_t)2);
     CHECK_EQ(p[0], std::string("{\"a\":1}"));
     p = sseSplit("data: {\"b\":", carry);
@@ -139,7 +139,7 @@ TEST(provider_Anthropic_Stream) {
     ChatResponse r = acc.finish();
     CHECK_EQ(r.calls.size(), (size_t)1);
     CHECK_EQ(r.calls[0].argsJson, std::string("{\"command\":\"x\"}"));
-    CHECK_EQ(r.inTokens, 50L);
+    CHECK_EQ(r.inTokens, 90L);
     CHECK_EQ(r.cacheHit, 40L);
     return "";
 }
@@ -267,5 +267,91 @@ TEST(provider_Stream_Reasoning_Captured) {
     b.feed(w.value);
     CHECK_EQ(b.reasoning, std::string("deep"));
     CHECK(b.text.empty());
+    return "";
+}
+
+TEST(provider_Model_Options_And_Thinking_Budgets) {
+    ChatRequest req;
+    req.model = resolveModel(defaultConfig(), "openai:test").value;
+    req.thinking = "none";
+    req.sessionTag = "stable";
+    auto b = buildOpenAiBody(req);
+    CHECK(b.has("max_completion_tokens") && !b.has("max_tokens"));
+    CHECK_EQ(b.at("reasoning_effort").asStr(), std::string("none"));
+    CHECK_EQ(b.at("prompt_cache_key").asStr(), std::string("stable"));
+    req.model.options.streamUsage = false;
+    req.model.options.reasoning = "none";
+    b = buildOpenAiBody(req);
+    CHECK(!b.has("stream_options") && !b.has("reasoning_effort"));
+    req.model = mkModel();
+    req.maxTokens = 1500;
+    for (const char* level : {"minimal", "low", "medium", "high", "xhigh", "max"}) {
+        req.thinking = level;
+        b = buildAnthropicBody(req);
+        long budget = b.at("thinking").at("budget_tokens").asInt();
+        CHECK(budget >= 1024 && budget < req.maxTokens);
+    }
+    req.model.options.reasoning = "adaptive";
+    b = buildAnthropicBody(req);
+    CHECK_EQ(b.at("thinking").at("type").asStr(), std::string("adaptive"));
+    CHECK_EQ(b.at("output_config").at("effort").asStr(), std::string("max"));
+    CHECK(b.has("cache_control"));
+    return "";
+}
+
+TEST(provider_Usage_Denominators_And_Stream_Errors) {
+    auto v = json::parse(R"({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":200}}})");
+    auto r = parseOpenAiResponse(v.value);
+    CHECK(r.ok && r.value.cacheHit == 200 && r.value.cacheMiss == 800);
+    v = json::parse(R"({"content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":50,"cache_creation_input_tokens":200,"cache_read_input_tokens":750,"output_tokens":10}})");
+    r = parseAnthropicResponse(v.value);
+    CHECK(r.ok && r.value.inTokens == 1000 && r.value.cacheMiss == 250);
+    OpenAiStreamAcc a;
+    a.feed(json::parse(R"({"choices":[{"delta":{"tool_calls":[{"index":1e300}]}}]})").value);
+    CHECK(!a.error.empty() && a.pend.empty());
+    AnthropicStreamAcc c;
+    c.feed(json::parse(R"({"type":"error","error":{"message":"overloaded"}})").value);
+    CHECK_EQ(c.finish().error, std::string("overloaded"));
+    v = json::parse(R"({"content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":8e18,"cache_creation_input_tokens":8e18,"cache_read_input_tokens":8e18}})");
+    r = parseAnthropicResponse(v.value);
+    CHECK(r.ok && r.value.inTokens == -1);  // hostile usage cannot overflow counters
+    CHECK_EQ(retryDelayMs(999), 30000L);
+    CHECK_EQ(retryAfterMs("HTTP/1.1 429\r\nRetry-After: 8\r\n"), 8000L);
+    CHECK_EQ(retryAfterMs("Retry-After: 99999\r\n"), 60000L);
+    return "";
+}
+
+TEST(provider_Reasoning_Replay_And_Grouped_Results) {
+    AnthropicStreamAcc acc;
+    for (const char* s : {
+        R"({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}})",
+        R"({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}})",
+        R"({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}})"})
+        acc.feed(json::parse(s).value);
+    auto reply = acc.finish();
+    ChatRequest req;
+    req.model = mkModel();
+    ChatMessage m{"assistant", "", {{"a", "read", "{}"}, {"b", "read", "{}"}}, ""};
+    m.replay = reply.replay;
+    m.replay.asObj()["model"] = req.model.provider.name + ":" + req.model.model;
+    req.messages = {{"user", "q", {}, ""}, m, {"tool", "A", {}, "a"}, {"tool", "B", {}, "b"}};
+    auto b = buildAnthropicBody(req);
+    CHECK_EQ(b.at("messages").size(), (size_t)3);
+    CHECK_EQ(b.at("messages").at(2).at("content").size(), (size_t)2);
+    CHECK_EQ(b.at("messages").at(1).at("content").at(0).at("signature").asStr(), std::string("sig"));
+    req.model.model = "different";
+    b = buildAnthropicBody(req);
+    CHECK_EQ(b.at("messages").at(1).at("content").at(0).at("type").asStr(), std::string("tool_use"));
+    return "";
+}
+
+TEST(provider_Sse_Multiline_And_Key_Injection) {
+    std::string carry;
+    CHECK(sseSplit("data: {\"x\":\n", carry).empty());
+    auto events = sseSplit("data: 1}\r\n\r\n", carry);
+    CHECK(events.size() == 1 && json::parse(events[0]).ok);
+    ProviderCfg p{"test", "openai", "https://example.test", "POCKET_BAD_KEY"};
+    EnvGuard key("POCKET_BAD_KEY", "key\"\nurl = \"https://evil.test");
+    CHECK(!providerApiKey(p).ok);
     return "";
 }

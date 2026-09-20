@@ -369,66 +369,71 @@ bool resolveModelPath(const std::vector<std::string>& roots, const std::string& 
     return true;
 }
 
-std::string readAllFd(int fd, size_t maxBytes, bool& tooBig) {
+Result<std::string> readAllFd(int fd, size_t maxBytes) {
     std::string out;
     char buf[65536];
     for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf));
         if (n < 0) {
             if (errno == EINTR) continue;
-            break;
+            return Result<std::string>::Err("file read failed");
         }
         if (n == 0) break;
         if (out.size() + (size_t)n > maxBytes) {
-            tooBig = true;
-            out.append(buf, maxBytes - out.size());
-            break;
+            return Result<std::string>::Err("file exceeds read limit; request a narrower range");
         }
         out.append(buf, (size_t)n);
     }
-    return out;
+    return Result<std::string>::Ok(std::move(out));
 }
 
 }  // namespace
 
-Result<std::string> boxRead(const Authority& a, const std::string& path, size_t maxBytes) {
+Result<int> boxOpenRead(const Authority& a, const std::string& path) {
     if (a.unsafe) {
-        auto r = readFileBounded(expandHome(path), maxBytes);
-        if (!r.ok) return Result<std::string>::Err(r.error);
-        return r;
+        std::string p = expandHome(path);
+        if (p.empty() || p[0] != '/') p = a.workspace + "/" + p;
+        int fd = open(p.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        struct stat st{};
+        if (fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) return Result<int>::Ok(fd);
+        if (fd >= 0) close(fd);
+        return Result<int>::Err("read: not a regular file");
     }
     Resolved rs;
     std::string err;
     if (!resolveModelPath(a.readRoots, path, rs, err))
-        return Result<std::string>::Err("read denied: " + err);
+        return Result<int>::Err("read denied: " + err);
     int rootfd = a.readFds[(size_t)rs.rootIdx];
     int dirfd = openParentChain(rootfd, rs.comps, false, false, err);
-    if (dirfd < 0) return Result<std::string>::Err("read denied: " + err);
+    if (dirfd < 0) return Result<int>::Err("read denied: " + err);
     const std::string& leaf = rs.comps.back();
     int fd;
     if (leaf == ".") {
         fd = dirfd;  // reading a directory itself: fail cleanly below
     } else {
-        fd = openComp(dirfd, leaf.c_str(), O_RDONLY, 0, false, false);
+        fd = openComp(dirfd, leaf.c_str(), O_RDONLY | O_NONBLOCK, 0, false, false);
         if (fd < 0) {
             err = "cannot open '" + leaf + "': " + strerror(errno);
             close(dirfd);
-            return Result<std::string>::Err("read denied: " + err);
+            return Result<int>::Err("read denied: " + err);
         }
     }
     struct stat st;
-    bool isDir = (leaf == ".") || (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode));
-    if (isDir) {
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
         if (fd != dirfd) close(fd);
         close(dirfd);
-        return Result<std::string>::Err("read denied: is a directory: " + path);
+        return Result<int>::Err("read denied: not a regular file: " + path);
     }
-    bool tooBig = false;
-    std::string data = readAllFd(fd, maxBytes, tooBig);
-    close(fd);
     if (fd != dirfd) close(dirfd);
-    if (tooBig) data += "\n[... truncated: file exceeds limit ...]\n";
-    return Result<std::string>::Ok(std::move(data));
+    return Result<int>::Ok(fd);
+}
+
+Result<std::string> boxRead(const Authority& a, const std::string& path, size_t maxBytes) {
+    auto fd = boxOpenRead(a, path);
+    if (!fd.ok) return Result<std::string>::Err(fd.error);
+    auto data = readAllFd(fd.value, maxBytes);
+    close(fd.value);
+    return data;
 }
 
 VoidResult boxWrite(const Authority& a, const std::string& path, const std::string& data,
@@ -1036,7 +1041,7 @@ bool hasWord(const std::string& cmd, const std::string& word) {
     for (size_t i = 0; i + word.size() <= cmd.size(); ++i) {
         if (cmd.compare(i, word.size(), word) != 0) continue;
         bool left = i == 0 || (!isalnum((unsigned char)cmd[i - 1]) && cmd[i - 1] != '_' &&
-                               cmd[i - 1] != '-' && cmd[i - 1] != '/');
+                               cmd[i - 1] != '-');
         size_t e = i + word.size();
         bool right = e >= cmd.size() || (!isalnum((unsigned char)cmd[e]) && cmd[e] != '_' &&
                                         cmd[e] != '-');
@@ -1096,6 +1101,11 @@ bool mentionsDot(const std::string& cmd) {
 GuardResult classifyCommand(const std::string& cmd, const std::string& workspace, bool allowNet) {
     GuardResult r;
     std::string c = trim(cmd);
+    if (c.find('\0') != std::string::npos) {
+        r.verdict = Verdict::Deny;
+        r.reason = "NUL byte in command";
+        return r;
+    }
     if (c.empty()) {
         r.verdict = Verdict::Deny;
         r.reason = "empty command";
@@ -1203,6 +1213,11 @@ GuardResult classifyCommand(const std::string& cmd, const std::string& workspace
                 }
             }
         }
+        if (c.find_first_of("$`") != std::string::npos) {
+            r.verdict = Verdict::Ask;
+            r.reason = "recursive rm with a computed target needs approval";
+            return r;
+        }
         if (force && (mentionsRootish(c) || mentionsDot(c) || c.find(" *") != std::string::npos ||
                       c.find("/*") != std::string::npos)) {
             r.verdict = Verdict::Ask;
@@ -1216,6 +1231,12 @@ GuardResult classifyCommand(const std::string& cmd, const std::string& workspace
         }
     }
     // git destructive ops.
+    if (hasWord(c, "git") && hasWord(c, "push") &&
+        (hasFlag(c, 'f', "--force") || hasWord(c, "--force-with-lease"))) {
+        r.verdict = Verdict::Ask;
+        r.reason = "git force-push rewrites shared history; needs approval";
+        return r;
+    }
     if (hasWord(c, "git") && hasWord(c, "reset") && hasWord(c, "--hard")) {
         r.verdict = Verdict::Ask;
         r.reason = "'git reset --hard' can destroy uncommitted work; needs approval";

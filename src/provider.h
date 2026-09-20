@@ -38,6 +38,7 @@ struct ChatMessage {
     std::vector<ToolCall> toolCalls;  // assistant messages only
     std::string toolCallId;           // tool messages only
     std::vector<ChatImage> images{};  // user messages only (empty by default)
+    json::Value replay{};  // signed/opaque reasoning, scoped to the originating model
 };
 
 struct ChatRequest {
@@ -45,7 +46,7 @@ struct ChatRequest {
     std::string system;
     std::vector<ChatMessage> messages;
     std::vector<ToolDef> tools;
-    std::string thinking = "off";  // off|low|medium|high|max
+    std::string thinking = "off";  // auto|off|none|minimal|low|medium|high|xhigh|max
     bool stream = true;
     long maxTokens = 8192;
     // Stable per-PocketHarness-session tag. Sent as OpenRouter `session_id`
@@ -64,6 +65,8 @@ struct ChatResponse {
     long cacheHit = -1;   // cached/reused input tokens
     long cacheMiss = -1;  // uncached input tokens (DeepSeek prompt_cache_miss)
     double cost = -1;     // reported request cost, if any (OpenRouter)
+    json::Value replay{};
+    std::string error, stopReason;
 };
 
 struct ChatCallbacks {
@@ -82,12 +85,13 @@ inline constexpr int kChatMaxAttempts = 4;  // 1 initial + 3 retries
 bool shouldRetryRequest(int httpCode, bool curlFailed, bool timedOut, bool emitted);
 // Cooldown before attempt N (N>=1): 1s, 2s, 4s, ... capped at 30s.
 long retryDelayMs(int attempt);
+long retryAfterMs(const std::string& headers);  // numeric Retry-After, bounded to 60s
 
 // Request-body builders (pure, unit-tested).
 json::Value buildOpenAiBody(const ChatRequest& req);
 json::Value buildAnthropicBody(const ChatRequest& req);
 
-// Incremental SSE payload splitter: feed raw bytes, get "data:" payloads.
+// Incremental SSE event splitter: joins multiline data at blank-line boundaries.
 // Lines not starting with "data:" are ignored (event:/comments/id:).
 // Returns payloads; "[DONE]" arrives as a payload and means end-of-stream.
 std::vector<std::string> sseSplit(std::string_view chunk, std::string& carry);
@@ -96,6 +100,9 @@ std::vector<std::string> sseSplit(std::string_view chunk, std::string& carry);
 struct OpenAiStreamAcc {
     std::string text;
     std::string reasoning;
+    std::string error, stopReason;
+    bool done = false;
+    json::Array details;
     struct Pending {
         std::string id, name, args;
     };
@@ -109,9 +116,13 @@ struct OpenAiStreamAcc {
 struct AnthropicStreamAcc {
     std::string text;
     std::string reasoning;
+    std::string error, stopReason;
+    bool done = false;
+    json::Value usage{json::obj()};
     struct Block {
         std::string id, name, input;
         bool isTool = false;
+        json::Value value{};
     };
     std::vector<Block> blocks;  // indexed by content_block "index"
     long inTokens = -1, outTokens = -1;

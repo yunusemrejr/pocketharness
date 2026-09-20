@@ -2,6 +2,7 @@
 #include <ftw.h>
 #include <limits.h>
 #include <locale.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -21,6 +22,16 @@
 namespace pocket {
 namespace {
 
+std::atomic<bool> printCancel{false};
+static_assert(std::atomic<bool>::is_always_lock_free);
+void cancelPrint(int) { printCancel.store(true); }
+
+int positiveOption(const std::string& text, int max) {
+    if (text.empty() || text.size() > 9 || text.find_first_not_of("0123456789") != std::string::npos) return 0;
+    long n = std::stol(text);
+    return n > 0 && n <= max ? (int)n : 0;
+}
+
 void usage() {
     printf(
         "pocket %s — tiny Linux-native coding-agent harness\n"
@@ -33,7 +44,7 @@ void usage() {
         "\n"
         "options:\n"
         "  -m, --model SPEC     provider:model[@routing] or alias (default: config)\n"
-        "  -t, --thinking LVL   off|low|medium|high|max\n"
+        "  -t, --thinking LVL   auto|off|none|minimal|low|medium|high|xhigh|max\n"
         "  -p, --print PROMPT   non-interactive prompt (stdout = final answer)\n"
         "  --image PATH         attach an image (PNG/JPEG/GIF/WebP, max 5 MiB, repeatable)\n"
         "  --resume [id]        resume a session (interactive unless -p)\n"
@@ -44,6 +55,7 @@ void usage() {
         "  --allow-write PATH   extra write root for native tools (repeatable)\n"
         "  --allow-destructive  -p mode: permit guard-flagged commands (explicit)\n"
         "  --max-rounds N       cap model tool rounds per turn (default 100)\n"
+        "  --max-tokens N       completion budget (default: model config, fits context)\n"
         "  --unsafe             disable containment (conspicuous, never persisted)\n"
         "  --allow-root         permit agent execution as UID 0 (dangerous)\n"
         "  --help               this text\n"
@@ -112,7 +124,7 @@ int pocketMain(int argc, char** argv) {
     bool optNetwork = false, optUnsafe = false, optAllowRoot = false, optNoNetwork = false;
     bool optAllowDestructive = false;
     bool optHelp = false, optVersion = false;
-    int optMaxRounds = 0;  // 0 = no CLI override; config/default applies
+    int optMaxRounds = 0, optMaxTokens = 0;  // 0 = model/config defaults
     std::vector<std::string> allowRead, allowWrite, optImages;
 
     for (int i = 1; i < argc; ++i) {
@@ -139,11 +151,14 @@ int pocketMain(int argc, char** argv) {
         else if (a == "--allow-root") optAllowRoot = true;
         else if (a == "--allow-destructive") optAllowDestructive = true;
         else if (a == "--max-rounds") {
-            optMaxRounds = atoi(needVal("--max-rounds").c_str());
+            optMaxRounds = positiveOption(needVal("--max-rounds"), 1000);
             if (optMaxRounds < 1 || optMaxRounds > 1000) {
                 fprintf(stderr, "pocket: --max-rounds needs 1..1000\n");
                 return 2;
             }
+        } else if (a == "--max-tokens") {
+            optMaxTokens = positiveOption(needVal("--max-tokens"), 1048576);
+            if (!optMaxTokens) { fprintf(stderr, "pocket: --max-tokens needs 1..1048576\n"); return 2; }
         } else if (a == "--allow-read") allowRead.push_back(needVal("--allow-read"));
         else if (a == "--allow-write") allowWrite.push_back(needVal("--allow-write"));
         else if (a == "--image") optImages.push_back(needVal("--image"));
@@ -249,14 +264,11 @@ int pocketMain(int argc, char** argv) {
         }
     }
 
-    auto thinkOk = [](const std::string& t) {
-        return t == "off" || t == "low" || t == "medium" || t == "high" || t == "max";
-    };
     std::string thinkingFlag;
     if (!thinkingCli.empty()) {
         thinkingFlag = toLower(thinkingCli);
-        if (!thinkOk(thinkingFlag)) {
-            fprintf(stderr, "pocket: bad --thinking (off|low|medium|high|max)\n");
+        if (!validThinking(thinkingFlag)) {
+            fprintf(stderr, "pocket: bad --thinking (auto|off|none|minimal|low|medium|high|xhigh|max)\n");
             return 2;
         }
     }
@@ -268,7 +280,8 @@ int pocketMain(int argc, char** argv) {
             return 0;
         }
         for (const auto& s : list)
-            printf("%s  (%ld events)  %s\n", s.id.c_str(), s.events, s.firstLine.c_str());
+            printf("%s  %s  %s  %s\n", s.id.c_str(), s.active ? "active" : "idle",
+                   sanitizeTerminal(s.workspace).c_str(), sanitizeTerminal(s.firstLine).c_str());
         return 0;
     }
 
@@ -276,7 +289,7 @@ int pocketMain(int argc, char** argv) {
     // concurrent sessions never observe each other (no shared UI state). ---
     std::string sessionId;
     if (resume) {
-        auto s = sessionResolve(resumeId);
+        auto s = sessionResolve(resumeId, workspace);
         if (!s.ok) {
             fprintf(stderr, "pocket: %s\n", s.error.c_str());
             return 1;
@@ -290,12 +303,26 @@ int pocketMain(int argc, char** argv) {
         }
         sessionId = s.value;
     }
-    SessionMeta sm = sessionLoadMeta(sessionId).value;
+    auto lease = sessionLock(sessionId);
+    if (!lease.ok) { fprintf(stderr, "pocket: %s\n", lease.error.c_str()); return 1; }
+    struct Lease { int fd; ~Lease() { close(fd); } } sessionLease{lease.value};
+    auto loadedMeta = sessionLoadMeta(sessionId);
+    if (!loadedMeta.ok) { fprintf(stderr, "pocket: %s\n", loadedMeta.error.c_str()); return 1; }
+    SessionMeta sm = loadedMeta.value;
+    if (!sm.workspace.empty() && sm.workspace != workspace) {
+        fprintf(stderr, "pocket: session belongs to workspace %s; run pocket there to resume\n",
+                sanitizeTerminal(sm.workspace).c_str());
+        return 1;
+    }
+    sm.workspace = workspace;
+    if (auto saved = sessionSaveMeta(sessionId, sm); !saved.ok) {
+        fprintf(stderr, "pocket: %s\n", saved.error.c_str()); return 1;
+    }
 
     // --- model + thinking: explicit CLI wins, then this session, then config ---
     std::string wantModel = !modelSpec.empty() ? modelSpec : sm.modelSpec;
     auto rmR = resolveModel(cfg, wantModel);
-    if (!rmR.ok && !wantModel.empty() && wantModel != cfg.defaultModel) {
+    if (!rmR.ok && modelSpec.empty() && !wantModel.empty() && wantModel != cfg.defaultModel) {
         fprintf(stderr, "pocket: %s; falling back to default\n", rmR.error.c_str());
         rmR = resolveModel(cfg, "");
     }
@@ -305,7 +332,7 @@ int pocketMain(int argc, char** argv) {
     }
     ResolvedModel model = rmR.value;
     std::string thinking = !thinkingFlag.empty() ? thinkingFlag : sm.thinking;
-    if (!thinkOk(thinking)) thinking = cfg.thinking;
+    if (!validThinking(thinking)) thinking = cfg.thinking;
 
     if (!curlAvailable()) {
         fprintf(stderr, "pocket: the `curl` executable is required but not runnable\n");
@@ -334,6 +361,7 @@ int pocketMain(int argc, char** argv) {
     }
     chmod(tpl.data(), 0700);
     std::string sessionTmp = tpl.data();
+    struct Scratch { std::string path; ~Scratch() { nftw(path.c_str(), removeTmp, 16, FTW_DEPTH | FTW_PHYS); } } scratch{sessionTmp};
     std::string sandboxHome = sessionTmp + "/home";
     ensureDir(sandboxHome, 0700);
     // The native `read` tool can see session scratch (pasted images land
@@ -369,12 +397,13 @@ int pocketMain(int argc, char** argv) {
     ao.model = model;
     ao.thinking = thinking;
     ao.maxRounds = optMaxRounds > 0 ? optMaxRounds : cfg.maxRounds;
+    ao.maxTokens = optMaxTokens;
     ao.tools = &tools;
     ao.sessionId = sessionId;
     Agent agent(ao);
     if (resume) {
         auto r = agent.restore(sessionId);
-        if (!r.ok) fprintf(stderr, "pocket: resume note: %s\n", r.error.c_str());
+        if (!r.ok) { fprintf(stderr, "pocket: cannot resume: %s\n", r.error.c_str()); return 1; }
     }
     for (const auto& img : optImages) {
         std::string err = agent.attachImage(img);
@@ -396,9 +425,13 @@ int pocketMain(int argc, char** argv) {
         // --- non-interactive: stdout = streamed answer, stderr = activity ---
         if (!sysSrc.empty()) fprintf(stderr, "pocket: system prompt: %s\n", sysSrc.c_str());
         tools.askApproval = nullptr;  // fail closed (or --allow-destructive)
-        std::atomic<bool> cancel{false};
-        tools.cancel = &cancel;
-        agent.setCancel(&cancel);
+        struct sigaction sa{}, oldInt{}, oldTerm{};
+        sa.sa_handler = cancelPrint;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, &oldInt);
+        sigaction(SIGTERM, &sa, &oldTerm);
+        tools.cancel = &printCancel;
+        agent.setCancel(&printCancel);
         bool errTty = isatty(STDERR_FILENO);
         agent.setCallbacks(
             [&](std::string_view tok) {
@@ -406,18 +439,20 @@ int pocketMain(int argc, char** argv) {
                 (void)!fwrite(s.data(), 1, s.size(), stdout);
                 fflush(stdout);
             },
-            [&](const std::string& note) { fprintf(stderr, "(%s)\n", note.c_str()); },
+            [&](const std::string& note) { fprintf(stderr, "(%s)\n", sanitizeTerminal(note).c_str()); },
             [&](std::string_view chunk) {
                 // Thinking streams to stderr so stdout stays the pure answer.
                 std::string s = sanitizeTerminal(std::string(chunk));
                 if (errTty) s = "\033[2m" + s + "\033[0m";
                 (void)!fwrite(s.data(), 1, s.size(), stderr);
             });
-        tools.onEvent = [&](const std::string& line) { fprintf(stderr, "⚙ %s\n", line.c_str()); };
+        tools.onEvent = [&](const std::string& line) { fprintf(stderr, "⚙ %s\n", sanitizeTerminal(line).c_str()); };
         tools.onToolDone = [&](const std::string& name, bool ok, const std::string&) {
             fprintf(stderr, "%s %s\n", ok ? "✓" : "✗", name.c_str());
         };
         std::string err = agent.runTurn(prompt);
+        sigaction(SIGINT, &oldInt, nullptr);
+        sigaction(SIGTERM, &oldTerm, nullptr);
         printf("\n");
         const AgentStats& st = agent.stats();
         if (st.cacheSeen) {
@@ -431,7 +466,7 @@ int pocketMain(int argc, char** argv) {
             fprintf(stderr, "cancelled\n");
             rc = 130;
         } else if (!err.empty()) {
-            fprintf(stderr, "pocket: %s\n", err.c_str());
+            fprintf(stderr, "pocket: %s\n", sanitizeTerminal(err).c_str());
             rc = 1;
         }
     } else {
@@ -459,7 +494,6 @@ int pocketMain(int argc, char** argv) {
     }
 
     authorityClose(auth);
-    nftw(sessionTmp.c_str(), removeTmp, 16, FTW_DEPTH | FTW_PHYS);
     return rc;
 }
 

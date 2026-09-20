@@ -78,3 +78,60 @@ TEST(process_Streaming_Callback) {
     CHECK(r.ok && got == r.out && got == "one\ntwo\n");
     return "";
 }
+
+TEST(process_Closed_Stdin_Does_Not_Kill_Parent) {
+    SpawnOpts o;
+    o.exe = "/bin/sh";
+    o.argv = {"sh", "-c", "exec 0<&-; sleep 0.02; echo alive"};
+    o.stdinData = std::string(2 << 20, 'x');
+    o.timeoutMs = 2000;
+    auto r = spawn(o);
+    CHECK(r.ok && r.out == "alive\n");
+    return "";
+}
+
+TEST(process_Flood_Timeout_And_Bounded_Callbacks) {
+    SpawnOpts o;
+    o.exe = "/bin/sh";
+    o.argv = {"sh", "-c", "while :; do printf 'lots of output\\n'; done"};
+    o.outLimit = 128;
+    o.timeoutMs = 150;
+    size_t seen = 0;
+    o.onChunk = [&](std::string_view s, bool) { seen += s.size(); };
+    auto start = nowMs();
+    auto r = spawn(o);
+    CHECK(r.timedOut && r.truncated && seen == 128 && nowMs() - start < 3000);
+    o.stopOnLimit = true;
+    o.timeoutMs = 3000;
+    r = spawn(o);
+    CHECK(r.truncated && !r.ok && !r.timedOut);
+    return "";
+}
+
+TEST(process_Child_Exit_Still_Drains_Descendants) {
+    SpawnOpts o;
+    o.exe = "/bin/sh";
+    o.argv = {"sh", "-c", "(sleep 0.03; echo late) & exit 0"};
+    o.timeoutMs = 1000;
+    auto r = spawn(o);
+    CHECK(r.ok && r.out == "late\n");
+    o.argv = {"sh", "-c", "exec 1>&- 2>&-; sleep 0.03"};
+    r = spawn(o);
+    CHECK(r.ok && r.out.empty());
+    return "";
+}
+
+TEST(process_Path_Uses_Child_Environment_And_Workdir) {
+    std::string dir = makeTempDir("pocket-exe");
+    CHECK(atomicWriteFile(dir + "/local-program", "#!/bin/sh\nprintf right", 0755).ok);
+    SpawnOpts o;
+    o.exe = "local-program";
+    o.env = {"PATH=."};
+    o.workdir = dir;
+    auto r = spawn(o);
+    CHECK(r.ok && r.out == "right");
+    o.env = {"PATH=/nonexistent"};
+    CHECK(!spawn(o).ok);  // no fallback to the workspace when PATH has no match
+    rmRf(dir);
+    return "";
+}
