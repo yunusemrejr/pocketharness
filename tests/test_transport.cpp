@@ -148,3 +148,25 @@ TEST(transport_Retry_And_Metadata_Use_Correct_Auth_Config) {
     rmRf(dir);
     return "";
 }
+
+TEST(transport_NonUtf8_Messages_Are_Repaired_For_Both_Protocols) {
+    std::string dir = makeTempDir("pocket-http-unicode");
+    HomeGuard hg(dir);
+    CHECK(ensureDir(stateDir(), 0700).ok);
+    LocalServer server({http(R"({"choices":[{"message":{"content":"ok"}}]})"),
+                        http(R"({"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"})")});
+    CHECK(!server.url.empty());
+    auto req = requestFor(server);
+    req.messages[0].content = "İ Ç 😀 VER\xddLEN \xf0\x9f\x98";
+    CHECK(chatRequest(req, {}).ok);
+    req.model.provider.protocol = "anthropic";
+    CHECK(chatRequest(req, {}).ok);
+    server.join();
+    CHECK_EQ(server.requests.size(), (size_t)2);
+    for (const auto& request : server.requests) {
+        CHECK(request.find("İ Ç 😀 VER\\ufffdLEN \\ufffd\\ufffd\\ufffd") != std::string::npos);
+        CHECK(request.find('\xdd') == std::string::npos);
+    }
+    rmRf(dir);
+    return "";
+}

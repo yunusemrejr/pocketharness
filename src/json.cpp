@@ -197,6 +197,10 @@ struct Parser {
                                 return false;
                             }
                         }
+                        if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                            error = "lone low surrogate at offset " + std::to_string(pos);
+                            return false;
+                        }
                         appendUtf8(out, cp);
                         break;
                     }
@@ -376,9 +380,32 @@ Result<Value> parse(std::string_view text) {
 // ---------------------------------------------------------------------------
 // Serializer
 // ---------------------------------------------------------------------------
+static size_t utf8ScalarBytes(std::string_view s, size_t pos) {
+    unsigned char c = s[pos];
+    size_t n = c >= 0xc2 && c <= 0xdf ? 2 : c >= 0xe0 && c <= 0xef ? 3 :
+               c >= 0xf0 && c <= 0xf4 ? 4 : 0;
+    if (!n || n > s.size() - pos) return 0;
+    for (size_t j = 1; j < n; ++j)
+        if (((unsigned char)s[pos + j] & 0xc0) != 0x80) return 0;
+    unsigned char second = s[pos + 1];
+    if ((c == 0xe0 && second < 0xa0) || (c == 0xed && second >= 0xa0) ||
+        (c == 0xf0 && second < 0x90) || (c == 0xf4 && second >= 0x90)) return 0;
+    return n;
+}
+
 void writeEscaped(std::string& out, std::string_view s) {
     out.push_back('"');
-    for (unsigned char c : s) {
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = s[i];
+        if (c >= 0x80) {
+            // Tool output and old session logs may contain arbitrary bytes.
+            // Preserve valid UTF-8; replace each invalid byte, never guess a code page.
+            size_t n = utf8ScalarBytes(s, i);
+            if (n) { out.append(s.substr(i, n)); i += n; }
+            else { out += "\\ufffd"; ++i; }
+            continue;
+        }
+        ++i;
         switch (c) {
             case '"': out += "\\\""; break;
             case '\\': out += "\\\\"; break;

@@ -33,6 +33,7 @@ TEST(json_Escapes_And_Unicode) {
     CHECK(v.ok && v.value.asStr() == "\xf0\x9f\x98\x80");
     v = parse(R"("\ud800")");  // lone high surrogate
     CHECK(!v.ok);
+    CHECK(!parse(R"("\udddd")").ok);  // lone low surrogate (e.g. surrogateescape)
     v = parse(R"("bad \x")");
     CHECK(!v.ok);
     return "";
@@ -80,5 +81,26 @@ TEST(json_Serialize_Roundtrip) {
     CHECK(pretty.find("\"a\": \"x\\ty\"") != std::string::npos);
     CHECK(pretty.find('\n') != std::string::npos);
     CHECK(parse(pretty).ok);
+    return "";
+}
+
+TEST(json_Serialize_Only_Unicode_Scalars) {
+    // Preserve valid UTF-8, including scalar boundaries, Turkish and emoji.
+    std::string valid = "VERİLEN ÇEKLER 😀\x7f\xc2\x80\xdf\xbf\xe0\xa0\x80"
+                        "\xed\x9f\xbf\xee\x80\x80\xef\xbf\xbf\xf0\x90\x80\x80\xf4\x8f\xbf\xbf";
+    CHECK_EQ(stringify(Value(valid)), "\"" + valid + "\"");
+    // Invalid lead/continuation bytes, truncated sequences, overlong encodings,
+    // encoded surrogates and values above U+10FFFF must never reach the wire.
+    for (const std::string bad : {"\xdd", "\x80", "\xff", "\xc3", "\xe2\x82", "\xf0\x9f\x98",
+                                  "\xc0\xaf", "\xe0\x80\x80", "\xf0\x80\x80\x80",
+                                  "\xed\xa0\x80", "\xed\xb3\x9d", "\xf4\x90\x80\x80", "\xf8\x88\x80\x80\x80"}) {
+        std::string escaped, decoded;
+        for (size_t i = 0; i < bad.size(); ++i) { escaped += "\\ufffd"; decoded += "\xef\xbf\xbd"; }
+        CHECK_EQ(stringify(Value(bad)), "\"" + escaped + "\"");
+        CHECK_EQ(parse(stringify(Value(bad))).value.asStr(), decoded);
+        CHECK_EQ(stringify(Value(Object{{bad, bad}})), "{\"" + escaped + "\":\"" + escaped + "\"}");
+    }
+    CHECK_EQ(stringify(Value("VER\xddLEN \xc3(")), std::string("\"VER\\ufffdLEN \\ufffd(\""));
+    CHECK_EQ(stringify(Value(std::string("a\0b", 3))), std::string("\"a\\u0000b\""));
     return "";
 }

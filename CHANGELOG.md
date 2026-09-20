@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1
+
+- Serialize only valid UTF-8 JSON: preserve valid text and replace invalid bytes
+  from binary output, legacy encodings, or truncated characters with U+FFFD.
+  Applies to both providers and session writes; old sessions with raw invalid
+  bytes can resume without repeatedly sending malformed requests.
+- Reject unpaired low-surrogate JSON escapes. Add Unicode boundary, legacy
+  session recovery, and real curl regression tests for both wire protocols.
+
 ## 0.3.0
 
 - Keep capped tool-result prefixes stable as conversations grow; retain useful

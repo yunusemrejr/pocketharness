@@ -306,6 +306,13 @@ stay on disk, while bounded copies keep memory and subsequent requests small.
 Actual reuse still depends on the provider, cache lifetime, and minimum prefix
 size; no cache-hit rate is promised.
 
+JSON serialization preserves valid UTF-8 and replaces invalid bytes with `�`,
+including truncated characters and raw bytes in older session logs. This prevents
+binary/legacy-encoded tool output from breaking all subsequent requests. Source
+files are unchanged; decode them explicitly with their actual encoding when text
+fidelity matters. Restart the updated `pocket` and use `--resume` to recover an
+affected session.
+
 Cache percentages use only samples with a known denominator. OpenAI-style
 uncached tokens are total input minus reported cached input; Anthropic total
 input includes uncached input, cache writes, and cache reads. The TUI shows a
