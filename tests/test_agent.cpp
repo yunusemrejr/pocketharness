@@ -407,6 +407,37 @@ TEST(agent_Crash_Closes_Unknown_Tool_Outcome) {
     return "";
 }
 
+TEST(agent_Resume_Legacy_NonUtf8_Tool_Result) {
+    std::string dir = makeTempDir("pocket-legacy-bytes");
+    HomeGuard hg(dir);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    CHECK(sessionAppend(id.value, {"user", "inspect file", "", "", "", true}).ok);
+    CHECK(sessionAppend(id.value, {"assistant", "", "", "", "", true}).ok);
+    CHECK(sessionAppend(id.value, {"tool_call", "", "c1", "bash", "{}", true}).ok);
+    // Before 0.3.1 the serializer wrote raw command/file bytes to JSONL.
+    CHECK(appendLine(sessionDir() + "/" + id.value + ".jsonl",
+                     "{\"t\":\"tool_result\",\"id\":\"c1\",\"text\":\"VER\xddLEN \xc3\"}").ok);
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    std::string wire;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        wire = json::stringify(buildOpenAiBody(req));
+        ChatResponse response;
+        response.text = "recovered";
+        return Result<ChatResponse>::Ok(response);
+    };
+    Agent resumed(opts);
+    CHECK(resumed.restore(id.value).ok);
+    CHECK(validateHistory(resumed.messages()).empty());
+    CHECK(resumed.runTurn("go on").empty());
+    CHECK(wire.find("VER\\ufffdLEN \\ufffd") != std::string::npos);
+    CHECK(wire.find('\xdd') == std::string::npos);
+    CHECK(json::parse(wire).ok);
+    rmRf(dir);
+    return "";
+}
+
 TEST(agent_Compaction_Retains_Tail_On_Every_Resume) {
     std::string dir = makeTempDir("pocket-compact-replay");
     HomeGuard hg(dir);

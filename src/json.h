@@ -62,7 +62,8 @@ struct Value {
 // Parse one complete JSON document. Trailing garbage is an error.
 Result<Value> parse(std::string_view text);
 
-// Serialize. pretty=true emits indented JSON.
+// Serialize valid UTF-8 JSON, replacing invalid string bytes with U+FFFD.
+// pretty=true emits indented JSON. Valid UTF-8 strings remain byte-identical.
 std::string stringify(const Value& v, bool pretty = false);
 
 // Helpers to build objects without ceremony.
