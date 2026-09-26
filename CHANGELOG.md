@@ -4,6 +4,8 @@
 
 - Keep the composer live while the agent works. Show queued messages, process
   them in order, and hold pending work after Esc until explicit follow-up/resume.
+- Preserve picker navigation typed after queued `/thinking`, `/model`, and
+  `/models` commands, including across response completion and approval prompts.
 - Add goal pause/resume/clear/status with persisted progress and safe paused
   restoration after restart. Cancellation no longer deletes the goal.
 - Show Jev, Span, and local LM activity, including real outcomes, cancellation,

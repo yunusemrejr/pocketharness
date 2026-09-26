@@ -107,7 +107,9 @@ Esc stops the current work and holds the queue until a new follow-up or
 explicit resume. `/queue` shows pending messages, `/queue clear` discards them,
 and `/queue resume` releases the held queue. Local commands such as `/session`
 leave a held queue paused. Up to 64 messages / 256 KiB can be queued; if full,
-the unsent draft is retained.
+the unsent draft is retained. A queued `/thinking`, `/model`, or `/models` picker
+keeps its following keystrokes until it opens; Esc returns control to the composer
+and holds the queue.
 Paste or drop an image file (PNG/JPEG/GIF/WebP, max 5 MiB) to attach it to
 the next message — vision models read it inline (`--image PATH` does the
 same for `-p`).

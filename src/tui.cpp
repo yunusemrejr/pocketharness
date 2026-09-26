@@ -1336,18 +1336,109 @@ std::string attachPastedImages(TuiOpts& opts, Agent& agent, const std::string& t
     return out;
 }
 
+struct QueuedMessage {
+    std::string text;
+    std::string pickerKeys;
+};
+
 struct QueuedInput {
-    std::deque<std::string> messages;
+    std::deque<QueuedMessage> messages;
     bool held = false;
     bool quit = false;
     bool continueGoal = false;
+    // deque preserves references across pushes and removal of earlier items.
+    // A modal command owns its typeahead until its actual picker opens.
+    QueuedMessage* picker = nullptr;
+    std::string pickerEscape;
+    bool pickerPaste = false;
+    int64_t pickerEscAt = 0;
+    void releasePicker() { picker = nullptr; pickerEscape.clear(); pickerPaste = false; }
+    void clear() { releasePicker(); messages.clear(); }
+    size_t bytes() const {
+        size_t count = 0;
+        for (const auto& message : messages) count += message.text.size() + message.pickerKeys.size();
+        return count;
+    }
+    bool expirePickerEscape(const std::function<void()>& interrupt) {
+        if (!picker || pickerEscape.empty() || pickerPaste || nowMs() - pickerEscAt < 40) return false;
+        bool lone = pickerEscape == "\033";
+        if (lone) {
+            picker->pickerKeys.pop_back();
+            releasePicker();
+            interrupt();
+        } else {
+            // Replay has no original timing gaps: omit a timed-out prefix so
+            // later bytes cannot turn it into a new escape/paste sequence.
+            picker->pickerKeys.resize(picker->pickerKeys.size() - pickerEscape.size());
+            pickerEscape.clear();
+        }
+        return lone;
+    }
+    // false means this chunk belongs to the composer or an approval instead.
+    // On overflow/cancel, leave every unconsumed byte for the next reader.
+    bool capturePicker(const std::string& chunk, const std::function<void()>& interrupt,
+                       const std::function<void(const std::string&)>& notice) {
+        if (!picker) return false;
+        size_t used = bytes();
+        for (size_t i = 0; i < chunk.size(); ++i) {
+            unsigned char c = (unsigned char)chunk[i];
+            if ((c == 3 || c == 4) && !pickerPaste) {
+                if (!pickerEscape.empty()) picker->pickerKeys.resize(picker->pickerKeys.size() - pickerEscape.size());
+                if (c == 4) quit = true;
+                releasePicker();
+                interrupt();
+                g_stdinPend = chunk.substr(i + 1) + g_stdinPend;
+                return true;
+            }
+            // Reserve the closing delimiter so a bounded saved paste never
+            // leaves its future picker in paste mode after an overflow.
+            if (used >= 262138 || picker->pickerKeys.size() >= 65530) {
+                std::string pending = pickerEscape;
+                if (!pending.empty()) picker->pickerKeys.resize(picker->pickerKeys.size() - pending.size());
+                bool paste = pickerPaste;
+                if (paste) picker->pickerKeys += "\033[201~";
+                releasePicker();
+                interrupt();
+                // Preserve the remainder as a paste too: embedded Enter or
+                // Ctrl-C must not become live submissions or cancellation.
+                g_stdinPend = (paste ? "\033[200~" : "") + pending + chunk.substr(i) + g_stdinPend;
+                notice("queued picker input full; saved keys are held and remaining input returns to the composer\n");
+                return true;
+            }
+            picker->pickerKeys.push_back((char)c);
+            ++used;
+            if (!pickerEscape.empty()) {
+                pickerEscape.push_back((char)c);
+                if (pickerPaste) {
+                    if (pickerEscape == "\033[201~") {
+                        pickerPaste = false;
+                        pickerEscape.clear();
+                    } else if (std::string("\033[201~").compare(0, pickerEscape.size(), pickerEscape) != 0) {
+                        pickerEscape.clear();
+                    }
+                    continue;
+                }
+                if (pickerEscape == "\033[200~") pickerPaste = true;
+                bool single = pickerEscape.size() == 2 && c != '[' && c != 'O';
+                bool final = pickerEscape.size() > 2 && c >= 0x40 && c <= 0x7e;
+                if (single || final || pickerEscape.size() >= 32) pickerEscape.clear();
+            } else if (c == 0x1b) {
+                pickerEscape = "\033";
+                pickerEscAt = nowMs();
+            }
+        }
+        return true;
+    }
 };
 
-bool enqueue(QueuedInput& queue, const std::string& text) {
-    size_t bytes = text.size();
-    for (const auto& message : queue.messages) bytes += message.size();
+bool enqueue(QueuedInput& queue, const std::string& text, bool picker = false) {
+    size_t bytes = text.size() + queue.bytes();
     if (queue.messages.size() >= 64 || bytes > 262144) return false;
-    queue.messages.push_back(text);
+    queue.messages.push_back({text, ""});
+    if (picker) {
+        queue.releasePicker();
+        queue.picker = &queue.messages.back();
+    }
     return true;
 }
 
@@ -1358,11 +1449,22 @@ std::pair<std::string, std::string> slashParts(const std::string& text) {
     return {toLower(value.substr(0, end)), end == std::string::npos ? "" : trim(value.substr(end))};
 }
 
+bool opensPicker(const Config& cfg, const std::string& text) {
+    auto [command, args] = slashParts(text);
+    if (command == "/thinking") return args.empty();
+    if (command == "/model") return args.empty() || !resolveModel(cfg, args).ok;
+    if (command != "/models") return false;
+    size_t split = args.find_first_of(" \t\r\n");
+    std::string role = toLower(args.substr(0, split));
+    bool known = role == "main" || role == "fast" || role == "fallback" || role == "review" || role == "subagent";
+    return !known || split == std::string::npos || trim(args.substr(split)).empty();
+}
+
 std::string queueDescription(const QueuedInput& queue) {
     std::string out = "queue: " + std::to_string(queue.messages.size()) + (queue.held ? " held" : " ready") + "\n";
     size_t i = 0;
     for (const auto& message : queue.messages)
-        out += "  " + std::to_string(++i) + ". " + cutBytes(sanitizeTerminal(message), 180) + "\n";
+        out += "  " + std::to_string(++i) + ". " + cutBytes(sanitizeTerminal(message.text), 180) + "\n";
     return out;
 }
 
@@ -1416,7 +1518,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
     auto originalKpi = bar->kpi;
     bar->kpi = [&](int) {
         return status + "\n" + (queue.held ? "paused" : "working") + " · queued " + std::to_string(queue.messages.size()) +
-               (approvalPending ? " · approval: y/N" : " · Enter queue · Esc pause");
+               (approvalPending ? " · approval: y/N" : queue.picker ? " · picker waiting · Esc pause" : " · Enter queue · Esc pause");
     };
     bar->fixedInputH = 3;
     bar->fixedFooterH = (int)bar->statusRows().size();
@@ -1452,6 +1554,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
         cancel.store(true);
         interrupted = true;
         queue.held = true;
+        queue.releasePicker();
         queue.continueGoal = false;
         queuedReady.store(false);
         events.cv.notify_all();
@@ -1509,6 +1612,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
     bool thinkingHead = false;
     std::optional<Event> waitingApproval;
     auto pump = [&] {
+        if (!approvalPending && queue.expirePickerEscape(interrupt)) draw();
         std::deque<Event> batch;
         {
             std::lock_guard<std::mutex> lock(events.mu);
@@ -1536,7 +1640,8 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
             waitingApproval.reset();
             approvalPending = false;
         }
-        if (waitingApproval && !finished && !cancel.load() && g_stdinPend.empty() && !stdinReady() && !ed.inEscape && !ed.pasting) {
+        if (waitingApproval && !finished && !cancel.load() && g_stdinPend.empty() && !stdinReady() && !ed.inEscape && !ed.pasting &&
+            queue.pickerEscape.empty() && !queue.pickerPaste) {
             const Event& event = *waitingApproval;
             approvalPending = true;
             output([&] { rend.write("\nPocketHarness blocked a potentially destructive command.\n" +
@@ -1551,7 +1656,13 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
     control.pump = pump;
     control.interrupt = interrupt;
     control.consume = [&](const std::string& chunk) {
-        if (!approvalPending) return false;
+        if (!approvalPending) {
+            bool consumed = queue.capturePicker(chunk, interrupt, [&](const std::string& text) {
+                output([&] { rend.write(text); });
+            });
+            if (consumed) draw();
+            return consumed;
+        }
         for (char c : chunk) {
             int answer = c == 'y' || c == 'Y' ? 1 : c == 'n' || c == 'N' || c == '\r' || c == '\n' || c == 0x1b || c == 3 || c == 4 ? -1 : 0;
             if (!answer) continue;
@@ -1593,7 +1704,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
         } else if (command == "/goal" && (args.empty() || args == "status")) {
             output([&] { rend.write(goalStatus); });
         } else if (command == "/queue") {
-            if (args == "clear") queue.messages.clear();
+            if (args == "clear") queue.clear();
             else if (args == "resume") queue.held = false;
             else if (!args.empty() && args != "status") {
                 output([&] { rend.write("usage: /queue [status|clear|resume]\n"); });
@@ -1603,7 +1714,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
             queue.quit = true;
             interrupt();
         } else {
-            if (!enqueue(queue, text)) {
+            if (!enqueue(queue, text, opensPicker(*opts.cfg, text))) {
                 ed.setLines(text);
                 output([&] { rend.write("queue full (64 messages / 256 KiB); your draft is retained\n"); });
             } else {
@@ -2211,20 +2322,31 @@ int tuiRun(TuiOpts& opts) {
     while (!exitFlag && !queue.quit) {
         ed.prompt = bar.active ? shortPrompt() : promptFor(opts, agent);
         std::optional<std::string> input;
+        std::string pickerKeys;
         bool fromQueue = false;
         if (!queue.held && queue.continueGoal && queue.messages.empty()) {
             input = "/goal resume";
             fromQueue = true;
             queue.continueGoal = false;
         } else if (!queue.held && !queue.messages.empty()) {
-            if (!g_stdinPend.empty() || stdinReady() || ed.inEscape || ed.pasting) {
+            if (!g_stdinPend.empty() || stdinReady() || ed.inEscape || ed.pasting || !queue.pickerEscape.empty()) {
                 EditControl pending;
-                pending.pump = [&] { return !queue.held && (!g_stdinPend.empty() || stdinReady() || ed.inEscape || ed.pasting); };
-                pending.interrupt = [&] { queue.held = true; };
+                pending.interrupt = [&] { queue.held = true; queue.releasePicker(); };
+                pending.pump = [&] {
+                    queue.expirePickerEscape(pending.interrupt);
+                    return !queue.held && (!g_stdinPend.empty() || stdinReady() || ed.inEscape || ed.pasting || !queue.pickerEscape.empty());
+                };
+                pending.consume = [&](const std::string& chunk) {
+                    return queue.capturePicker(chunk, pending.interrupt, [&](const std::string& text) {
+                        bar.toTranscript(); writeAll(STDOUT_FILENO, text); draw();
+                    });
+                };
                 input = editLine(ed, draw, exitFlag, &pending);
                 if (!input) continue;
             } else {
-                input = std::move(queue.messages.front());
+                if (queue.picker == &queue.messages.front()) queue.releasePicker();
+                input = std::move(queue.messages.front().text);
+                pickerKeys = std::move(queue.messages.front().pickerKeys);
                 queue.messages.pop_front();
                 fromQueue = true;
             }
@@ -2239,7 +2361,7 @@ int tuiRun(TuiOpts& opts) {
         bar.draw();
         bar.toTranscript();
         if (command == "/queue") {
-            if (args == "clear") queue.messages.clear();
+            if (args == "clear") queue.clear();
             else if (args == "resume") {
                 queue.held = false;
                 queue.continueGoal = agent.goalPaused() && !queue.messages.empty();
@@ -2264,7 +2386,7 @@ int tuiRun(TuiOpts& opts) {
             (!queue.held || command.empty() || (command == "/goal" && args == "resume"))) {
             // Explicit input releases a held FIFO; older accepted messages keep
             // their order, while the newly submitted follow-up joins its tail.
-            if (!enqueue(queue, text)) {
+            if (!enqueue(queue, text, opensPicker(*opts.cfg, text))) {
                 ed.setLines(text);
                 queue.held = wasHeld;
                 queue.continueGoal = wasContinuation;
@@ -2280,6 +2402,9 @@ int tuiRun(TuiOpts& opts) {
             bool resume = args == "resume";
             runTurnInteractive(opts, agent, resume ? "" : args, shared, cancel, &bar, queue, !resume, resume);
         } else if (!command.empty()) {
+            // The saved bytes belong to this modal command, not to older FIFO
+            // turns, the live composer, or a destructive-command approval.
+            g_stdinPend = pickerKeys + g_stdinPend;
             if (!runCommand(opts, agent, text)) break;
         } else {
             bool resume = agent.goalPaused();

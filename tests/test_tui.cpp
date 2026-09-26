@@ -132,6 +132,28 @@ struct TuiFixture {
         }
         return true;
     }
+    bool sendDraining(const std::string& bytes) {
+        int flags = fcntl(master, F_GETFL);
+        if (flags < 0 || fcntl(master, F_SETFL, flags | O_NONBLOCK)) return false;
+        size_t off = 0;
+        int64_t until = nowMs() + 5000;
+        while (off < bytes.size() && nowMs() < until) {
+            pollfd p{master, POLLIN | POLLOUT, 0};
+            if (poll(&p, 1, 30) <= 0) continue;
+            if (p.revents & POLLIN) {
+                char buffer[8192];
+                ssize_t n = read(master, buffer, sizeof buffer);
+                if (n > 0) output.append(buffer, (size_t)n);
+            }
+            if (p.revents & POLLOUT) {
+                ssize_t n = write(master, bytes.data() + off, bytes.size() - off);
+                if (n > 0) off += (size_t)n;
+                else if (errno != EAGAIN && errno != EINTR) break;
+            }
+        }
+        int restored = fcntl(master, F_SETFL, flags);
+        return off == bytes.size() && restored == 0;
+    }
     bool waitFor(const std::string& text, int timeout = 3000) {
         int64_t until = nowMs() + timeout;
         while (output.find(text) == std::string::npos && nowMs() < until) {
@@ -445,6 +467,105 @@ TEST(tui_Approval_Cancel_And_Picker_Typeahead) {
     CHECK(t.send("/models fast glm,glm\r"));
     CHECK(t.waitFor("only the review council accepts multiple"));
     CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Queued_Picker_Owns_Its_Typeahead) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("first\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    // An older queued user turn must not consume the picker's arrow keys.
+    CHECK(t.send("older\r/thinking\r\033[B\033[B\r"));
+    CHECK(t.waitFor("queued 2"));
+    CHECK(!t.waitFor("thinking: none", 80));
+    t.finishFirst();
+    CHECK(t.waitFor("REPLY:\"older\""));
+    CHECK(t.waitFor("thinking: none"));
+    CHECK(t.output.find("REPLY:\"older\"") < t.output.find("thinking: none"));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Queued_Picker_Escape_Holds_Work) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("first\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    CHECK(t.send("/thinking\r\033[B\033[B\r"));
+    CHECK(t.waitFor("picker waiting"));
+    CHECK(t.send("\033"));
+    CHECK(t.waitFor("(paused;"));
+    CHECK(!t.waitFor("thinking: none", 100));
+    CHECK(t.send("/queue resume\r"));
+    CHECK(t.waitFor("thinking: none"));
+    CHECK(t.send("composer restored\r"));
+    CHECK(t.waitFor("REPLY:\"composer restored\""));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Queued_Picker_Keys_Never_Approve) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("delayed approval\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    CHECK(t.send("/thinking\r\033[200~yes\033[201~\025high\r"));
+    CHECK(t.waitFor("picker waiting"));
+    t.finishFirst();
+    CHECK(t.waitFor("Allow once? [y/N]"));
+    CHECK(!t.waitFor("allowed once", 80));
+    CHECK(t.send("n"));
+    CHECK(t.waitFor("REPLY:\"denied\""));
+    CHECK(t.waitFor("thinking: high"));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Queued_Models_Picker_Keeps_Split_Sequences) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("first\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    CHECK(t.send("/models\r"));
+    CHECK(t.waitFor("picker waiting"));
+    t.output.clear();
+    CHECK(t.send("\033["));
+    CHECK(t.waitFor("picker waiting"));
+    CHECK(t.send("B\033[B\033[B\033[B\rglm\r"));
+    t.finishFirst();
+    CHECK(t.waitFor("subagent: glm (saved)"));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Queued_Picker_Overflow_Preserves_Paste_Boundary) {
+    // Exercise an ordinary paste, a split start delimiter at the limit, and
+    // nested ESC bytes that must not masquerade as a paste terminator.
+    const std::vector<std::string> starts = {
+        "\033[200~" + std::string(68000, 'x'),
+        std::string(65527, 'x') + "\033[200~" + std::string(3000, 'x'),
+        "\033[200~" + std::string(65522, 'x') + "\033\033[201~" + std::string(3000, 'x')
+    };
+    for (const auto& start : starts) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("first\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    CHECK(t.send("/thinking\r"));
+    CHECK(t.waitFor("picker waiting"));
+    CHECK(t.sendDraining(start + "\r/goal clear\003OVERFLOW_TAIL\033[201~"));
+    CHECK(t.waitFor("queued picker input full"));
+    CHECK(t.waitFor("OVERFLOW_TAIL"));
+    CHECK(t.waitFor("(paused;"));
+    CHECK(t.output.find("goal clear requested") == std::string::npos);
+    CHECK(t.output.find("REPLY:") == std::string::npos);
+    CHECK(t.send("\003/queue clear\r"));
+    CHECK(t.waitFor("queue: 0 held"));
+    CHECK(t.send("after overflow\r"));
+    CHECK(t.waitFor("REPLY:\"after overflow\""));
+    CHECK(t.quit());
+    }
     return "";
 }
 
