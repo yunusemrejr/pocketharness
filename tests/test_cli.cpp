@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <thread>
 #include <cmath>
+#include <filesystem>
 #include "../src/config.h"
 #include "../src/process.h"
 #include "../src/session.h"
@@ -95,14 +96,29 @@ TEST(cli_Recursive_Child_Uses_Selected_Model_And_Reports_Combined_Cost) {
                           R"({"roles":{"main":"fixture:main-model"}})").ok);
     char cwd[4096];
     CHECK(getcwd(cwd, sizeof(cwd)) != nullptr);
+    // Debug/sanitizer binaries may exceed the old 64 MiB staging limit. An
+    // inert ELF trailer makes the same boundary testable in release builds.
+    const std::string executable = dir + "/pocket";
+    std::error_code copyError;
+    CHECK(std::filesystem::copy_file(std::string(cwd) + "/pocket", executable, copyError));
+    if (std::filesystem::file_size(executable) < (65u << 20))
+        CHECK(truncate(executable.c_str(), 65u << 20) == 0);
     SpawnOpts opts;
-    opts.exe = std::string(cwd) + "/pocket";
+    opts.exe = executable;
     opts.argv = {opts.exe, "--allow-root", dir + "/workspace", "-p", "delegate"};
     opts.timeoutMs = 20000;
     auto result = spawn(opts);
     server.stop();
-    if (!result.ok || result.exitCode != 0) return "recursive CLI: " + result.error + "\n" + result.err;
-    CHECK(server.sawChild);
+    if (!result.ok || result.exitCode != 0 || !server.sawChild) {
+        std::string diagnostic = "recursive CLI: child=" + std::to_string(server.sawChild) +
+            " exit=" + std::to_string(result.exitCode) + " " + result.error + "\n" + result.err;
+        for (const auto& s : sessionList(10, dir + "/workspace")) {
+            auto transcript = sessionLoad(s.id);
+            if (transcript.ok) for (const auto& event : transcript.value.events)
+                if (event.type == "tool_result") diagnostic += "\ntool result: " + event.text;
+        }
+        return diagnostic;
+    }
     CHECK_EQ(server.models.size(), size_t(3));
     CHECK(result.out.find("parent completed") != std::string::npos);
     auto sessions = sessionList(10, dir + "/workspace");

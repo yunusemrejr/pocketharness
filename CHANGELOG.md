@@ -31,6 +31,8 @@
   Installation replaces the executable atomically so existing sessions survive.
 - Give recursive processes a bounded termination grace period to cancel their
   own tool groups and report usage; deeper children receive shorter deadlines.
+- Stream the running executable into child sandboxes without a 64 MiB limit
+  or whole-binary allocation; report staging failures before starting a turn.
 
 ## 0.4.0
 

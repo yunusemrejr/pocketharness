@@ -1,10 +1,12 @@
 // PocketHarness - entry point: CLI, privilege checks, workspace setup, modes.
 #include <ftw.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <locale.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/sendfile.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -118,6 +120,30 @@ int removeTmp(const char* path, const struct stat*, int type, struct FTW*) {
     (void)type;
     if (remove(path) != 0 && errno != ENOENT) return -1;
     return 0;
+}
+
+// Called before model tools can access this new private scratch directory.
+// Stream the running inode: installed binaries can be replaced while a session
+// is open, and instrumented/debug builds can be much larger than release builds.
+VoidResult stageExecutable(const std::string& path) {
+    int source = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+    if (source < 0) return VoidResult::Err("cannot open running executable");
+    int target = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0700);
+    if (target < 0) { close(source); return VoidResult::Err("cannot create staged executable"); }
+    bool copied = fchmod(target, 0700) == 0;
+    while (copied) {
+        ssize_t n = sendfile(target, source, nullptr, 1u << 20);
+        if (n > 0 || (n < 0 && errno == EINTR)) continue;
+        copied = n == 0;
+        break;
+    }
+    close(source);
+    if (close(target) != 0) copied = false;
+    if (!copied) {
+        unlink(path.c_str());
+        return VoidResult::Err("cannot copy running executable into sandbox");
+    }
+    return VoidResult::Ok();
 }
 
 }  // namespace
@@ -464,12 +490,11 @@ int pocketMain(int argc, char** argv) {
 
     // Stage this binary on the sandbox PATH: `pocket kit` and recursive
     // `pocket -p` must work inside confinement, wherever pocket is installed.
-    char selfPath[PATH_MAX];
-    if (auto self = realpath("/proc/self/exe", selfPath) ? readFileBounded(selfPath, 64 << 20)
-                                                         : Result<std::string>::Err("");
-        self.ok) {
-        ensureDir(sessionTmp + "/bin", 0700);
-        (void)atomicWriteFile(sessionTmp + "/bin/pocket", self.value, 0700);
+    auto staged = ensureDir(sessionTmp + "/bin", 0700);
+    if (staged.ok) staged = stageExecutable(sessionTmp + "/bin/pocket");
+    if (!staged.ok) {
+        fprintf(stderr, "pocket: %s\n", staged.error.c_str());
+        return 1;
     }
 
     ToolEnv tools;
