@@ -498,6 +498,12 @@ Result<SessionMeta> sessionLoadMeta(const std::string& id) {
     m.genTokens = v.value.at("gen_tokens").asInt(m.outTokens);
     m.childSessions = v.value.at("child_sessions").asInt(0);
     m.rolesSet = v.value.at("roles_set").asBool(false);
+    m.goal = v.value.at("goal").asStr();
+    m.goalStatus = v.value.at("goal_status").asStr();
+    m.goalPhase = v.value.at("goal_phase").asStr();
+    m.goalBrief = v.value.at("goal_brief").asStr();
+    m.goalNext = v.value.at("goal_next").asStr();
+    m.goalProgress = v.value.at("goal_progress").asStr();
     for (const auto& [role, model] : v.value.at("roles").asObj())
         if (model.isStr()) m.roles[role] = model.asStr();
     return Result<SessionMeta>::Ok(m);
@@ -532,6 +538,12 @@ VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m) {
     o["gen_tokens"] = json::Value(m.genTokens);
     o["child_sessions"] = json::Value(m.childSessions);
     o["roles_set"] = json::Value(m.rolesSet);
+    o["goal"] = m.goal;
+    o["goal_status"] = m.goalStatus;
+    o["goal_phase"] = m.goalPhase;
+    o["goal_brief"] = m.goalBrief;
+    o["goal_next"] = m.goalNext;
+    o["goal_progress"] = m.goalProgress;
     json::Object roles;
     for (const auto& [role, model] : m.roles) roles[role] = model;
     o["roles"] = json::Value(std::move(roles));

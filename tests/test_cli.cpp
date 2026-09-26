@@ -9,18 +9,25 @@
 #include "../src/config.h"
 #include "../src/process.h"
 #include "../src/session.h"
+#include "../src/skills.h"
 
 using namespace pocket;
 using namespace pocket::test;
 
 namespace {
+enum class CliFixture { Recursive, Judge, Goal };
 struct RecursiveServer {
     int fd = -1;
     std::string url;
     std::thread worker;
     std::vector<std::string> models;
     bool sawChild = false;
-    RecursiveServer() {
+    CliFixture fixture;
+    std::atomic<bool> completeAudit{false};
+    int audits = 0, work = 0;
+    bool sawFollowup = false;
+    int completions = 0;
+    explicit RecursiveServer(CliFixture mode = CliFixture::Recursive) : fixture(mode) {
         fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         sockaddr_in address{};
         address.sin_family = AF_INET;
@@ -50,14 +57,33 @@ struct RecursiveServer {
                     if (request.size() >= boundary + 4 + bytes) break;
                 }
                 std::string reply = R"({"data":[]})";
-                if (startsWith(request, "POST ") && boundary != std::string::npos) {
+                if (startsWith(request, "POST /completion ")) {
+                    ++completions;
+                    reply = R"({"completion_probabilities":[{"top_probs":[{"token":"yes","prob":0.95},{"token":"no","prob":0.05}]}]})";
+                } else if (startsWith(request, "POST ") && boundary != std::string::npos) {
                     auto body = json::parse(request.substr(boundary + 4));
                     std::string model = body.value.at("model").asStr();
                     models.push_back(model);
-                    if (model == "child-model") {
+                    if (fixture == CliFixture::Goal) {
+                        const auto& messages = body.value.at("messages").asArr();
+                        const std::string system = messages.empty() ? "" : messages.front().at("content").asStr();
+                        std::string answer;
+                        if (system.find("You audit an autonomous agent") != std::string::npos) {
+                            ++audits;
+                            answer = completeAudit.load() ? "DONE" : "invalid audit response";
+                        } else if (system.find("planning council") != std::string::npos) answer = "INTENT: fixture goal";
+                        else {
+                            ++work;
+                            answer = "work completed";
+                            for (const auto& message : messages)
+                                sawFollowup |= message.at("content").asStr().find("verify the final requirement") != std::string::npos;
+                        }
+                        reply = json::stringify(json::Object{{"choices", json::Array{json::Object{
+                            {"message", json::Object{{"content", answer}}}, {"finish_reason", "stop"}}}}});
+                    } else if (model == "child-model") {
                         sawChild = true;
                         reply = R"({"choices":[{"message":{"content":"child completed"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":5,"cost":0.2}})";
-                    } else if (models.size() == 1) {
+                    } else if (models.size() == 1 && fixture == CliFixture::Recursive) {
                         reply = R"({"choices":[{"message":{"content":"","tool_calls":[{"id":"child","type":"function","function":{"name":"bash","arguments":"{\"command\":\"pocket --allow-root -p child\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":20,"completion_tokens":5,"cost":0.1}})";
                     } else {
                         reply = R"({"choices":[{"message":{"content":"parent completed"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":5,"cost":0.1}})";
@@ -147,5 +173,74 @@ TEST(cli_Empty_And_Conflicting_Prompt_Modes_Fail_Fast) {
         CHECK_EQ(r.exitCode, 2);
         CHECK(!r.timedOut);
     }
+    return "";
+}
+
+TEST(cli_Local_Judge_Activity_Reaches_The_User) {
+    std::string dir = makeTempDir("pocket-judge-cli");
+    HomeGuard hg(dir);
+    const std::string workspace = dir + "/workspace";
+    CHECK(ensureDir(workspace, 0700).ok);
+    CHECK(ensureDir(userConfigDir(), 0700).ok);
+    CHECK(ensureDir(projectSkillDir(workspace) + "/parser", 0700).ok);
+    CHECK(atomicWriteFile(projectSkillDir(workspace) + "/parser/SKILL.md",
+                         "# Parser tests\n\nFix parser bugs and test invalid inputs.\n").ok);
+    RecursiveServer server(CliFixture::Judge);
+    CHECK(!server.url.empty());
+    const int port = std::stoi(server.url.substr(server.url.find_last_of(':') + 1));
+    auto config = json::Object{{"providers", json::Object{{"fixture", json::Object{{"base_url", server.url}}}}},
+        {"default_model", "fixture:main-model"}, {"autonomy", false}, {"review", false}, {"jev", false},
+        {"local_lm", json::Object{{"port", port}}}};
+    CHECK(atomicWriteFile(userConfigPath(), json::stringify(config)).ok);
+    SpawnOpts opts;
+    opts.exe = "./pocket";
+    opts.argv = {opts.exe, "--allow-root", workspace, "-p", "Fix parser bugs and test invalid inputs carefully."};
+    opts.timeoutMs = 10000;
+    auto result = spawn(opts);
+    server.stop();
+    if (!result.ok || result.exitCode != 0) return "judge CLI: " + result.error + "\n" + result.err;
+    CHECK_EQ(server.completions, 1);
+    CHECK(result.err.find("local LM") != std::string::npos);
+    CHECK(result.err.find("successful") != std::string::npos);
+    CHECK(result.out.find("parent completed") != std::string::npos);
+    CHECK(result.out.find("judge:") == std::string::npos);  // keep -p stdout composable
+    rmRf(dir);
+    return "";
+}
+
+TEST(cli_Resume_Followup_Continues_Paused_Goal) {
+    const std::string dir = makeTempDir("pocket-goal-cli"), workspace = dir + "/workspace";
+    HomeGuard hg(dir);
+    CHECK(ensureDir(workspace, 0700).ok);
+    CHECK(ensureDir(userConfigDir(), 0700).ok);
+    RecursiveServer server(CliFixture::Goal);
+    CHECK(!server.url.empty());
+    const int port = std::stoi(server.url.substr(server.url.find_last_of(':') + 1));
+    auto config = json::Object{{"providers", json::Object{{"fixture", json::Object{{"base_url", server.url}}}}},
+        {"default_model", "fixture:main-model"}, {"autonomy", false}, {"review", false}, {"jev", false},
+        {"local_lm", json::Object{{"port", port}}}};
+    CHECK(atomicWriteFile(userConfigPath(), json::stringify(config)).ok);
+    SpawnOpts opts;
+    opts.exe = "./pocket";
+    opts.argv = {opts.exe, "--allow-root", workspace, "-g", "Complete the fixture goal"};
+    opts.timeoutMs = 15000;
+    auto first = spawn(opts);
+    if (!first.ok || first.exitCode != 1) return "goal should pause on invalid audit:\n" + first.err;
+    auto sessions = sessionList(10, workspace);
+    CHECK_EQ(sessions.size(), size_t(1));
+    auto paused = sessionLoadMeta(sessions[0].id);
+    CHECK(paused.ok && paused.value.goalStatus == "paused");
+    server.completeAudit.store(true);
+    opts.argv = {opts.exe, "--allow-root", workspace, "--resume", sessions[0].id, "-p", "verify the final requirement"};
+    auto second = spawn(opts);
+    server.stop();
+    if (!second.ok || second.exitCode != 0) return "goal follow-up did not resume:\n" + second.err;
+    auto completed = sessionLoadMeta(sessions[0].id);
+    CHECK(completed.ok && completed.value.goalStatus == "completed");
+    CHECK_EQ(completed.value.goal, std::string("Complete the fixture goal"));
+    CHECK(server.sawFollowup);
+    CHECK_EQ(server.work, 2);
+    CHECK_EQ(server.audits, 2);
+    rmRf(dir);
     return "";
 }

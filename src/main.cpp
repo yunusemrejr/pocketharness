@@ -539,10 +539,10 @@ int pocketMain(int argc, char** argv) {
     ao.awareness = awarenessBlock(workspace, cfg, allowNet, optUnsafe, prompt.empty(),
                                   optMaxRounds > 0 ? optMaxRounds : cfg.maxRounds);
     ao.judge = [&cfg, &tools](const std::string& q, const std::string& text, double* cost) {
-        return judgeYes(cfg, q, text, cost, tools.cancel);
+        return judgeYes(cfg, q, text, cost, tools.cancel, tools.onEvent);
     };
     ao.decide = [&cfg, &tools](const json::Value& state, const std::vector<Question>& qs, bool transcript, double* cost) {
-        return decide(cfg, state, qs, transcript, cost, tools.cancel);
+        return decide(cfg, state, qs, transcript, cost, tools.cancel, tools.onEvent);
     };
     ao.hint = [&cfg, &tools, workspace](const std::string& text, double* cost) -> std::string {
         if (!needsBrief(text)) return "";
@@ -553,7 +553,7 @@ int pocketMain(int argc, char** argv) {
         for (size_t i = 0; i < hits.size(); ++i)
             qs.push_back({"s" + std::to_string(i), "Would the guide \"" + hits[i].name + ": " + hits[i].preview.substr(0, 200) +
                                                        "\" materially help an expert do this task well?"});
-        auto p = decide(cfg, json::Object{{"task", text.substr(0, 2000)}}, qs, false, cost, tools.cancel);
+        auto p = decide(cfg, json::Object{{"task", text.substr(0, 2000)}}, qs, false, cost, tools.cancel, tools.onEvent);
         std::vector<std::string> keep;
         for (size_t i = 0; i < hits.size(); ++i)
             if (p.empty() ? i == 0 : p["s" + std::to_string(i)] >= 0.7) keep.push_back(hits[i].name);
@@ -622,7 +622,8 @@ int pocketMain(int argc, char** argv) {
         tools.onToolDone = [&](const std::string& name, bool ok, const std::string&) {
             fprintf(stderr, "%s %s\n", ok ? "✓" : "✗", name.c_str());
         };
-        std::string err = goalText.empty() ? agent.runTurn(prompt) : agent.runGoal(goalText);
+        std::string err = !goalText.empty() ? agent.runGoal(goalText) :
+                          agent.goalPaused() ? agent.resumeGoal(prompt) : agent.runTurn(prompt);
         sigaction(SIGINT, &oldInt, nullptr);
         sigaction(SIGTERM, &oldTerm, nullptr);
         printf("\n");

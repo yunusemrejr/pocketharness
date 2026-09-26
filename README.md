@@ -95,13 +95,19 @@ export OPENROUTER_API_KEY=...     # also enables the Span/Jev judges
 ```
 
 Slash commands: `/models` (assign main · fast · fallback · review · subagent, fuzzy
-search over the catalog) `/model` `/goal` `/thinking` `/compact` `/undo`
+search over the catalog) `/model` `/goal` `/queue` `/thinking` `/compact` `/undo`
 `/skills` `/session` `/brain` `/catalog` `/security` `/help` `/quit`. Keys: Enter submits, Ctrl-J/Alt-Enter newline,
-Up/Down history, Ctrl-C cancels (empty prompt quits), Ctrl-D quits.
+Up/Down history, Esc pauses work, Ctrl-C cancels (idle empty prompt quits), Ctrl-D quits.
 Paste is bracketed (multi-line paste never submits early); the pinned bottom
 bar shows the input box, full provider/model/thinking, combined metered cost,
-and context/tok-s/cache KPIs. Text typed during generation is kept for the next
-prompt; Enter submits it after the current turn finishes.
+and context/tok-s/cache KPIs. The composer stays live during generation: Enter
+queues a message visibly, and queued messages run in order after the current
+turn. A running goal yields between work or audit steps to take queued input.
+Esc stops the current work and holds the queue until a new follow-up or
+explicit resume. `/queue` shows pending messages, `/queue clear` discards them,
+and `/queue resume` releases the held queue. Local commands such as `/session`
+leave a held queue paused. Up to 64 messages / 256 KiB can be queued; if full,
+the unsent draft is retained.
 Paste or drop an image file (PNG/JPEG/GIF/WebP, max 5 MiB) to attach it to
 the next message — vision models read it inline (`--image PATH` does the
 same for `-p`).
@@ -159,7 +165,15 @@ Weak and strong models get the same standards, enforced by the harness:
 6. **Goals.** `/goal TEXT` (or `pocket -g`) runs turns until an audit says
    the goal is met: Span confirms cheaply when it is sure, otherwise the
    `fast` model audits the digest and lists what remains. Stricter limits,
-   review always on.
+   review always on. `/goal` or `/goal status` shows the saved goal;
+   `/goal pause`, `/goal resume`, and `/goal clear` control it. Esc pauses without
+   deleting progress. A follow-up to a paused goal resumes it with that input.
+   Goals survive session restart: `pocket --resume` restores them paused until
+   you submit a follow-up or use `/goal resume`.
+
+Judge activity appears in the transcript while work runs: Jev, Span, and the
+local LM report requests and outcomes. Cached answers are explicitly marked
+as reused; an unavailable or cancelled judge is not reported as successful.
 
 Every check is bounded (a few nudges per turn); every remote judge
 refines and never gates; offline, the native classifier and heuristics

@@ -244,7 +244,7 @@ std::string gotoRc(int r, int c = 1) {
     return "\033[" + std::to_string(r) + ";" + std::to_string(c) + "H";
 }
 
-const char* kCommands[] = {"/models", "/model", "/goal", "/thinking", "/compact", "/undo", "/skills",
+const char* kCommands[] = {"/models", "/model", "/goal", "/queue", "/thinking", "/compact", "/undo", "/skills",
                             "/session", "/brain", "/catalog", "/security", "/help", "/quit", nullptr};
 
 struct Editor {
@@ -256,6 +256,10 @@ struct Editor {
     std::string prompt;
     int lastRows = 1;
     bool pinned = false;
+    // A turn may finish between bytes of a key or paste. Decoder state belongs
+    // to the composer, not to one invocation of the input loop.
+    std::string escape;
+    bool inEscape = false, pasting = false, pasteCR = false;
 
     bool empty() const { return lines.size() == 1 && lines[0].empty(); }
 
@@ -438,17 +442,24 @@ bool stdinReady() {
 }
 
 // Returns submitted text, or nullopt when the user asked to exit.
+struct EditControl {
+    std::function<bool()> pump;  // false when the background turn has finished
+    std::function<void()> interrupt;
+    std::function<bool(const std::string&)> consume;  // approval owns this chunk
+};
 std::optional<std::string> editLine(Editor& ed, const std::function<void()>& draw,
-                                    bool& exitFlag) {
+                                    bool& exitFlag, EditControl* control = nullptr) {
     draw();
-    std::string esc;  // pending escape sequence (after ESC)
-    bool inEsc = false;
-    bool paste = false, pasteCR = false;  // bracketed paste state
+    std::string& esc = ed.escape;
+    bool& inEsc = ed.inEscape;
+    bool& paste = ed.pasting;
+    bool& pasteCR = ed.pasteCR;
     auto endEsc = [&]() {
         inEsc = false;
         esc.clear();
     };
     for (;;) {
+        if (control && !control->pump()) return std::nullopt;
         if (g_winch) {
             g_winch = 0;
             draw();
@@ -459,16 +470,29 @@ std::optional<std::string> editLine(Editor& ed, const std::function<void()>& dra
             if (!readMore(chunk, 40)) {
                 bool lone = esc.empty();
                 endEsc();
+                if (lone && !paste && control) {
+                    control->interrupt();
+                    draw();
+                    continue;
+                }
                 if (lone && !ed.empty() && !paste) {
                     ed.reset();  // Esc clears the draft, including history state
                     draw();
                 }
                 continue;
             }
-        } else if (!readChunk(chunk)) {
-            exitFlag = true;
-            return std::nullopt;
+        } else {
+            if (control && g_stdinPend.empty()) {
+                struct pollfd pfd{STDIN_FILENO, POLLIN, 0};
+                if (poll(&pfd, 1, 30) <= 0) continue;
+            }
+            if (!readChunk(chunk)) {
+                exitFlag = true;
+                if (control) control->interrupt();
+                return std::nullopt;
+            }
         }
+        if (control && control->consume && control->consume(chunk)) continue;
         for (size_t i = 0; i < chunk.size(); ++i) {
             unsigned char c = (unsigned char)chunk[i];
             if (inEsc) {
@@ -586,6 +610,7 @@ std::optional<std::string> editLine(Editor& ed, const std::function<void()>& dra
                     ed.newline();
                     break;
                 case 0x03:  // Ctrl-C
+                    if (control) { control->interrupt(); break; }
                     if (ed.empty()) {
                         exitFlag = true;
                         return std::nullopt;
@@ -595,6 +620,7 @@ std::optional<std::string> editLine(Editor& ed, const std::function<void()>& dra
                 case 0x04:  // Ctrl-D
                     if (ed.empty()) {
                         exitFlag = true;
+                        if (control) control->interrupt();
                         return std::nullopt;
                     }
                     ed.deleteFwd();
@@ -1052,7 +1078,11 @@ std::string kpiText(TuiOpts& opts, Agent& agent, int) {
         trio += b;
         if (st.costIncomplete) trio += " + unreported";
     }
-    if (!agent.goal().empty()) trio = "◎ goal · " + trio;
+    if (agent.goalStatus() != GoalStatus::None) {
+        const char* state = agent.goalStatus() == GoalStatus::Active ? "active" :
+                            agent.goalPaused() ? "paused" : "completed";
+        trio = std::string("◎ goal ") + state + " · " + trio;
+    }
     if (!st.costSeen) trio += " · total unreported";
     return trio + "\nprovider " + sanitizeTerminal(opts.model.provider.name) +
            " · model " + sanitizeTerminal(opts.model.model) +
@@ -1073,12 +1103,13 @@ struct BottomBar {
     bool firstDraw = true, inTranscript = false;
     int64_t lastKpi = 0;
     int footerH = 1;
+    int fixedInputH = 0, fixedFooterH = 0;
 
     void setup() {
         rows = termRows();
         cols = termWidth();
         const char* t = getenv("TERM");
-        active = isatty(STDOUT_FILENO) && rows >= 10 && (!t || std::string(t) != "dumb");
+        active = isatty(STDOUT_FILENO) && rows >= 6 && (!t || std::string(t) != "dumb");
     }
     void teardown() {
         if (!active) return;
@@ -1129,7 +1160,7 @@ struct BottomBar {
             firstDraw = true;
         }
         int r = termRows(), c = termWidth();
-        if (r < 10) {
+        if (r < 6) {
             teardown();
             ed->pinned = false;
             ed->lastRows = 1;
@@ -1142,11 +1173,13 @@ struct BottomBar {
             cols = c;
             firstDraw = true;
         }
-        footerH = std::min((int)statusRows().size(), std::max(1, rows / 2));
+        footerH = std::min(fixedFooterH ? fixedFooterH : (int)statusRows().size(), std::max(1, rows / 2));
         auto view = ed->layout();
         size_t maxH = (size_t)std::max(1, rows - footerH - 4);
         size_t start = view.cursorRow >= maxH ? view.cursorRow - maxH + 1 : 0;
-        int inputH = (int)std::min(maxH, view.rows.size() - start);
+        int inputH = fixedInputH ? (int)std::min(maxH, (size_t)fixedInputH) : (int)std::min(maxH, view.rows.size() - start);
+        size_t visibleH = (size_t)inputH;
+        start = view.cursorRow >= visibleH ? view.cursorRow - visibleH + 1 : 0;
         int newTop = std::max(2, rows - footerH - inputH + 1);
         int newRegion = newTop - 1;
         int clearFrom = firstDraw || !inputTop ? newTop : std::min(inputTop, newTop);
@@ -1158,7 +1191,7 @@ struct BottomBar {
         }
         firstDraw = false;
         inputTop = newTop;
-        for (int i = 0; i < inputH; ++i)
+        for (int i = 0; i < inputH && start + (size_t)i < view.rows.size(); ++i)
             out += gotoRc(inputTop + i) + view.rows[start + (size_t)i];
         writeAll(STDOUT_FILENO, out);
         drawKpi(false);
@@ -1303,74 +1336,313 @@ std::string attachPastedImages(TuiOpts& opts, Agent& agent, const std::string& t
     return out;
 }
 
-int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, SharedInput& shared,
-                       std::atomic<bool>& cancel, BottomBar* bar, bool goal = false) {
-    InputGate gate(&shared);
+struct QueuedInput {
+    std::deque<std::string> messages;
+    bool held = false;
+    bool quit = false;
+    bool continueGoal = false;
+};
+
+bool enqueue(QueuedInput& queue, const std::string& text) {
+    size_t bytes = text.size();
+    for (const auto& message : queue.messages) bytes += message.size();
+    if (queue.messages.size() >= 64 || bytes > 262144) return false;
+    queue.messages.push_back(text);
+    return true;
+}
+
+std::pair<std::string, std::string> slashParts(const std::string& text) {
+    std::string value = trim(text);
+    if (value.empty() || value[0] != '/') return {};
+    size_t end = value.find_first_of(" \t\r\n");
+    return {toLower(value.substr(0, end)), end == std::string::npos ? "" : trim(value.substr(end))};
+}
+
+std::string queueDescription(const QueuedInput& queue) {
+    std::string out = "queue: " + std::to_string(queue.messages.size()) + (queue.held ? " held" : " ready") + "\n";
+    size_t i = 0;
+    for (const auto& message : queue.messages)
+        out += "  " + std::to_string(++i) + ". " + cutBytes(sanitizeTerminal(message), 180) + "\n";
+    return out;
+}
+
+std::string goalDescription(const Agent& agent) {
+    std::string status = agent.goalStatus() == GoalStatus::Active ? "active" :
+                         agent.goalStatus() == GoalStatus::Paused ? "paused" :
+                         agent.goalStatus() == GoalStatus::Completed ? "completed" : "none";
+    return "goal: " + status + (agent.goal().empty() ? "" : " · " + sanitizeTerminal(agent.goal())) + "\n";
+}
+
+// Agent work runs on one worker; only this main thread touches the terminal,
+// editor, or message queue. Immutable events are the only output crossing.
+int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, SharedInput&,
+                       std::atomic<bool>& cancel, BottomBar* bar, QueuedInput& queue,
+                       bool goal = false, bool resume = false) {
+    enum class Kind { Token, Reasoning, Notice, Tool, Status, Approval, Done };
+    struct Event { Kind kind; std::string text; std::string extra; };
+    struct Events {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<Event> items;
+        size_t bytes = 0;
+        int approval = 0;  // 0 waiting, 1 allow, -1 reject
+    } events;
+    auto post = [&](Kind kind, const std::string& text, const std::string& extra = "") {
+        bool stream = kind == Kind::Token || kind == Kind::Reasoning;
+        std::string bounded = !stream && text.size() > 65536 ? cutBytes(text, 65536) + "\n[display truncated]\n" : text;
+        size_t offset = 0;
+        do {
+            size_t count = stream ? std::min((size_t)16384, bounded.size() - offset) : bounded.size();
+            std::unique_lock<std::mutex> lock(events.mu);
+            events.cv.wait(lock, [&] { return events.bytes < 262144 && events.items.size() < 256; });
+            if (cancel.load() && (kind == Kind::Token || kind == Kind::Reasoning)) return;
+            if ((kind == Kind::Token || kind == Kind::Reasoning) && !events.items.empty() && events.items.back().kind == kind)
+                events.items.back().text.append(bounded, offset, count);
+            else events.items.push_back({kind, bounded.substr(offset, count), extra});
+            events.bytes += count + extra.size();
+            events.cv.notify_all();
+            offset += count;
+        } while (offset < bounded.size());
+    };
+    Editor& ed = *bar->ed;
     StreamRenderer rend;
-    struct Callbacks {
-        Agent& agent;
-        ToolEnv& tools;
-        ~Callbacks() {
-            agent.setCallbacks({}, {});
-            tools.onEvent = {};
-            tools.onToolDone = {};
-            g_endPartial = nullptr;
+    bool finished = false, interrupted = false, approvalPending = false;
+    bool clearRequested = false, pauseRequested = false;
+    std::atomic<bool> queuedReady{!queue.held && !queue.messages.empty()};
+    std::string result;
+    std::string status = kpiText(opts, agent, termWidth());
+    std::string goalStatus = goalDescription(agent);
+    if (goal || resume) goalStatus = "goal: active · " + (resume ? agent.goal() : input) + "\n";
+    auto originalKpi = bar->kpi;
+    bar->kpi = [&](int) {
+        return status + "\n" + (queue.held ? "paused" : "working") + " · queued " + std::to_string(queue.messages.size()) +
+               (approvalPending ? " · approval: y/N" : " · Enter queue · Esc pause");
+    };
+    bar->fixedInputH = 3;
+    bar->fixedFooterH = (int)bar->statusRows().size();
+    bar->draw();
+    bar->toTranscript();
+    writeAll(STDOUT_FILENO, col("\033[38;5;37m") + std::string(goal || resume ? "◎ goal" : "◆ pocket") + col(C_RESET) + "\n");
+    if (bar->active) writeAll(STDOUT_FILENO, "\0337");
+    bar->draw();
+    auto draw = [&] {
+        if (bar->active && (g_tstp || termRows() != bar->rows || termWidth() != bar->cols)) {
+            writeAll(STDOUT_FILENO, "\0338");
+            rend.endLine();
+            bar->draw();
+            bar->toTranscript();
+            writeAll(STDOUT_FILENO, "\0337");
         }
-    } callbacks{agent, *opts.tools};
-    g_endPartial = [&] { rend.endLine(); };
-    bool thinkHead = false;
+        bar->draw();
+    };
+    auto output = [&](const std::function<void()>& emit) {
+        if (bar->active) {
+            writeAll(STDOUT_FILENO, "\0338");
+            emit();
+            writeAll(STDOUT_FILENO, "\0337");
+        } else {
+            writeAll(STDOUT_FILENO, "\r\033[K");
+            emit();
+            rend.endLine();
+            ed.lastRows = 1;
+            ed.lastCursorRow = 0;
+        }
+    };
+    auto interrupt = [&] {
+        cancel.store(true);
+        interrupted = true;
+        queue.held = true;
+        queue.continueGoal = false;
+        queuedReady.store(false);
+        events.cv.notify_all();
+    };
+    cancel.store(false);
+    agent.setGoalYield([&] { return queuedReady.load(); });
+    int64_t lastStatus = 0;
+    auto updateStatus = [&](bool force = false) {
+        int64_t now = nowMs();
+        if (force || now - lastStatus >= 250) {
+            lastStatus = now;
+            post(Kind::Status, kpiText(opts, agent, termWidth()));
+        }
+    };
+    // These callbacks execute only on the agent worker. Agent stats and goal
+    // strings are therefore never read concurrently by the editor thread.
     agent.setCallbacks(
-        [&](std::string_view tok) {
-            if (cancel.load()) return;
-            rend.feed(tok);
-            if (bar) bar->liveKpi();
-        },
-        [&](const std::string& note) {
-            rend.write(col("\033[38;5;179m") + "  ◇ " + sanitizeTerminal(note) + col(C_RESET) + "\n");
-        },
-        [&](std::string_view chunk) {
-            if (cancel.load()) return;
-            if (!thinkHead) {
-                thinkHead = true;
-                rend.write(col(C_DIM) + std::string("∴ thinking") + col(C_RESET) + "\n");
-            }
-            rend.feed(chunk, true);
-            if (bar) bar->liveKpi();
-        });
-    opts.tools->onEvent = [&](const std::string& line) {
-        rend.write(col(C_DIM) + "  › " + sanitizeTerminal(line) + col(C_RESET) + "\n");
-    };
+        [&](std::string_view text) { if (!cancel.load()) post(Kind::Token, std::string(text)); updateStatus(); },
+        [&](const std::string& text) { post(Kind::Notice, text); updateStatus(); },
+        [&](std::string_view text) { if (!cancel.load()) post(Kind::Reasoning, std::string(text)); updateStatus(); });
+    opts.tools->onEvent = [&](const std::string& text) { post(Kind::Tool, text); updateStatus(); };
     opts.tools->onToolDone = [&](const std::string& name, bool ok, const std::string& summary) {
-        std::string mark = ok ? (col(C_GREEN) + std::string("  ✓ ")) : (col(C_RED) + std::string("  ✗ "));
-        std::string block = mark + sanitizeTerminal(name) + col(C_RESET) + "\n";
-        int shown = 0;
-        for (const std::string& ln : splitLines(summary)) {
-            if (shown >= 3) {
-                block += col(C_DIM) + "      [...]" + col(C_RESET) + "\n";
-                break;
-            }
-            block += col(C_DIM) + "      " + cutBytes(sanitizeTerminal(ln), (size_t)std::max(20, termWidth() - 8)) + col(C_RESET) + "\n";
-            ++shown;
+        std::string text = (ok ? "✓ " : "✗ ") + name;
+        size_t count = 0;
+        for (const auto& line : splitLines(summary)) {
+            if (++count > 3) { text += "\n    [...]"; break; }
+            text += "\n    " + cutBytes(sanitizeTerminal(line), 120);
         }
-        rend.write(block);
+        post(Kind::Tool, text);
+        updateStatus();
     };
-    {
-        std::lock_guard<std::mutex> lk(shared.mu);
-        shared.q.clear();
+    auto originalApproval = opts.tools->askApproval;
+    opts.tools->askApproval = [&](const std::string& command, const std::string& reason) {
+        if (command.size() + reason.size() > 65536) {
+            post(Kind::Notice, "command rejected: approval text exceeds the 64 KiB display limit");
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(events.mu);
+            events.approval = 0;
+        }
+        post(Kind::Approval, command, reason);
+        std::unique_lock<std::mutex> lock(events.mu);
+        while (!events.approval && !cancel.load()) events.cv.wait_for(lock, std::chrono::milliseconds(50));
+        return events.approval > 0 && !cancel.load();
+    };
+    std::thread worker([&] {
+        std::string error;
+        try { error = resume ? agent.resumeGoal(input) : goal ? agent.runGoal(input) : agent.runTurn(input); }
+        catch (const std::exception& e) { error = e.what(); }
+        catch (...) { error = "unexpected agent failure"; }
+        updateStatus(true);
+        post(Kind::Done, error);
+    });
+    bool thinkingHead = false;
+    std::optional<Event> waitingApproval;
+    auto pump = [&] {
+        std::deque<Event> batch;
+        {
+            std::lock_guard<std::mutex> lock(events.mu);
+            batch.swap(events.items);
+            events.bytes = 0;
+            events.cv.notify_all();
+        }
+        for (const auto& event : batch) {
+            if (event.kind == Kind::Status) status = event.text;
+            else if (event.kind == Kind::Done) { finished = true; result = event.text; }
+            else if (event.kind == Kind::Approval) {
+                waitingApproval = event;
+            } else output([&] {
+                if (event.kind == Kind::Token) rend.feed(event.text);
+                else if (event.kind == Kind::Reasoning) {
+                    if (!thinkingHead) { thinkingHead = true; rend.write("∴ thinking\n"); }
+                    rend.feed(event.text, true);
+                } else rend.write(col(C_DIM) + std::string(event.kind == Kind::Tool ? "  › " : "  ◇ ") +
+                                  sanitizeTerminal(event.text) + col(C_RESET) + "\n");
+            });
+        }
+        // Consume composer typeahead before establishing approval ownership.
+        // A buffered "yes do X" must remain a follow-up, never permission.
+        if (finished || cancel.load()) {
+            waitingApproval.reset();
+            approvalPending = false;
+        }
+        if (waitingApproval && !finished && !cancel.load() && g_stdinPend.empty() && !stdinReady() && !ed.inEscape && !ed.pasting) {
+            const Event& event = *waitingApproval;
+            approvalPending = true;
+            output([&] { rend.write("\nPocketHarness blocked a potentially destructive command.\n" +
+                sanitizeTerminal(event.extra) + "\n\n  " + sanitizeTerminal(event.text) + "\n\nAllow once? [y/N] "); });
+            waitingApproval.reset();
+            draw();
+        }
+        if (!batch.empty()) draw();
+        return !finished;
+    };
+    EditControl control;
+    control.pump = pump;
+    control.interrupt = interrupt;
+    control.consume = [&](const std::string& chunk) {
+        if (!approvalPending) return false;
+        for (char c : chunk) {
+            int answer = c == 'y' || c == 'Y' ? 1 : c == 'n' || c == 'N' || c == '\r' || c == '\n' || c == 0x1b || c == 3 || c == 4 ? -1 : 0;
+            if (!answer) continue;
+            if (c == 0x1b || c == 3 || c == 4) interrupt();
+            {
+                std::lock_guard<std::mutex> lock(events.mu);
+                events.approval = answer;
+            }
+            events.cv.notify_all();
+            approvalPending = false;
+            output([&] { rend.write(answer > 0 ? "allowed once\n" : "rejected\n"); });
+            draw();
+            break;
+        }
+        return true;
+    };
+    bool exitFlag = false;
+    while (!finished) {
+        auto submitted = editLine(ed, draw, exitFlag, &control);
+        if (exitFlag) {
+            queue.quit = true;
+            interrupt();
+            while (!finished) {
+                pump();
+                std::unique_lock<std::mutex> lock(events.mu);
+                if (!finished) events.cv.wait_for(lock, std::chrono::milliseconds(30));
+            }
+            break;
+        }
+        if (!submitted) continue;
+        std::string text = *submitted;
+        ed.reset();
+        auto [command, args] = slashParts(text);
+        if (command == "/goal" && (args == "pause" || args == "clear")) {
+            clearRequested |= args == "clear";
+            pauseRequested |= args == "pause";
+            interrupt();
+            output([&] { rend.write("goal " + args + " requested; waiting for the active operation to stop\n"); });
+        } else if (command == "/goal" && (args.empty() || args == "status")) {
+            output([&] { rend.write(goalStatus); });
+        } else if (command == "/queue") {
+            if (args == "clear") queue.messages.clear();
+            else if (args == "resume") queue.held = false;
+            else if (!args.empty() && args != "status") {
+                output([&] { rend.write("usage: /queue [status|clear|resume]\n"); });
+            }
+            output([&] { rend.write(queueDescription(queue)); });
+        } else if (command == "/quit" || command == "/exit" || command == "/q") {
+            queue.quit = true;
+            interrupt();
+        } else {
+            if (!enqueue(queue, text)) {
+                ed.setLines(text);
+                output([&] { rend.write("queue full (64 messages / 256 KiB); your draft is retained\n"); });
+            } else {
+                // A new explicit submission releases a queue held by Esc/Ctrl-C.
+                if (command.empty() || (command == "/goal" && args == "resume")) queue.held = false;
+            }
+        }
+        queuedReady.store(!queue.held && !queue.messages.empty());
+        draw();
     }
-    writeAll(STDOUT_FILENO, col("\033[38;5;37m") + std::string(goal ? "◎ goal" : "◆ pocket") + col(C_RESET) + "\n");
-    std::string err = goal ? agent.runGoal(input) : agent.runTurn(input);
-    rend.flush();
-    g_endPartial = nullptr;
-    if (err == "cancelled") {
-        writeAll(STDOUT_FILENO, col(C_YELLOW) + std::string("\n(cancelled)") + col(C_RESET) + "\n");
-        return 0;
+    worker.join();
+    agent.setGoalYield({});
+    agent.setCallbacks({}, {});
+    opts.tools->onEvent = {};
+    opts.tools->onToolDone = {};
+    opts.tools->askApproval = std::move(originalApproval);
+    if (clearRequested) {
+        std::string error = agent.clearGoal();
+        if (!error.empty()) result = error;
+    } else if (pauseRequested || agent.goalStatus() == GoalStatus::Active) {
+        std::string error = agent.pauseGoal();
+        if (!error.empty()) result = error;
     }
-    if (!err.empty()) {
-        writeAll(STDOUT_FILENO, col(C_RED) + std::string("\nerror: ") + sanitizeTerminal(err) + col(C_RESET) + "\n");
-        return 0;
-    }
-    writeAll(STDOUT_FILENO, "\n");
+    if ((goal || resume) && !interrupted && result.empty())
+        queue.continueGoal = agent.goalPaused() && !queue.held && !queue.messages.empty();
+    if (interrupted && !queue.held && !queue.messages.empty() && agent.goalPaused()) queue.continueGoal = true;
+    if (result == "cancelled" && !interrupted) queue.held = true;
+    if (!result.empty() && result != "cancelled") { queue.held = true; queue.continueGoal = false; }
+    output([&] {
+        rend.flush();
+        if (result == "cancelled") writeAll(STDOUT_FILENO, queue.held ?
+            "\n(paused; queued messages held until a new message or /queue resume)\n" :
+            "\n(stopped; continuing with explicitly queued follow-up)\n");
+        else if (!result.empty()) writeAll(STDOUT_FILENO, "\nerror: " + sanitizeTerminal(result) + "\n");
+        else writeAll(STDOUT_FILENO, "\n");
+    });
+    bar->fixedInputH = bar->fixedFooterH = 0;
+    bar->kpi = std::move(originalKpi);
+    bar->draw();
     return 0;
 }
 
@@ -1595,17 +1867,18 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
     auto say = [&](const std::string& s) { writeAll(STDOUT_FILENO, sanitizeTerminal(s)); };
 
     if (cmd == "quit" || cmd == "exit" || cmd == "q") return false;
-    if (cmd == "goal" && (args.empty() || args == "clear")) {
-        if (args == "clear") agent.clearGoal();
-        say("goal: " + (agent.goal().empty() ? std::string("none") : agent.goal()) +
-            " · usage: /goal <what must be true when done>\n");
+    if (cmd == "goal" && (args.empty() || args == "status" || args == "pause" || args == "clear")) {
+        std::string error = args == "clear" ? agent.clearGoal() : args == "pause" ? agent.pauseGoal() : "";
+        if (!error.empty()) say("error: " + error + "\n");
+        say(goalDescription(agent));
         return true;
     }
     if (cmd == "help") {
         say("commands:\n"
             "  /models           assign models to roles: main · fast · fallback · review · subagent (fuzzy search)\n"
             "  /model [spec]     switch the main model directly\n"
-            "  /goal [text]      work fully autonomously until the goal is audited as met\n"
+            "  /goal [text]      start a goal; /goal status|pause|resume|clear controls it\n"
+            "  /queue [action]   status, clear, or resume held follow-ups\n"
             "  /undo             revert the newest file change made by the agent\n"
             "  /brain            learned quirks, provider health, judges, overseer stats\n"
             "  /catalog          refresh the live model catalog now\n"
@@ -1616,7 +1889,8 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             "  /security         show sandbox + authority state\n"
             "  /help             this text\n"
             "  /quit             exit\n"
-            "keys: Enter submit · Ctrl-J/Alt-Enter newline · Up/Down history · Ctrl-C cancel/quit · Ctrl-D quit\n"
+            "keys: Enter send/queue · Ctrl-J/Alt-Enter newline · Up/Down history · Esc/Ctrl-C pause active work\n"
+            "queued follow-ups wait after a pause; a new message or /queue resume releases them\n"
             "paste or drop an image file to attach it to the next message (vision models read it)\n");
         return true;
     }
@@ -1898,9 +2172,13 @@ int tuiRun(TuiOpts& opts) {
     printBanner(opts);
     Agent& agent = *opts.agent;
     Editor ed;
+    QueuedInput queue;
     BottomBar bar;
     bar.ed = &ed;
-    bar.kpi = [&](int cols) { return kpiText(opts, agent, cols); };
+    bar.kpi = [&](int cols) {
+        return kpiText(opts, agent, cols) + (queue.messages.empty() ? "" :
+            "\nqueued " + std::to_string(queue.messages.size()) + (queue.held ? " · held · /queue resume" : " · ready"));
+    };
     bar.setup();
     auto draw = [&] { bar.draw(); };
     std::atomic<bool> cancel{false};
@@ -1930,33 +2208,84 @@ int tuiRun(TuiOpts& opts) {
 
     bool exitFlag = false;
     int rc = 0;
-    while (!exitFlag) {
+    while (!exitFlag && !queue.quit) {
         ed.prompt = bar.active ? shortPrompt() : promptFor(opts, agent);
-        auto input = editLine(ed, draw, exitFlag);
-        ed.reset();
+        std::optional<std::string> input;
+        bool fromQueue = false;
+        if (!queue.held && queue.continueGoal && queue.messages.empty()) {
+            input = "/goal resume";
+            fromQueue = true;
+            queue.continueGoal = false;
+        } else if (!queue.held && !queue.messages.empty()) {
+            if (!g_stdinPend.empty() || stdinReady() || ed.inEscape || ed.pasting) {
+                EditControl pending;
+                pending.pump = [&] { return !queue.held && (!g_stdinPend.empty() || stdinReady() || ed.inEscape || ed.pasting); };
+                pending.interrupt = [&] { queue.held = true; };
+                input = editLine(ed, draw, exitFlag, &pending);
+                if (!input) continue;
+            } else {
+                input = std::move(queue.messages.front());
+                queue.messages.pop_front();
+                fromQueue = true;
+            }
+        } else input = editLine(ed, draw, exitFlag);
         if (exitFlag || !input) break;
+        if (!fromQueue) ed.reset();
         std::string text = *input;
         size_t nonspace = text.find_first_not_of(" \t\r\n");
         if (nonspace != std::string::npos && text[nonspace] == '/') text.erase(0, nonspace);
         if (trim(text).empty()) continue;
-        bar.draw();  // clear the submitted draft now; output follows below
+        auto [command, args] = slashParts(text);
+        bar.draw();
         bar.toTranscript();
-        if (text[0] != '/') text = attachPastedImages(opts, agent, text);
-        if (bar.active)  // pinned input isn't in the scrollback: echo it
-            writeAll(STDOUT_FILENO,
-                     col(C_BOLD) + "> " + col(C_RESET) + sanitizeTerminal(text) + "\n");
-        size_t end = text.find_first_of(" \t\r\n");
-        bool goal = toLower(text.substr(0, end)) == "/goal";
-        std::string goalText = goal && end != std::string::npos ? trim(text.substr(end)) : "";
-        if (goal && !goalText.empty() && goalText != "clear") {
-            runTurnInteractive(opts, agent, goalText, shared, cancel, &bar, true);
+        if (command == "/queue") {
+            if (args == "clear") queue.messages.clear();
+            else if (args == "resume") {
+                queue.held = false;
+                queue.continueGoal = agent.goalPaused() && !queue.messages.empty();
+            }
+            else if (!args.empty() && args != "status") writeAll(STDOUT_FILENO, "usage: /queue [status|clear|resume]\n");
+            writeAll(STDOUT_FILENO, queueDescription(queue));
             continue;
         }
-        if (text[0] == '/') {
+        bool goalControl = command == "/goal" && (args.empty() || args == "status" || args == "pause" || args == "clear");
+        if (goalControl) {
+            if (args == "pause" || args == "clear") { queue.held = true; queue.continueGoal = false; }
+            runCommand(opts, agent, text);
+            continue;
+        }
+        bool wasHeld = queue.held, wasContinuation = queue.continueGoal;
+        if (!fromQueue && queue.held && (command.empty() || (command == "/goal" && args == "resume"))) {
+            queue.held = false;
+            queue.continueGoal = agent.goalPaused();
+            if (command == "/goal" && !queue.messages.empty()) continue;
+        }
+        if (!fromQueue && !queue.messages.empty() && command != "/quit" && command != "/exit" && command != "/q" &&
+            (!queue.held || command.empty() || (command == "/goal" && args == "resume"))) {
+            // Explicit input releases a held FIFO; older accepted messages keep
+            // their order, while the newly submitted follow-up joins its tail.
+            if (!enqueue(queue, text)) {
+                ed.setLines(text);
+                queue.held = wasHeld;
+                queue.continueGoal = wasContinuation;
+                writeAll(STDOUT_FILENO, "queue full (64 messages / 256 KiB); your draft is retained\n");
+                continue;
+            }
+            queue.held = false;
+            continue;
+        }
+        if (command.empty()) text = attachPastedImages(opts, agent, text);
+        if (bar.active) writeAll(STDOUT_FILENO, col(C_BOLD) + "> " + col(C_RESET) + sanitizeTerminal(text) + "\n");
+        if (command == "/goal") {
+            bool resume = args == "resume";
+            runTurnInteractive(opts, agent, resume ? "" : args, shared, cancel, &bar, queue, !resume, resume);
+        } else if (!command.empty()) {
             if (!runCommand(opts, agent, text)) break;
-            continue;
+        } else {
+            bool resume = agent.goalPaused();
+            queue.continueGoal = false;
+            runTurnInteractive(opts, agent, text, shared, cancel, &bar, queue, false, resume);
         }
-        runTurnInteractive(opts, agent, text, shared, cancel, &bar);
     }
 
     shared.stop.store(true);
@@ -2040,7 +2369,7 @@ int lineRun(TuiOpts& opts) {
         size_t end = line.find_first_of(" \t\r\n");
         bool goal = toLower(line.substr(0, end)) == "/goal";
         std::string goalText = goal && end != std::string::npos ? trim(line.substr(end)) : "";
-        if (line[0] == '/' && (!goal || goalText.empty() || goalText == "clear")) {
+        if (line[0] == '/' && (!goal || goalText.empty() || goalText == "clear" || goalText == "pause" || goalText == "status")) {
             if (!runCommand(opts, agent, line)) break;
             continue;
         }
@@ -2048,7 +2377,8 @@ int lineRun(TuiOpts& opts) {
         rend = StreamRenderer{};
         g_endPartial = [&] { rend.endLine(); };
         if (!g_plain) writeAll(STDOUT_FILENO, "assistant:\n");
-        std::string err = goal ? agent.runGoal(goalText) : agent.runTurn(line);
+        std::string err = goal && goalText == "resume" ? agent.resumeGoal() : goal ? agent.runGoal(goalText) :
+                          agent.goalPaused() ? agent.resumeGoal(line) : agent.runTurn(line);
         rend.flush();
         g_endPartial = nullptr;
         if (!err.empty() && err != "cancelled")

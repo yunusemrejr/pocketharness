@@ -112,7 +112,7 @@ std::string afterChange(ToolEnv& env, const std::string& path, const std::string
                         {{"generic", "Is this generic AI-template work (stock purple/blue gradients, emoji decoration, "
                                      "pulsing dots, buzzword hero copy, glassmorphism everywhere, lorem-style filler)?"},
                          {"fake", "Does it contain placeholder, fake or made-up content presented as real?"}},
-                        false, &env.sideCost, env.cancel);
+                        false, &env.sideCost, env.cancel, env.onEvent);
         if (v.count("generic") && v["generic"] >= 0.8)
             out += "\n[quality:jev] reads as generic AI-template design/copy (p=" + std::to_string(v["generic"]).substr(0, 4) +
                    "): give it a deliberate identity.";

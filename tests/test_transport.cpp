@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <thread>
 #include <chrono>
+#include <functional>
 #include "../src/oversee.h"
 #include "../src/provider.h"
 
@@ -17,7 +18,8 @@ struct LocalServer {
     std::string url;
     std::vector<std::string> requests;
     std::thread worker;
-    explicit LocalServer(std::vector<std::string> replies, int delayMs = 0) {
+    explicit LocalServer(std::vector<std::string> replies, int delayMs = 0,
+                         std::function<void()> onRequest = {}) {
         fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -26,7 +28,7 @@ struct LocalServer {
         if (fd < 0 || bind(fd, (sockaddr*)&addr, len) || listen(fd, 4) ||
             getsockname(fd, (sockaddr*)&addr, &len)) return;
         url = "http://127.0.0.1:" + std::to_string(ntohs(addr.sin_port)) + "/v1";
-        worker = std::thread([this, replies, delayMs] {
+        worker = std::thread([this, replies, delayMs, onRequest] {
             for (size_t i = 0; i < replies.size();) {
                 const auto& reply = replies[i];
                 pollfd wait{fd, POLLIN, 0};
@@ -50,6 +52,7 @@ struct LocalServer {
                 if (request.empty()) { close(client); continue; }  // port-only health probes
                 ++i;
                 requests.push_back(request);
+                if (onRequest) onRequest();
                 if (delayMs) std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
                 size_t sent = 0;
                 while (sent < reply.size()) {
@@ -194,18 +197,17 @@ TEST(transport_Http_Creates_Staging_And_Escapes_Secret_Header) {
 TEST(transport_Http_Cancellation_Stops_Active_Judge_Request) {
     std::string dir = makeTempDir("pocket-http-cancel");
     HomeGuard hg(dir);
-    LocalServer server({http("ok")}, 1200);
-    CHECK(!server.url.empty());
     std::atomic<bool> cancel{false};
-    std::thread trigger([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::atomic<int64_t> cancelledAt{0};
+    LocalServer server({http("ok")}, 1200, [&] {
+        cancelledAt.store(nowMs());
         cancel.store(true);
     });
-    int64_t start = nowMs();
+    CHECK(!server.url.empty());
     auto r = httpRequest(server.url, "", "{}", 5000, {}, &cancel);
-    long elapsed = (long)(nowMs() - start);
-    trigger.join();
-    CHECK(!r.ok && r.error == "cancelled" && elapsed < 1000);
+    const int64_t cancelTime = cancelledAt.load();
+    CHECK(cancelTime > 0);
+    CHECK(!r.ok && r.error == "cancelled" && nowMs() - cancelTime < 1000);
     server.join();
     CHECK(server.requests.size() == 1);
     CHECK(!httpRequest(server.url, "", "", 5000, {}, &cancel).ok);
@@ -316,6 +318,99 @@ TEST(transport_Local_Transcript_Judge_Cannot_Certify_Completion) {
     CHECK(result.size() == 2 && result["complete"] == 0.8 && result["review"] == 0.2);
     server.join();
     CHECK(server.requests.size() == 2);
+    rmRf(dir);
+    return "";
+}
+
+TEST(transport_Judge_Activity_Distinguishes_Requests_And_Caches) {
+    std::string dir = makeTempDir("pocket-judge-activity");
+    HomeGuard hg(dir);
+    const std::string answer = R"({"completion_probabilities":[{"probs":[{"tok_str":"yes","prob":1}]}]})";
+    LocalServer server({http(answer), http(answer), http(answer)});
+    CHECK(!server.url.empty());
+    Config cfg;
+    cfg.jev = false;
+    cfg.localLm.port = std::stoi(server.url.substr(server.url.find_last_of(':') + 1));
+    std::vector<std::string> notices;
+    const auto thread = std::this_thread::get_id();
+    bool sameThread = true;
+    auto activity = [&](const std::string& notice) {
+        sameThread &= std::this_thread::get_id() == thread;
+        // Status reads use the judge mutex; callbacks must not hold it.
+        (void)judgeStatus(cfg);
+        notices.push_back(notice);
+    };
+    CHECK(judgeYes(cfg, "private-question-marker", "private-content-marker", nullptr, nullptr, activity) == 1);
+    CHECK(notices == std::vector<std::string>({"judge: local LM preparing assessment",
+                                             "judge: local LM ran successfully (1 answer)"}));
+    notices.clear();
+    CHECK(judgeYes(cfg, "private-question-marker", "private-content-marker", nullptr, nullptr, activity) == 1);
+    CHECK(notices == std::vector<std::string>{"judge: local LM cached answers reused (1; no model request)"});
+    notices.clear();
+    const json::Value state = json::Object{{"task", "private-batch-marker"}};
+    const std::vector<Question> questions{{"a", "First private question"}, {"b", "Second private question"}};
+    CHECK(decide(cfg, state, questions, false, nullptr, nullptr, activity).size() == 2);
+    CHECK(notices == std::vector<std::string>({"judge: Jev/Span unavailable (disabled); trying local LM",
+                                             "judge: local LM preparing assessment",
+                                             "judge: local LM ran successfully (2 answers)"}));
+    for (const auto& notice : notices) CHECK(notice.find("private-") == std::string::npos);
+    notices.clear();
+    CHECK(decide(cfg, state, questions, false, nullptr, nullptr, activity).size() == 2);
+    CHECK(notices == std::vector<std::string>{"judge: cached decisions reused (no model request)"});
+    CHECK(sameThread);
+    server.join();
+    CHECK(server.requests.size() == 3);
+    rmRf(dir);
+    return "";
+}
+
+TEST(transport_Judge_Activity_Reports_Failure_Cooldown_And_Cancellation) {
+    std::string dir = makeTempDir("pocket-judge-activity-failure");
+    HomeGuard hg(dir);
+    LocalServer server({http("private provider body must not appear in notices", 503)});
+    CHECK(!server.url.empty());
+    Config cfg;
+    cfg.jev = false;
+    cfg.localLm.port = std::stoi(server.url.substr(server.url.find_last_of(':') + 1));
+    std::vector<std::string> notices;
+    auto activity = [&](const std::string& notice) { notices.push_back(notice); };
+    CHECK(judgeYes(cfg, "Question?", "Text", nullptr, nullptr, activity) < 0);
+    CHECK(notices == std::vector<std::string>({"judge: local LM preparing assessment",
+                                             "judge: local LM failed (HTTP 503)",
+                                             "judge: Jev/Span unavailable (disabled)"}));
+    notices.clear();
+    CHECK(judgeYes(cfg, "Question?", "Text", nullptr, nullptr, activity) < 0);
+    CHECK(notices == std::vector<std::string>({"judge: local LM unavailable (cooldown after an earlier failure)",
+                                             "judge: Jev/Span unavailable (disabled)"}));
+    CHECK(judgeStatus(cfg).find("cooldown") != std::string::npos);
+    notices.clear();
+    std::atomic<bool> cancel{true};
+    CHECK(decide(cfg, json::Object{}, {{"q", "Question?"}}, false, nullptr, &cancel, activity).empty());
+    CHECK(notices == std::vector<std::string>{"judge: assessment cancelled"});
+    server.join();
+    CHECK(server.requests.size() == 1);
+    rmRf(dir);
+    return "";
+}
+
+TEST(transport_Judge_Activity_Never_Reports_Cancelled_Request_As_Success) {
+    std::string dir = makeTempDir("pocket-judge-activity-cancel");
+    HomeGuard hg(dir);
+    std::atomic<bool> cancel{false};
+    LocalServer server({http(R"({"completion_probabilities":[{"probs":[{"tok_str":"yes","prob":1}]}]})")}, 750,
+                       [&] { cancel.store(true); });
+    CHECK(!server.url.empty());
+    Config cfg;
+    cfg.jev = false;
+    cfg.localLm.port = std::stoi(server.url.substr(server.url.find_last_of(':') + 1));
+    std::vector<std::string> notices;
+    double result = judgeYes(cfg, "Question?", "Text", nullptr, &cancel,
+                            [&](const std::string& notice) { notices.push_back(notice); });
+    CHECK(result < 0);
+    CHECK(notices == std::vector<std::string>({"judge: local LM preparing assessment",
+                                             "judge: local LM assessment cancelled"}));
+    server.join();
+    CHECK(server.requests.size() == 1);
     rmRf(dir);
     return "";
 }

@@ -116,6 +116,9 @@ struct SessionMeta {
     long childSessions = 0;
     std::map<std::string, std::string> roles;
     bool rolesSet = false;
+    // Goal checkpoints are session-local. Active goals restore as paused; only
+    // an explicit resume/follow-up may start work again.
+    std::string goal, goalStatus, goalPhase, goalBrief, goalNext, goalProgress;
 };
 Result<SessionMeta> sessionLoadMeta(const std::string& id);  // missing => Ok(empty)
 VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m);

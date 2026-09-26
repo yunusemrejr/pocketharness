@@ -23,7 +23,8 @@ struct TuiFixture {
     int master = -1, release = -1;
     pid_t child = -1;
     std::string output;
-    explicit TuiFixture(int width = 80, int height = 24) {
+    bool plain = false;
+    explicit TuiFixture(int width = 80, int height = 24, bool lineMode = false, bool pausedGoal = false) : plain(lineMode) {
         master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
         if (master < 0 || grantpt(master) || unlockpt(master)) return;
         char* path = ptsname(master);
@@ -62,18 +63,33 @@ struct TuiFixture {
             AgentOpts ao;
             ao.model = resolveModel(cfg, "glm").value;
             ao.tools = &env;
+            bool holdGoalWork = false;
             ao.request = [&](const ChatRequest& req, const ChatCallbacks& cb) -> Result<ChatResponse> {
                 std::string user = req.messages.back().content;
-                if (user == "first") {
-                    if (cb.onToken) cb.onToken("FIRST_RUNNING\n");
-                    char go;
-                    while (read(gate[0], &go, 1) < 0 && errno == EINTR) {}
+                if (req.system.find("You are the planning council") != std::string::npos)
+                    holdGoalWork = user.find("REQUEST:\nhold") != std::string::npos;
+                bool heldGoal = req.stream && holdGoalWork && user.find("[goal") != std::string::npos;
+                if (heldGoal) holdGoalWork = false;
+                if (user == "first" || user == "delayed approval" || heldGoal) {
+                    if (env.onEvent) env.onEvent("judge: local LM ran successfully (fixture)");
+                    if (cb.onToken) cb.onToken(heldGoal ? "GOAL_RUNNING\n" : "FIRST_RUNNING\n");
+                    for (;;) {
+                        if (cb.cancel && cb.cancel->load()) return Result<ChatResponse>::Err("cancelled");
+                        pollfd ready{gate[0], POLLIN, 0};
+                        if (poll(&ready, 1, 20) > 0) {
+                            char go;
+                            if (read(gate[0], &go, 1) == 1) break;
+                        }
+                    }
                 }
-                if (user == "approval") user = env.askApproval("fixture command", "fixture reason") ? "allowed" : "denied";
-                if (user == "cancel") {
+                if (user == "approval" || user == "delayed approval") user = env.askApproval("fixture command", "fixture reason") ? "allowed" : "denied";
+                if (user == "oversized approval")
+                    user = env.askApproval(std::string(65537, 'x'), "fixture reason") ? "unexpected allowance" : "oversized rejected";
+                if (user == "cancel" || user == "late approval") {
                     if (cb.onToken) cb.onToken("CANCEL_RUNNING\n");
                     for (int i = 0; i < 200 && cb.cancel && !cb.cancel->load(); ++i)
                         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    if (user == "late approval") env.askApproval("raced command", "after cancellation");
                     if (cb.cancel && cb.cancel->load()) return Result<ChatResponse>::Err("cancelled");
                 }
                 if (user == "longstream" && cb.onToken) {
@@ -81,18 +97,24 @@ struct TuiFixture {
                     cb.onToken("\nLONG_DONE\n");
                 }
                 ChatResponse reply;
-                reply.text = "REPLY:" + json::stringify(user) + "\n";
+                reply.text = req.system.find("You audit an autonomous agent") != std::string::npos ? "DONE" : "REPLY:" + json::stringify(user) + "\n";
                 if (cb.onToken) cb.onToken(reply.text);
                 return Result<ChatResponse>::Ok(reply);
             };
             Agent agent(ao);
+            if (pausedGoal) {
+                std::atomic<bool> stopped{true};
+                agent.setCancel(&stopped);
+                agent.runGoal("seeded goal");
+                agent.setCancel(nullptr);
+            }
             TuiOpts opts;
             opts.agent = &agent;
             opts.tools = &env;
             opts.cfg = &cfg;
             opts.model = ao.model;
             opts.workspace = home;
-            int rc = tuiRun(opts);
+            int rc = plain ? lineRun(opts) : tuiRun(opts);
             if (env.cancel || env.onEvent || env.onToolDone || env.askApproval) rc = 91;
             _exit(rc);
         }
@@ -122,7 +144,7 @@ struct TuiFixture {
         }
         return output.find(text) != std::string::npos;
     }
-    bool ready() { return child > 0 && waitFor("cache "); }
+    bool ready() { return child > 0 && waitFor(plain ? "pocket " : "cache "); }
     void finishFirst() { char c = 'x'; if (write(release, &c, 1) != 1) return; }
     bool quit() {
         if (!send("/quit\r")) return false;
@@ -166,13 +188,15 @@ TEST(tui_Followup_Typed_During_Response) {
     CHECK(t.waitFor("total unreported"));
     CHECK(t.send("first\r"));
     CHECK(t.waitFor("FIRST_RUNNING"));
-    CHECK(t.send("second\r"));
-    // Give the input watcher time to consume the follow-up before the reply.
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(t.waitFor("judge: local LM ran successfully"));
+    CHECK(t.send("seconx\177d"));
+    CHECK(t.waitFor("> second"));  // visible/editable before the provider finishes
+    CHECK(t.send("\rthird\r"));
+    CHECK(t.waitFor("queued 2"));
     t.finishFirst();
     CHECK(t.waitFor("REPLY:\"second\""));
-    CHECK(t.send("third\r"));
     CHECK(t.waitFor("REPLY:\"third\""));
+    CHECK(t.output.find("REPLY:\"second\"") < t.output.find("REPLY:\"third\""));
     CHECK(t.quit());
     return "";
 }
@@ -192,6 +216,185 @@ TEST(tui_Paste_Multiline_And_Command_Boundary) {
     CHECK(t.send(std::string("\xc3", 1) + "\001\033[CX\r"));
     CHECK(t.waitFor("REPLY:" + json::stringify(std::string("\xc3", 1) + "X")));
     CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Escape_Holds_Queue_And_Preserves_Draft) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("first\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    CHECK(t.send("older\rkept draft"));
+    CHECK(t.waitFor("queued 1"));
+    CHECK(t.waitFor("> kept draft"));
+    CHECK(t.send("\033"));
+    CHECK(t.waitFor("(paused;"));
+    CHECK(!t.waitFor("REPLY:\"older\"", 150));
+    // A status command must not release held prompts. Retain the draft by
+    // using history after the command, as a user can do with Ctrl-P.
+    CHECK(t.send("\025/session\r"));
+    CHECK(t.waitFor("messages:"));
+    CHECK(!t.waitFor("REPLY:\"older\"", 100));
+    CHECK(t.send("kept draft"));
+    CHECK(t.send(" continued\r"));
+    CHECK(t.waitFor("REPLY:\"older\""));
+    CHECK(t.waitFor("REPLY:\"kept draft continued\""));
+    CHECK(t.output.find("REPLY:\"older\"") < t.output.find("REPLY:\"kept draft continued\""));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Busy_Paste_Decoder_Survives_Turn_End) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("first\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    CHECK(t.send("\033[200~café\nsecond"));
+    CHECK(t.waitFor("... second"));
+    t.finishFirst();
+    CHECK(t.waitFor("REPLY:\"first\""));
+    CHECK(t.send(" line\033[201~\033[A\001X\r"));
+    CHECK(t.waitFor("REPLY:\"Xcafé\\nsecond line\""));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Queue_Limit_Retains_Draft_And_Controls_Held_Work) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("first\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    std::string many;
+    for (int i = 0; i < 64; ++i) many += "queued-" + std::to_string(i) + "\r";
+    CHECK(t.send(many + "overflow retained\r"));
+    CHECK(t.waitFor("queued 64"));
+    CHECK(t.waitFor("queue full"));
+    CHECK(t.waitFor("> overflow retained"));
+    CHECK(t.send("\033"));
+    CHECK(t.waitFor("(paused;"));
+    CHECK(t.send("\r\025/queue status\r"));  // same capacity guard also applies while idle
+    CHECK(t.waitFor("queue: 64 held"));
+    CHECK(t.output.find("REPLY:\"queued-0\"") == std::string::npos);
+    CHECK(t.send("/queue clear\r/queue resume\r"));
+    CHECK(t.waitFor("queue: 0 ready"));
+    CHECK(t.send("after clearing\r"));
+    CHECK(t.waitFor("REPLY:\"after clearing\""));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Queued_Yes_Does_Not_Approve) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("delayed approval\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    CHECK(t.send("yes do X\rretained draft"));
+    CHECK(t.waitFor("queued 1"));
+    CHECK(t.waitFor("> retained draft"));
+    t.finishFirst();
+    CHECK(t.waitFor("Allow once? [y/N]"));
+    CHECK(!t.waitFor("allowed once", 120));
+    CHECK(t.send("n"));
+    CHECK(t.waitFor("REPLY:\"denied\""));
+    CHECK(t.waitFor("REPLY:\"yes do X\""));
+    CHECK(t.send(" done\r"));
+    CHECK(t.waitFor("REPLY:\"retained draft done\""));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Goal_Controls_While_Busy) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("/goal hold\r"));
+    if (!t.waitFor("GOAL_RUNNING")) return "goal start output: " + sanitizeTerminal(t.output);
+    CHECK(t.waitFor("goal active"));
+    CHECK(t.send("/goal pause\r"));
+    CHECK(t.waitFor("goal pause requested"));
+    CHECK(t.waitFor("(paused;"));
+    CHECK(t.send("/goal status\r"));
+    CHECK(t.waitFor("goal: paused"));
+    CHECK(t.waitFor("goal paused"));
+    CHECK(t.send("/goal resume\r"));
+    CHECK(t.waitFor("goal met"));
+    CHECK(t.send("/goal status\r"));
+    CHECK(t.waitFor("goal: completed"));
+    CHECK(t.waitFor("goal completed"));
+    t.output.clear();
+    CHECK(t.send("/goal hold\r"));
+    if (!t.waitFor("GOAL_RUNNING")) return "goal restart output: " + sanitizeTerminal(t.output);
+    CHECK(t.send("/goal clear\r"));
+    CHECK(t.waitFor("goal clear requested"));
+    CHECK(t.waitFor("(paused;"));
+    CHECK(t.send("/goal status\r"));
+    CHECK(t.waitFor("goal: none"));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Line_Mode_Goal_Controls) {
+    TuiFixture t(80, 24, true);
+    CHECK(t.ready());
+    CHECK(t.send("/goal status\n/goal pause\n/goal clear\n/goal resume\n"));
+    CHECK(t.waitFor("goal: none"));
+    CHECK(t.waitFor("no paused goal to resume"));
+    CHECK(t.output.find("REPLY:") == std::string::npos);
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Oversized_Approval_Cannot_Approve_A_Truncated_Command) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("oversized approval\r"));
+    CHECK(t.waitFor("approval text exceeds the 64 KiB display limit"));
+    CHECK(t.waitFor("REPLY:\"oversized rejected\""));
+    CHECK(t.output.find("Allow once?") == std::string::npos);
+    CHECK(t.send("still responsive\r"));
+    CHECK(t.waitFor("REPLY:\"still responsive\""));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Goal_Yields_To_Queued_Followup) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("/goal hold\r"));
+    CHECK(t.waitFor("GOAL_RUNNING"));
+    CHECK(t.send("change plan\r"));
+    CHECK(t.waitFor("queued 1"));
+    t.finishFirst();
+    CHECK(t.waitFor("USER FOLLOW-UP:\\nchange plan"));
+    CHECK(t.waitFor("goal met"));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Approval_Posted_After_Cancel_Does_Not_Claim_Input) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("late approval\r"));
+    CHECK(t.waitFor("CANCEL_RUNNING"));
+    CHECK(t.send("\033"));
+    CHECK(t.waitFor("(paused;"));
+    CHECK(!t.waitFor("Allow once?", 100));
+    CHECK(t.send("still editable\r"));
+    CHECK(t.waitFor("REPLY:\"still editable\""));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Paused_Goal_Explicit_Followup_Resumes) {
+    for (bool lineMode : {false, true}) {
+        TuiFixture t(80, 24, lineMode, true);
+        CHECK(t.ready());
+        CHECK(t.send(lineMode ? "resume me\n" : "resume me\r"));
+        CHECK(t.waitFor("USER FOLLOW-UP:\\nresume me"));
+        CHECK(t.waitFor("goal met"));
+        CHECK(t.send(lineMode ? "/goal status\n" : "/goal status\r"));
+        CHECK(t.waitFor("goal: completed"));
+        CHECK(t.quit());
+    }
     return "";
 }
 
@@ -228,7 +431,7 @@ TEST(tui_Approval_Cancel_And_Picker_Typeahead) {
     CHECK(t.send("cancel\r"));
     CHECK(t.waitFor("CANCEL_RUNNING"));
     CHECK(t.send("\003after cancel\r"));
-    CHECK(t.waitFor("(cancelled)"));
+    CHECK(t.waitFor("(stopped;"));
     CHECK(t.waitFor("REPLY:\"after cancel\""));
     // Selection and navigation in a single read must retain the arrow move.
     CHECK(t.send("/thinking\r\033[B\033[B\r"));

@@ -131,7 +131,28 @@ VoidResult Agent::restore(const std::string& sessionId) {
     opts_.sessionId = sessionId;
     ensureMeta();  // same session => same frozen prefix and sticky tag
     if (!persistenceError_.empty()) return VoidResult::Err(persistenceError_);
-    SessionMeta m = sessionLoadMeta(sessionId).value;
+    auto meta = sessionLoadMeta(sessionId);
+    if (!meta.ok) return VoidResult::Err(meta.error);
+    SessionMeta m = meta.value;
+    if (m.goal.size() > 65536 || m.goalBrief.size() > 16384 ||
+        m.goalNext.size() > 131072 || m.goalProgress.size() > 40000)
+        return VoidResult::Err("goal checkpoint exceeds size limit");
+    goal_ = m.goal;
+    goalBrief_ = m.goalBrief;
+    goalNext_ = m.goalNext;
+    goalProgress_ = m.goalProgress;
+    goalPhase_ = m.goalPhase;
+    goalStatus_ = GoalStatus::None;
+    if (!goal_.empty()) {
+        if (m.goalStatus == "completed") goalStatus_ = GoalStatus::Completed;
+        else if (m.goalStatus == "paused" || m.goalStatus == "active") goalStatus_ = GoalStatus::Paused;
+        else return VoidResult::Err("invalid goal status in session checkpoint");
+        if (goalStatus_ == GoalStatus::Paused && goalPhase_ != "plan" &&
+            goalPhase_ != "work" && goalPhase_ != "audit")
+            return VoidResult::Err("invalid goal phase in session checkpoint");
+    } else if (!m.goalStatus.empty() && m.goalStatus != "none") {
+        return VoidResult::Err("goal checkpoint has no goal");
+    }
     stats_ = AgentStats{};
     lastEstimate_ = 0;
     stats_.turns = m.turns;
@@ -221,6 +242,10 @@ VoidResult Agent::restore(const std::string& sessionId) {
     if (!persistenceError_.empty()) return VoidResult::Err(persistenceError_);
     std::string bad = validateHistory(messages_);
     if (!bad.empty()) return VoidResult::Err(bad);
+    // Opening a session never starts autonomous work. A process interrupted
+    // while active needs an explicit resume, just like an intentional pause.
+    if (m.goalStatus == "active") saveStats();
+    if (!persistenceError_.empty()) return VoidResult::Err(persistenceError_);
     return VoidResult::Ok();
 }
 
@@ -263,6 +288,14 @@ void Agent::saveStats() {
     m.costEstimated = stats_.costEstimated;
     m.costIncomplete = stats_.costIncomplete;
     m.childSessions = stats_.childSessions;
+    m.goal = goal_;
+    m.goalStatus = goalStatus_ == GoalStatus::Active ? "active" :
+        goalStatus_ == GoalStatus::Paused ? "paused" :
+        goalStatus_ == GoalStatus::Completed ? "completed" : "none";
+    m.goalPhase = goalPhase_;
+    m.goalBrief = goalBrief_;
+    m.goalNext = goalNext_;
+    m.goalProgress = goalProgress_;
     auto saved = sessionSaveMeta(opts_.sessionId, m);
     if (!saved.ok) persistenceError_ = saved.error;
     if (!opts_.parentUsageDir.empty()) {
@@ -775,7 +808,7 @@ std::string Agent::councilReview() {
     std::string finalText = messages_.empty() ? "" : messages_.back().content;
     auto span = ask(turnTranscript(finalText),
                     {{"bad", "Is the work incomplete, unverified or defective relative to the user's request?"}}, true);
-    if (goal_.empty() && span.count("bad") && span["bad"] < 0.2) {
+    if (goalStatus_ != GoalStatus::Active && span.count("bad") && span["bad"] < 0.2) {
         ++stats_.reviews;
         if (opts_.onNotice) opts_.onNotice("review: span-01 finds the work sound");
         return "";
@@ -813,7 +846,7 @@ std::string Agent::councilReview() {
 // follow-up message to send, or "" to finish. Every check fires at most a
 // bounded number of times: the overseer can never trap a turn.
 std::string Agent::stopGate(const std::string& text) {
-    bool goalMode = !goal_.empty();
+    bool goalMode = goalStatus_ == GoalStatus::Active;
     if (++turnGates_ > (goalMode ? 8 : 4)) return "";
     if (opts_.autonomy && turnNudges_ < (goalMode ? 4 : 2)) {
         // Span reads the whole turn in one sub-second call; the native naive
@@ -987,7 +1020,7 @@ std::string Agent::runTurn(const std::string& userText) {
     hookNagged_.clear();
     if (opts_.tools) opts_.tools->changedFiles.clear();
     std::string text = userText;
-    if (opts_.brief && goal_.empty() && needsBrief(userText)) {
+    if (opts_.brief && goalStatus_ != GoalStatus::Active && needsBrief(userText)) {
         std::string b = makeBrief(userText);
         if (!b.empty()) text += "\n\n" + b;
     }
@@ -1125,43 +1158,165 @@ std::string Agent::runTurn(const std::string& userText) {
            " tool rounds (partial work is saved; raise with --max-rounds N)";
 }
 
+std::string Agent::finishGoal(std::string error, bool completed) {
+    if (completed && opts_.cancel && opts_.cancel->load()) {
+        completed = false;
+        error = "cancelled";
+    }
+    goalStatus_ = completed ? GoalStatus::Completed : GoalStatus::Paused;
+    if (completed) {
+        goalPhase_.clear();
+        goalNext_.clear();
+    }
+    saveStats();
+    if (!persistenceError_.empty()) return "session persistence failed: " + persistenceError_;
+    return error;
+}
+
+std::string Agent::pauseGoal() {
+    if (goalStatus_ == GoalStatus::None) return "no goal to pause";
+    if (goalStatus_ == GoalStatus::Completed) return "goal already completed";
+    return finishGoal("");
+}
+
+std::string Agent::clearGoal() {
+    goal_.clear();
+    goalStatus_ = GoalStatus::None;
+    goalPhase_.clear();
+    goalBrief_.clear();
+    goalNext_.clear();
+    goalProgress_.clear();
+    saveStats();
+    return persistenceError_.empty() ? "" : "session persistence failed: " + persistenceError_;
+}
+
 std::string Agent::runGoal(const std::string& goal, int maxCycles) {
-    struct SaveOnExit { Agent* agent; ~SaveOnExit() { agent->saveStats(); } } save{this};
+    if (!persistenceError_.empty()) return "session persistence failed: " + persistenceError_;
+    if (trim(goal).empty()) return "goal cannot be empty";
+    if (goal.size() > 65536) return "goal exceeds 64 KiB limit";
+    if (maxCycles < 1) return "goal cycle limit must be positive";
     goal_ = goal;
+    goalStatus_ = GoalStatus::Active;
+    goalPhase_ = "plan";
+    goalBrief_.clear();
+    goalNext_.clear();
+    goalProgress_.clear();
+    return continueGoal(maxCycles);
+}
+
+std::string Agent::resumeGoal(const std::string& followup, int maxCycles) {
+    if (!persistenceError_.empty()) return "session persistence failed: " + persistenceError_;
+    if (goalStatus_ != GoalStatus::Paused) return "no paused goal to resume";
+    if (maxCycles < 1) return "goal cycle limit must be positive";
+    if (followup.size() > 16384) return "goal follow-up exceeds 16 KiB limit";
+    goalStatus_ = GoalStatus::Active;
+    if (!trim(followup).empty()) {
+        // An explicit change of direction needs work, even if an earlier
+        // interruption happened during the audit. Keep the original brief.
+        goalPhase_ = "work";
+        goalNext_ = "[goal resume] " + goal_ + "\nContinue from the existing conversation and current files. "
+                    "Do not repeat completed work; inspect uncertain tool outcomes before retrying.\n" +
+                    goalBrief_ + "\nUSER FOLLOW-UP:\n" + followup;
+    }
+    return continueGoal(maxCycles);
+}
+
+std::string Agent::continueGoal(int maxCycles) {
+    // A provider/callback exception still leaves a resumable checkpoint. The
+    // UI owns the exception report; unwinding must never leave a live goal.
+    struct PauseOnExit {
+        Agent* agent;
+        ~PauseOnExit() noexcept {
+            if (agent->goalStatus_ == GoalStatus::Active) {
+                agent->goalStatus_ = GoalStatus::Paused;
+                try { agent->saveStats(); } catch (...) {}
+            }
+        }
+    } pauseOnExit{this};
+    saveStats();
+    auto cancelled = [&] { return opts_.cancel && opts_.cancel->load(); };
+    auto continuation = [&] {
+        return "[goal resume] " + goal_ + "\nContinue from the existing conversation and current files. "
+               "Do not repeat completed work; inspect uncertain tool outcomes before retrying.\n" + goalBrief_;
+    };
+    if (!persistenceError_.empty()) return finishGoal("session persistence failed: " + persistenceError_);
+    if (cancelled()) return finishGoal("cancelled");
+    if (goalPhase_ == "plan") {
+        goalBrief_ = makeBrief(goal_).substr(0, 16384);
+        goalNext_ = "[goal] " + goal_ +
+                    "\nWork fully autonomously until this goal is verifiably met. Interpret it as a demanding "
+                    "expert would; verify every claim with evidence.\n" + goalBrief_;
+        goalPhase_ = "work";
+        saveStats();
+        if (cancelled()) return finishGoal("cancelled");
+    }
     ResolvedModel auditor = opts_.fast.empty() ? opts_.model : opts_.fast[0];
-    std::string brief = makeBrief(goal);
-    std::string msg = "[goal] " + goal +
-                      "\nWork fully autonomously until this goal is verifiably met. Interpret it as a demanding "
-                      "expert would; verify every claim with evidence." + (brief.empty() ? "" : "\n\n" + brief);
     for (int cycle = 0; cycle < maxCycles; ++cycle) {
-        std::string err = runTurn(msg);
-        if (!err.empty()) { goal_.clear(); return err; }
-        if (opts_.cancel && opts_.cancel->load()) { goal_.clear(); return "cancelled"; }
-        auto span = ask(turnTranscript(messages_.empty() ? "" : messages_.back().content),
-                        {{"met", "Has the assistant fully achieved this goal, with verification evidence? Goal: " + goal.substr(0, 1500)}},
+        if (!persistenceError_.empty()) return finishGoal("session persistence failed: " + persistenceError_);
+        if (cancelled()) return finishGoal("cancelled");
+        if (goalPhase_ == "work") {
+            std::string msg = goalNext_.empty() ? continuation() : goalNext_;
+            // Keep the pending instruction durable until a successful turn.
+            // A crash between checkpoint and pushUser must not lose explicit
+            // follow-up guidance. The history determines what remains undone.
+            if (!messages_.empty()) msg =
+                "[goal continuation] Continue from existing history and current files. Do not repeat completed work; "
+                "inspect uncertain tool outcomes before retrying. This direction may already be partly complete:\n" + msg;
+            int previousTurns = stats_.turns;
+            std::string err = runTurn(msg);
+            if (stats_.turns != previousTurns) {
+                if (!goalProgress_.empty()) goalProgress_ += "\n[Next goal turn]\n";
+                goalProgress_ += turnDigest(40000);
+                if (goalProgress_.size() > 40000) {
+                    const std::string omitted = "\n[... earlier goal evidence omitted ...]\n";
+                    goalProgress_ = goalProgress_.substr(0, 10000) + omitted +
+                        goalProgress_.substr(goalProgress_.size() - (30000 - omitted.size()));
+                }
+            }
+            if (!err.empty()) return finishGoal(err);
+            goalPhase_ = "audit";
+            saveStats();
+        }
+        if (cancelled()) return finishGoal("cancelled");
+        if (!persistenceError_.empty()) return finishGoal("session persistence failed: " + persistenceError_);
+        if (goalYield_ && goalYield_()) return finishGoal("");
+        // Persisting the bounded digest lets a resumed audit inspect the same
+        // evidence without re-running completed work or relying on stale indexes.
+        json::Value evidence = json::Object{
+            {"input", json::Array{json::Object{{"role", "user"}, {"content", goal_ + "\n" + goalBrief_}}}},
+            {"output", json::Object{{"role", "assistant"}, {"content", goalProgress_}}}};
+        auto span = ask(evidence,
+                        {{"met", "Has the assistant fully achieved this goal, with verification evidence? Goal: " + goal_.substr(0, 1500)}},
                         true);
+        if (cancelled()) return finishGoal("cancelled");
+        if (goalYield_ && goalYield_()) return finishGoal("");
         if (span.count("met") && span["met"] >= 0.9) {
             if (opts_.onNotice) opts_.onNotice("goal met (decision audit after " + std::to_string(cycle + 1) + " cycle(s))");
-            goal_.clear();
-            return "";
+            return finishGoal("", true);
         }
         auto r = sideRequest(auditor,
                              "You audit an autonomous agent. Decide if the GOAL is fully achieved, judging only by "
                              "evidence in the transcript digest (commands run, results, changes). First line: DONE or "
                              "CONTINUE. If CONTINUE, list precisely what remains.",
-                             "GOAL: " + goal + (brief.empty() ? "" : "\n" + brief) + "\n\nDIGEST:\n" + turnDigest(40000), 800);
-        if (!r.ok) { goal_.clear(); return "goal audit failed: " + r.error; }
+                             "GOAL: " + goal_ + "\n" + goalBrief_ + "\n\nDIGEST:\n" + goalProgress_, 800);
+        if (cancelled()) return finishGoal("cancelled");
+        if (goalYield_ && goalYield_()) return finishGoal("");
+        if (!r.ok) return finishGoal("goal audit failed: " + r.error);
         std::string verdict = trim(r.value.text);
-        if (toLower(trim(verdict.substr(0, verdict.find('\n')))) == "done") {
+        std::string first = toLower(trim(verdict.substr(0, verdict.find('\n'))));
+        if (first == "done") {
             if (opts_.onNotice) opts_.onNotice("goal met (audited after " + std::to_string(cycle + 1) + " cycle(s))");
-            goal_.clear();
-            return "";
+            return finishGoal("", true);
         }
-        if (opts_.onNotice) opts_.onNotice("goal audit: not yet — continuing");
-        msg = "[goal audit] Not met yet:\n" + verdict.substr(0, 3000) + "\nContinue autonomously.";
+        if (first != "continue" && !startsWith(first, "continue:"))
+            return finishGoal("goal audit returned no valid DONE/CONTINUE verdict; goal paused");
+        goalPhase_ = "work";
+        goalNext_ = continuation() + "\n[goal audit] Remaining work:\n" + verdict.substr(0, 3000);
+        saveStats();
+        if (goalYield_ && goalYield_()) return finishGoal("");
+        if (cycle + 1 < maxCycles && opts_.onNotice) opts_.onNotice("goal audit: not yet — continuing");
     }
-    goal_.clear();
-    return "goal not confirmed after " + std::to_string(maxCycles) + " audit cycles (work is saved)";
+    return finishGoal("goal not confirmed after " + std::to_string(maxCycles) + " audit cycles (goal paused; work is saved)");
 }
 
 }  // namespace pocket

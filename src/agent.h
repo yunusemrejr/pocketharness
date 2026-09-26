@@ -130,6 +130,8 @@ inline constexpr size_t kCacheWindow = 20;
 // Record one request's reported (hit, miss) pair; negative = unreported.
 void noteCacheSample(AgentStats& st, long hit, long miss);
 
+enum class GoalStatus { None, Active, Paused, Completed };
+
 class Agent {
   public:
     explicit Agent(AgentOpts opts);
@@ -145,11 +147,19 @@ class Agent {
     // Force compaction now (used by /compact). Error text or "".
     std::string compactNow();
 
-    // Goal mode: work, then audit "is the goal met?" and continue until it
-    // is (or maxCycles). Stricter overseer checks than a plain turn.
+    // Goal mode: work, then audit, preserving progress on cancellation/error.
+    // These methods and getters belong to the worker, or the idle UI after
+    // joining it. While running, the UI may only change the cancel atomic.
     std::string runGoal(const std::string& goal, int maxCycles = 12);
+    std::string resumeGoal(const std::string& followup = "", int maxCycles = 12);
     const std::string& goal() const { return goal_; }
-    void clearGoal() { goal_.clear(); }
+    GoalStatus goalStatus() const { return goalStatus_; }
+    bool goalPaused() const { return goalStatus_ == GoalStatus::Paused; }
+    std::string pauseGoal();
+    std::string clearGoal();
+    // Called only at completed-turn boundaries. The UI callback must read
+    // synchronized queue state and must not access this Agent concurrently.
+    void setGoalYield(std::function<bool()> fn) { goalYield_ = std::move(fn); }
 
     // Queue an image file for the next user message ("", or error text).
     // Persists bytes under the session dir (resume-safe) plus a working
@@ -208,6 +218,8 @@ class Agent {
     // Load the frozen prefix from the session sidecar, or freeze it now.
     // Empty sessionId (unit tests) skips persistence but still builds once.
     void ensureMeta();
+    std::string continueGoal(int maxCycles);
+    std::string finishGoal(std::string error, bool completed = false);
 
     AgentOpts opts_;
     std::string system_;
@@ -219,6 +231,9 @@ class Agent {
     long lastEstimate_ = 0;
     std::string persistenceError_;
     std::string goal_;
+    GoalStatus goalStatus_ = GoalStatus::None;
+    std::string goalPhase_, goalBrief_, goalNext_, goalProgress_;
+    std::function<bool()> goalYield_;
     long outputBoost_ = 1;  // doubled when replies hit the output cap (session-wide)
     long workspaceSequence_ = 0;
     // Per-turn overseer state.

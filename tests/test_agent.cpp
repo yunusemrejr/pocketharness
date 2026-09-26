@@ -1,6 +1,8 @@
 // PocketHarness tests - agent prompt stability, frozen prefix, resume.
 #include "mini.h"
 
+#include <stdexcept>
+
 #include "../src/agent.h"
 #include "../src/config.h"
 #include "../src/session.h"
@@ -688,5 +690,346 @@ TEST(agent_Local_Gateway_Uses_Known_Prices_Or_Marks_Unknown) {
     Agent unknown(opts);
     CHECK(unknown.runTurn("hello").empty());
     CHECK(unknown.stats().costIncomplete);
+    return "";
+}
+
+TEST(agent_Goal_Cancel_Persist_Resume_Clear) {
+    std::string home = makeTempDir("pocket-goal");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    std::atomic<bool> cancel{false};
+    opts.cancel = &cancel;
+    int plans = 0, work = 0, audits = 0;
+    std::string resumedPrompt;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) {
+            ++plans;
+            r.text = "INTENT: complete the task";
+        } else if (req.system.find("audit") != std::string::npos) {
+            ++audits;
+            r.text = "DONE";
+        } else {
+            ++work;
+            resumedPrompt = req.messages.back().content;
+            if (work == 1) {
+                cancel.store(true);
+                return Result<ChatResponse>::Err("cancelled");
+            }
+            r.text = "Completed and verified.";
+        }
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent first(opts);
+    CHECK_EQ(first.runGoal("finish the important work"), std::string("cancelled"));
+    CHECK(first.goalPaused());
+    CHECK_EQ(first.goal(), std::string("finish the important work"));
+    CHECK_EQ(sessionLoadMeta(id.value).value.goalStatus, std::string("paused"));
+    CHECK_EQ(plans, 1);
+    CHECK_EQ(work, 1);
+    CHECK_EQ(audits, 0);
+    cancel.store(false);
+    Agent resumed(opts);
+    CHECK(resumed.restore(id.value).ok);
+    CHECK(resumed.goalPaused());
+    CHECK_EQ(resumed.messageCount(), first.messageCount());
+    CHECK(resumed.resumeGoal().empty());
+    CHECK(resumedPrompt.find("Do not repeat completed work") != std::string::npos);
+    CHECK_EQ(plans, 1);
+    CHECK_EQ(work, 2);
+    CHECK_EQ(audits, 1);
+    CHECK(resumed.goalStatus() == GoalStatus::Completed);
+    CHECK_EQ(resumed.goal(), first.goal());
+    Agent completed(opts);
+    CHECK(completed.restore(id.value).ok);
+    CHECK(completed.goalStatus() == GoalStatus::Completed);
+    size_t messages = completed.messageCount();
+    CHECK(!completed.resumeGoal().empty());
+    CHECK(completed.clearGoal().empty());
+    CHECK(completed.goal().empty());
+    CHECK(completed.goalStatus() == GoalStatus::None);
+    CHECK_EQ(completed.messageCount(), messages);
+    Agent cleared(opts);
+    CHECK(cleared.restore(id.value).ok);
+    CHECK(cleared.goal().empty());
+    CHECK(cleared.goalStatus() == GoalStatus::None);
+    CHECK(!cleared.resumeGoal().empty());
+    CHECK_EQ(work, 2);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Goal_Audit_Cancellation_Wins_And_Resumes_Audit_Only) {
+    // Both the decision model and the generative auditor can complete at
+    // the same moment as Esc. Neither may turn that pause into completion.
+    for (bool decision : {false, true}) {
+        std::string home = makeTempDir("pocket-goal-audit");
+        CHECK(!home.empty());
+        HomeGuard hg(home);
+        auto id = sessionCreate();
+        CHECK(id.ok);
+        AgentOpts opts;
+        opts.model = resolveModel(defaultConfig(), "glm").value;
+        opts.sessionId = id.value;
+        std::atomic<bool> cancel{false};
+        opts.cancel = &cancel;
+        int work = 0, audits = 0, decisions = 0;
+        if (decision) opts.decide = [&](const json::Value&, const std::vector<Question>& questions, bool, double*) {
+            for (const auto& q : questions) if (q.id == "met") {
+                if (++decisions == 1) cancel.store(true);
+                return std::map<std::string, double>{{"met", 0.99}};
+            }
+            return std::map<std::string, double>{};
+        };
+        opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+            ChatResponse r;
+            if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish";
+            else if (req.system.find("audit") != std::string::npos) {
+                if (++audits == 1) cancel.store(true);
+                r.text = "DONE";
+            } else { ++work; r.text = "Completed and verified."; }
+            return Result<ChatResponse>::Ok(r);
+        };
+        Agent first(opts);
+        CHECK_EQ(first.runGoal("finish it"), std::string("cancelled"));
+        CHECK(first.goalPaused());
+        CHECK_EQ(sessionLoadMeta(id.value).value.goalPhase, std::string("audit"));
+        CHECK_EQ(work, 1);
+        cancel.store(false);
+        Agent resumed(opts);
+        CHECK(resumed.restore(id.value).ok);
+        CHECK(resumed.resumeGoal().empty());
+        CHECK(resumed.goalStatus() == GoalStatus::Completed);
+        CHECK_EQ(work, 1);
+        CHECK_EQ(decision ? decisions : audits, 2);
+        rmRf(home);
+    }
+    return "";
+}
+
+TEST(agent_Goal_Audit_Error_And_Invalid_Verdict_Pause) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    int work = 0, audits = 0;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish";
+        else if (req.system.find("audit") != std::string::npos) {
+            ++audits;
+            if (audits == 1) return Result<ChatResponse>::Err("provider unavailable");
+            r.text = audits == 2 ? "maybe done" : "DONE";
+        } else { ++work; r.text = "Completed and verified."; }
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runGoal("finish it").find("audit failed") != std::string::npos);
+    CHECK(a.goalPaused());
+    CHECK(a.resumeGoal().find("no valid") != std::string::npos);
+    CHECK(a.goalPaused());
+    CHECK(a.resumeGoal().empty());
+    CHECK_EQ(work, 1);
+    CHECK_EQ(audits, 3);
+    return "";
+}
+
+TEST(agent_Goal_Limit_And_Explicit_Followup) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    int work = 0, plans = 0, audits = 0;
+    std::string prompt;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) { ++plans; r.text = "INTENT: finish"; }
+        else if (req.system.find("audit") != std::string::npos) {
+            r.text = ++audits == 1 ? "CONTINUE: verify integration" : "DONE";
+        } else { ++work; prompt = req.messages.back().content; r.text = "Completed and verified."; }
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runGoal("finish it", 1).find("goal paused") != std::string::npos);
+    CHECK(a.goalPaused());
+    CHECK(a.pauseGoal().empty());
+    // An ordinary turn must not restart the audit loop implicitly.
+    CHECK(a.runTurn("what changed?").empty());
+    CHECK(a.goalPaused());
+    CHECK_EQ(audits, 1);
+    CHECK(a.resumeGoal("also verify Linux").empty());
+    CHECK(prompt.find("USER FOLLOW-UP:\nalso verify Linux") != std::string::npos);
+    CHECK_EQ(plans, 1);
+    CHECK_EQ(work, 3);
+    CHECK(a.goalStatus() == GoalStatus::Completed);
+    return "";
+}
+
+TEST(agent_Goal_Restore_Active_As_Paused_Without_Requests) {
+    std::string home = makeTempDir("pocket-goal-crash");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    int requests = 0;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ++requests;
+        return Result<ChatResponse>::Err("unexpected request");
+    };
+    Agent initial(opts);
+    auto meta = sessionLoadMeta(id.value).value;
+    meta.goal = "preserve task";
+    meta.goalStatus = "active";
+    meta.goalPhase = "work";
+    CHECK(sessionSaveMeta(id.value, meta).ok);
+    Agent restored(opts);
+    CHECK(restored.restore(id.value).ok);
+    CHECK(restored.goalPaused());
+    CHECK_EQ(restored.goal(), meta.goal);
+    CHECK_EQ(sessionLoadMeta(id.value).value.goalStatus, std::string("paused"));
+    CHECK_EQ(requests, 0);
+    meta.goalPhase = "corrupt";
+    CHECK(sessionSaveMeta(id.value, meta).ok);
+    Agent corrupt(opts);
+    CHECK(!corrupt.restore(id.value).ok);
+    CHECK_EQ(requests, 0);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Goal_PreCancelled_And_Invalid_Input_Do_Not_Run) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    std::atomic<bool> cancel{true};
+    opts.cancel = &cancel;
+    int requests = 0;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ++requests;
+        return Result<ChatResponse>::Err("unexpected request");
+    };
+    Agent a(opts);
+    CHECK_EQ(a.runGoal("preserve this"), std::string("cancelled"));
+    CHECK(a.goalPaused());
+    CHECK(!a.runGoal("   ").empty());
+    CHECK(!a.runGoal("replacement", 0).empty());
+    CHECK_EQ(a.goal(), std::string("preserve this"));
+    CHECK(!a.resumeGoal(std::string(16385, 'x')).empty());
+    CHECK_EQ(a.goal(), std::string("preserve this"));
+    CHECK_EQ(requests, 0);
+    return "";
+}
+
+TEST(agent_Goal_Yields_At_Turn_Boundary_And_Resumes_With_Guidance) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    int work = 0, audits = 0, plans = 0;
+    std::string prompt;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) { ++plans; r.text = "INTENT: finish"; }
+        else if (req.system.find("audit") != std::string::npos) { ++audits; r.text = "DONE"; }
+        else { ++work; prompt = req.messages.back().content; r.text = "Completed and verified."; }
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    bool queued = true;
+    a.setGoalYield([&] { return queued; });
+    CHECK(a.runGoal("finish it").empty());
+    CHECK(a.goalPaused());
+    CHECK_EQ(work, 1);
+    CHECK_EQ(audits, 0);
+    queued = false;
+    CHECK(a.resumeGoal("also check cancellation").empty());
+    CHECK(prompt.find("also check cancellation") != std::string::npos);
+    CHECK_EQ(work, 2);
+    CHECK_EQ(plans, 1);
+    CHECK_EQ(audits, 1);
+    CHECK(a.goalStatus() == GoalStatus::Completed);
+    return "";
+}
+
+TEST(agent_Goal_Exception_Pauses_And_Preserves_Pending_Followup) {
+    std::string home = makeTempDir("pocket-goal-exception");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    std::atomic<bool> cancel{true};
+    opts.cancel = &cancel;
+    bool throwHint = true;
+    opts.hint = [&](const std::string&, double*) -> std::string {
+        if (throwHint) throw std::runtime_error("hint interrupted before pushUser");
+        return "";
+    };
+    std::string prompt;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("audit") != std::string::npos) r.text = "DONE";
+        else { prompt = req.messages.back().content; r.text = "Completed and verified."; }
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK_EQ(a.runGoal("preserve this goal"), std::string("cancelled"));
+    cancel.store(false);
+    bool threw = false;
+    try { (void)a.resumeGoal("preserve this crucial guidance"); }
+    catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+    CHECK(a.goalPaused());
+    CHECK_EQ(a.messageCount(), (size_t)0);
+    auto saved = sessionLoadMeta(id.value);
+    CHECK(saved.ok);
+    CHECK_EQ(saved.value.goalStatus, std::string("paused"));
+    CHECK(saved.value.goalNext.find("preserve this crucial guidance") != std::string::npos);
+    throwHint = false;
+    Agent resumed(opts);
+    CHECK(resumed.restore(id.value).ok);
+    CHECK(resumed.resumeGoal().empty());
+    CHECK(prompt.find("preserve this crucial guidance") != std::string::npos);
+    CHECK(resumed.goalStatus() == GoalStatus::Completed);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Goal_Audit_Sees_Earlier_Verified_Work_After_Resume) {
+    std::string home = makeTempDir("pocket-goal-evidence");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    int work = 0, audits = 0;
+    std::string evidence;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish";
+        else if (req.system.find("audit") != std::string::npos) {
+            evidence = req.messages.back().content;
+            r.text = ++audits == 1 ? "CONTINUE: verify the second component" : "DONE";
+        } else r.text = ++work == 1 ? "FIRST_COMPONENT_VERIFIED" : "SECOND_COMPONENT_VERIFIED";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent first(opts);
+    CHECK(!first.runGoal("verify both components", 1).empty());
+    CHECK(first.goalPaused());
+    Agent resumed(opts);
+    CHECK(resumed.restore(id.value).ok);
+    CHECK(resumed.resumeGoal().empty());
+    CHECK(evidence.find("FIRST_COMPONENT_VERIFIED") != std::string::npos);
+    CHECK(evidence.find("SECOND_COMPONENT_VERIFIED") != std::string::npos);
+    CHECK(evidence.find("verify the second component") != std::string::npos);
+    CHECK_EQ(work, 2);
+    CHECK_EQ(audits, 2);
+    CHECK(sessionLoadMeta(id.value).value.goalProgress.size() <= 40000);
+    rmRf(home);
     return "";
 }

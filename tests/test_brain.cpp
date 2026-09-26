@@ -168,7 +168,8 @@ TEST(agent_Goal_Runs_Until_Audit_Says_Done) {
     };
     Agent a(opts);
     CHECK(a.runGoal("ship it", 5).empty());
-    CHECK(work == 2 && audits == 2 && a.goal().empty());
+    CHECK(work == 2 && audits == 2 && a.goal() == "ship it");
+    CHECK(a.goalStatus() == GoalStatus::Completed);
     return "";
 }
 

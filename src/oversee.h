@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -18,8 +19,11 @@ namespace pocket {
 
 // P(yes) that `question` holds for `text`; -1 when no judge answered.
 // cost (if non-null) receives the USD spent (0 local, reported for Jev).
+// Activity is synchronous on the calling thread, reports engine/status only,
+// and distinguishes cached answers from model requests. No prompt data is sent.
 double judgeYes(const Config& cfg, const std::string& question, const std::string& text,
-                double* cost = nullptr, std::atomic<bool>* cancel = nullptr);
+                double* cost = nullptr, std::atomic<bool>* cancel = nullptr,
+                const std::function<void(const std::string&)>& activity = {});
 
 // Batched structured judgment on OpenRouter's decisions API: one call
 // answers many yes/no questions with calibrated probabilities.
@@ -37,7 +41,8 @@ struct Question {
 };
 std::map<std::string, double> decide(const Config& cfg, const json::Value& state,
                                      const std::vector<Question>& qs, bool transcript,
-                                     double* cost = nullptr, std::atomic<bool>* cancel = nullptr);
+                                     double* cost = nullptr, std::atomic<bool>* cancel = nullptr,
+                                     const std::function<void(const std::string&)>& activity = {});
 bool decideAvailable(const Config& cfg);
 std::string judgeStatus(const Config& cfg);  // which judges are live
 void judgeShutdown();                        // stop a llama-server this process started
