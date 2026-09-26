@@ -222,14 +222,38 @@ TEST(agent_Recovers_From_Empty_Reasoning_Only_Replies) {
     AgentOpts opts;
     opts.model = resolveModel(defaultConfig(), "glm").value;
     int n = 0;
-    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
-        if (n++ == 0) return Result<ChatResponse>::Err("empty response from provider");
+    opts.thinking = "high";
+    std::vector<std::string> levels;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        levels.push_back(req.thinking);
+        if (n++ < 2) return Result<ChatResponse>::Err("empty response from provider");
         ChatResponse r;
         r.text = "done";
         return Result<ChatResponse>::Ok(r);
     };
     Agent a(opts);
-    CHECK(a.runTurn("go").empty() && n == 2);
+    std::string err = a.runTurn("go");
+    if (!err.empty()) return "runTurn: " + err + " after " + std::to_string(n);
+    CHECK(n == 3 && levels[0] == "high" && levels[1] == "off" && levels[2] == "off");
+    CHECK(validateHistory(a.messages()).empty());
+    return "";
+}
+
+TEST(agent_Output_Cap_Raises_Budget_And_Retries) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    std::vector<long> budgets;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        budgets.push_back(req.maxTokens);
+        if (budgets.size() == 1)
+            return Result<ChatResponse>::Err("provider output limit reached; increase model max_tokens (no tools executed)");
+        ChatResponse r;
+        r.text = "done";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runTurn("write a big file").empty());
+    CHECK(budgets.size() == 2 && budgets[1] == budgets[0] * 2);
     CHECK(validateHistory(a.messages()).empty());
     return "";
 }

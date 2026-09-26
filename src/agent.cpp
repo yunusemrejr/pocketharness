@@ -425,8 +425,8 @@ long Agent::contextUsed() const {
 }
 
 long Agent::completionBudget() const {
-    return std::min(opts_.maxTokens > 0 ? opts_.maxTokens : opts_.model.options.maxTokens,
-                    std::max(1L, contextMax() / 4));
+    long base = opts_.maxTokens > 0 ? opts_.maxTokens : opts_.model.options.maxTokens;
+    return std::min(std::min(base * outputBoost_, 1048576L), std::max(1L, contextMax() / 4));
 }
 
 std::string validateHistory(const std::vector<ChatMessage>& msgs) {
@@ -452,7 +452,8 @@ Result<ChatResponse> Agent::requestOnce() {
     req.system = system_;  // frozen prefix: byte-identical every request
     req.messages = messages_;  // results were capped once on arrival
     req.tools = toolDefs_;     // fixed schemas in fixed order
-    req.thinking = opts_.thinking;
+    req.thinking = calmNext_ ? "off" : opts_.thinking;
+    calmNext_ = false;
     req.stream = true;
     req.maxTokens = completionBudget();
     req.sessionTag = orSessionId_;
@@ -902,7 +903,7 @@ std::string Agent::runTurn(const std::string& userText) {
     std::string previousBatch;
     int repeats = 0;
     std::map<std::string, int> failures;
-    int emptyReplies = 0;
+    int emptyReplies = 0, lengthRetries = 0;
 
     for (int round = 0; round < opts_.maxRounds; ++round) {
         if (opts_.cancel && opts_.cancel->load()) return "cancelled";
@@ -918,8 +919,22 @@ std::string Agent::runTurn(const std::string& userText) {
         // nudge twice, then give up with the provider's error.
         if (!response.ok && response.error.find("empty response") != std::string::npos && emptyReplies < 2) {
             ++emptyReplies;
-            if (opts_.onNotice) opts_.onNotice("overseer: empty reply (reasoning only); asking the model to continue");
+            calmNext_ = true;  // next request without thinking: the model must act
+            if (opts_.onNotice) opts_.onNotice("overseer: empty reply (reasoning only); retrying without thinking");
             pushUser("[overseer] Your previous reply was empty. Continue: make the next tool call, or give the final answer.");
+            continue;
+        }
+        // Output cut off at the token cap: raise the cap (bounded by a quarter
+        // of the window) and ask for smaller pieces. The cut reply is dropped.
+        if (!response.ok && response.error.find("output limit reached") != std::string::npos && lengthRetries < 3) {
+            ++lengthRetries;
+            long before = completionBudget();
+            outputBoost_ *= 2;
+            if (opts_.onNotice)
+                opts_.onNotice("overseer: reply hit the output cap; budget " + std::to_string(before) + " -> " +
+                               std::to_string(completionBudget()) + " tokens");
+            pushUser("[overseer] Your last reply was cut off at the output limit and discarded. Write large files "
+                     "in pieces (a skeleton first, then edit or append sections) and keep reasoning brief.");
             continue;
         }
         if (!response.ok) return response.error;

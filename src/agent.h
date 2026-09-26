@@ -214,10 +214,11 @@ class Agent {
     long lastEstimate_ = 0;
     std::string persistenceError_;
     std::string goal_;
+    long outputBoost_ = 1;  // doubled when replies hit the output cap (session-wide)
     // Per-turn overseer state.
     size_t turnStart_ = 0;
     int turnNudges_ = 0, turnGates_ = 0;
-    bool unverified_ = false, verifyNudged_ = false, reviewed_ = false;
+    bool unverified_ = false, verifyNudged_ = false, reviewed_ = false, calmNext_ = false;
     std::vector<std::string> hookNagged_;
 };
 

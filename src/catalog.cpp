@@ -1,7 +1,11 @@
 // PocketHarness - model catalog implementation.
 #include "catalog.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <time.h>
 
 #include <mutex>
@@ -114,8 +118,12 @@ std::vector<CatalogModel> parseCatalog(const std::string& provider, const std::s
 std::vector<CatalogModel> catalogLoad(const Config& cfg) {
     std::vector<CatalogModel> out;
     json::Value cache = readCache();
-    for (const auto& [prov, entry] : cache.at("providers").asObj())
+    for (const auto& [prov, entry] : cache.at("providers").asObj()) {
+        bool known = false;  // renamed/removed providers age out of the picker
+        for (const auto& p : cfg.providers) known = known || p.name == prov;
+        if (!known) continue;
         for (const auto& m : entry.at("models").asArr()) out.push_back(fromJson(prov, m));
+    }
     // Configured models are always selectable, even for listing-less endpoints.
     for (const auto& a : cfg.models)
         if (!catalogFind(out, a.provider, a.model)) {
@@ -164,11 +172,28 @@ std::string catalogRefresh(const Config& cfg) {
            std::to_string(todo.size()) + " keyed providers";
 }
 
-void catalogRefreshIfStale(const Config& cfg) {
+void catalogRefreshIfStale(const Config&) {
     struct stat st;
-    if (stat(catalogPath().c_str(), &st) == 0 && time(nullptr) - st.st_mtime < kStaleSec) return;
-    // Detached: a daily refresh must never delay startup. The write is atomic.
-    std::thread([cfg] { (void)catalogRefresh(cfg); }).detach();
+    std::string path = catalogPath();
+    if (stat(path.c_str(), &st) == 0 && time(nullptr) - st.st_mtime < kStaleSec) return;
+    // Claim the refresh (mtime) so concurrent sessions don't all fetch.
+    if (ensureDir(stateDir(), 0700).ok && stat(path.c_str(), &st) != 0)
+        (void)atomicWriteFile(path, "{\"providers\":{}}", 0600);
+    utimes(path.c_str(), nullptr);
+    // A detached `pocket --refresh-catalog` grandchild: never delays startup,
+    // never outlives-or-crashes this process's threads at exit.
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        setsid();
+        if (fork() == 0) {
+            int devnull = open("/dev/null", O_RDWR);
+            if (devnull >= 0) dup2(devnull, 0), dup2(devnull, 1), dup2(devnull, 2);
+            execl("/proc/self/exe", "pocket", "--refresh-catalog", (char*)nullptr);
+        }
+        _exit(0);
+    }
+    waitpid(pid, nullptr, 0);
 }
 
 std::string catalogLabel(const CatalogModel& m) {

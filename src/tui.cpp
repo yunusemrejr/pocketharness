@@ -1483,7 +1483,6 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
     auto pickModel = [&](const std::string& title, const std::string& initial, bool allowNone) -> std::string {
         auto all = catalogLoad(*opts.cfg);
         std::vector<std::string> labels, specs;
-        if (allowNone) labels.push_back("(none) — clear this role"), specs.push_back("-");
         for (const auto& m : opts.cfg->models) {
             labels.push_back(m.alias + " = " + m.provider + ":" + m.model + (m.routing.empty() ? "" : "@" + m.routing));
             specs.push_back(m.alias);
@@ -1492,6 +1491,8 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             labels.push_back(catalogLabel(m));
             specs.push_back(m.provider + ":" + m.id);
         }
+        // Last, never the default row: Enter must not silently clear a role.
+        if (allowNone) labels.push_back("(none) — clear this role"), specs.push_back("-");
         PickResult pr = pickOne(title, labels, initial);
         if (!pr.submitted) return "";
         if (!pr.filter.empty() && resolveModel(*opts.cfg, pr.filter).ok) return pr.filter;

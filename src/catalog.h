@@ -30,7 +30,8 @@ const CatalogModel* catalogFind(const std::vector<CatalogModel>& all, const std:
 
 // Fetch every provider whose key is present (parallel, bounded) and rewrite
 // the cache. Providers that fail keep their previous entries. Returns a
-// one-line summary. Async variant runs only when the cache is >24h old.
+// one-line summary. The async variant (a detached `pocket --refresh-catalog`
+// process) runs only when the cache is >24h old.
 std::string catalogRefresh(const Config& cfg);
 void catalogRefreshIfStale(const Config& cfg);
 

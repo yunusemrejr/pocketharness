@@ -142,6 +142,10 @@ Weak and strong models get the same standards, enforced by the harness:
    too. Findings return to the model immediately.
 4. **Watchmaker.** The same call failing three times gets a "change
    approach" note; long turns get a convergence check; identical batches stop.
+   Model quirks are absorbed instead of ending the turn: a reasoning-only
+   (empty) reply is retried without thinking; a reply cut off at the output
+   cap doubles the budget (up to a quarter of the window) and asks for the
+   work in smaller pieces.
 5. **Stop gate.** When the model answers without tools, Span reads the turn:
    asking permission, announcing work without doing it, dropped
    requirements, premature completion → a short `[overseer]` nudge and the
