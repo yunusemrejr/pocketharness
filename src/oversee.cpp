@@ -266,7 +266,10 @@ std::string awarenessBlock(const std::string& ws, const Config& cfg, bool allowN
     s += "- at most " + std::to_string(maxRounds) + " tool rounds per turn; repeated identical calls are stopped\n";
     s += "- every write/edit is quality-scanned; ";
     s += cfg.review ? "an overseer reviews changed work before a turn ends\n" : "reviews are off\n";
-    s += "Superpowers: `pocket kit` via bash (web, search, dom, shot, img, svg, spring, wav, audio, slop, probe).\n";
+    s += "Superpowers: `pocket kit` via bash — web, search, dom, shot, img, svg, spring, wav, audio, slop, "
+         "find/sym/refs (code index), probe; run `pocket kit` for usage. To see a UI, "
+         "`pocket kit shot file://$PWD/page.html out.png 1280x800`, then read out.png: images you read are "
+         "shown to you.\n";
     std::string mem = projectDir(ws) + "/memory.md";
     auto m = readFileBounded(mem, 16384);
     s += "Project memory: " + mem + " — append short durable learnings (commands, pitfalls, decisions).\n";

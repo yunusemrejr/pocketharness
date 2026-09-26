@@ -8,6 +8,8 @@
 #include "../src/catalog.h"
 #include "../src/config.h"
 #include "../src/oversee.h"
+#include "../src/sandbox.h"
+#include "../src/tools.h"
 #include "../src/tui.h"
 #include "../src/wisdom.h"
 
@@ -255,5 +257,34 @@ TEST(agent_Output_Cap_Raises_Budget_And_Retries) {
     CHECK(a.runTurn("write a big file").empty());
     CHECK(budgets.size() == 2 && budgets[1] == budgets[0] * 2);
     CHECK(validateHistory(a.messages()).empty());
+    return "";
+}
+
+TEST(agent_Read_Image_Attaches_Pixels_To_Next_Message) {
+    std::string ws = makeTempDir("pocket-view");
+    CHECK(atomicWriteFile(ws + "/shot.png", std::string("\x89PNG\r\n\x1a\n", 8) + std::string(64, 'p')).ok);
+    auto auth = authorityInit(ws, {}, {}, false);
+    CHECK(auth.ok);
+    ToolEnv env;
+    env.auth = &auth.value;
+    env.workspace = ws;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &env;
+    int n = 0;
+    size_t imagesSeen = 0;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        for (const auto& m : req.messages) imagesSeen = std::max(imagesSeen, m.images.size());
+        ChatResponse r;
+        if (n++ == 0) r.calls = {{"c1", "read", "{\"path\":\"shot.png\"}"}};
+        else r.text = "looks right";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runTurn("check the screenshot").empty());
+    CHECK(imagesSeen == 1 && env.viewImages.empty());
+    CHECK(validateHistory(a.messages()).empty());
+    authorityClose(auth.value);
+    rmRf(ws);
     return "";
 }

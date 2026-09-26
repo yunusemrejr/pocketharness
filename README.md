@@ -189,6 +189,8 @@ authority boundary, test surface, and context cost.
 
 - **read** — bounded file reads (1-based, line-numbered, offset/limit)
   from the workspace, allowed roots, the session tmp dir, and `/tmp`.
+  Reading a PNG/JPEG/GIF/WebP attaches its pixels to the next message, so
+  a vision model can `kit shot` its UI and actually look at it.
   Streams the requested range with a 200-line default; large files need not fit
   in memory. FIFOs and devices are refused, and scanning is bounded to 64 MiB.
 - **write** — atomic create/replace (tmp file + rename), parents created

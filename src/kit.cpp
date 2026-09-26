@@ -325,7 +325,7 @@ std::vector<std::string> chromeArgs(const std::string& exe) {
     std::string prof = std::string(td && *td ? td : "/tmp") + "/pocket-chrome-" + std::to_string(getuid());
     // Already inside Landlock+seccomp: Chrome's namespace sandbox can't nest.
     return {exe, "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
-            "--no-first-run", "--user-data-dir=" + prof, "--virtual-time-budget=4000"};
+            "--no-first-run", "--disable-dev-shm-usage", "--user-data-dir=" + prof, "--virtual-time-budget=4000"};
 }
 
 int kitWeb(const std::vector<std::string>& a) {

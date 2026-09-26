@@ -41,6 +41,7 @@ struct ToolEnv {
     std::vector<std::string> changedFiles;    // paths written this turn (agent resets)
     long bashRuns = 0;                        // successful+failed bash calls (verification signal)
     double sideCost = 0;                      // USD spent by tool-side judges (agent collects)
+    std::vector<ChatImage> viewImages;        // images `read` this batch (agent attaches them)
 };
 
 inline constexpr size_t kMaxUndo = 64;

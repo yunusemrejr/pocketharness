@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "agent.h"
 #include "brain.h"
 #include "kit.h"
 #include "oversee.h"
@@ -126,6 +127,20 @@ ToolResult toolRead(ToolEnv& env, const json::Value& args) {
     auto fd = boxOpenRead(*env.auth, path);
     if (!fd.ok) return {false, fd.error};
     struct Close { int fd; ~Close() { close(fd); } } closer{fd.value};
+    // Images are for eyes, not line numbers: the agent attaches the pixels
+    // to its next message so vision models can inspect renders/screenshots.
+    char head[16];
+    ssize_t hn = pread(fd.value, head, sizeof head, 0);
+    std::string mime = hn > 0 ? sniffImageMime(std::string_view(head, (size_t)hn)) : "";
+    if (!mime.empty()) {
+        auto bytes = boxRead(*env.auth, path, kMaxImageBytes);
+        if (!bytes.ok) return {false, "read: image over 5 MiB or unreadable: " + path};
+        if (env.viewImages.size() >= kMaxImagesPerMessage) return {false, "read: too many images in one batch"};
+        env.viewImages.push_back({mime, base64Encode(bytes.value)});
+        emit(env, "view " + path);
+        return {true, path + ": " + mime + ", " + std::to_string(bytes.value.size()) +
+                          " bytes — attached to the next message for visual inspection"};
+    }
     size_t cap = env.cfg ? env.cfg->outputLimitBytes : 262144;
     std::string out = path + " (from line " + std::to_string(offset) + "):\n";
     long line = 1, emitted = 0;

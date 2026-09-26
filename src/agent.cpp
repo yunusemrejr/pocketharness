@@ -994,6 +994,15 @@ std::string Agent::runTurn(const std::string& userText) {
             messages_.push_back(ChatMessage{"tool", wire, {}, tc.id});
             appendSession(SessionEvent{"tool_result", content, tc.id, tc.name, "", tr.ok});
         }
+        if (opts_.tools && !opts_.tools->viewImages.empty()) {
+            // Tool messages can't carry pixels on every wire: attach them to a
+            // short user message right after the batch. Transient by design:
+            // a resumed session keeps the marker text, not the pixels.
+            size_t n = opts_.tools->viewImages.size();
+            for (auto& img : opts_.tools->viewImages) pendingImages_.push_back(std::move(img));
+            opts_.tools->viewImages.clear();
+            pushUser("[harness] " + std::to_string(n) + " image(s) you read, attached for visual inspection.");
+        }
         if (round > 0 && round % 25 == 0 && !messages_.empty() && messages_.back().role == "tool")
             messages_.back().content += "\n[overseer] " + std::to_string(round) +
                                         " rounds in: if not converging, step back and simplify the approach.";
