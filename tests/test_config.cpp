@@ -294,3 +294,25 @@ TEST(config_Project_Cannot_Install_Shell_Hooks) {
     rmRf(dir);
     return "";
 }
+
+TEST(config_Working_Context_Ceiling_Default_Project_Override_And_Bounds) {
+    CHECK_EQ(defaultConfig().workingContextTokens, 96000L);
+    std::string home = makeTempDir("pocket-context-config");
+    HomeGuard hg(home);
+    std::string ws = home + "/ws";
+    CHECK(ensureDir(userConfigDir(), 0700).ok);
+    CHECK(ensureDir(ws + "/.pocket", 0700).ok);
+    CHECK(atomicWriteFile(userConfigPath(), R"({"working_context_tokens":48000})").ok);
+    CHECK(atomicWriteFile(projectConfigPath(ws), R"({"working_context_tokens":64000})").ok);
+    auto loaded = loadConfig(ws);
+    CHECK(loaded.ok && loaded.value.workingContextTokens == 64000);
+    CHECK(atomicWriteFile(projectConfigPath(ws), R"({"working_context_tokens":0})").ok);
+    loaded = loadConfig(ws);
+    CHECK(loaded.ok && loaded.value.workingContextTokens == 0);
+    for (const auto& value : {"-1", "true", "4095", "1048577", "4.5"}) {
+        CHECK(atomicWriteFile(projectConfigPath(ws), std::string("{\"working_context_tokens\":") + value + "}").ok);
+        CHECK(!loadConfig(ws).ok);
+    }
+    rmRf(home);
+    return "";
+}

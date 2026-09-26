@@ -437,6 +437,11 @@ std::vector<SessionInfo> sessionList(size_t max, const std::string& workspace) {
         si.id = id;
         si.path = sessionPath(id);
         si.workspace = meta.value.workspace;
+        si.goalStatus = meta.value.goalStatus;
+        si.goal = meta.value.goal.substr(0, 256);
+        si.lastStopReason = meta.value.lastStopReason;
+        si.lastStopDetail = meta.value.lastStopDetail;
+        si.lastStoppedAtMs = meta.value.lastStoppedAtMs;
         auto lock = sessionLock(id);
         si.active = !lock.ok;
         if (lock.ok) close(lock.value);
@@ -504,6 +509,11 @@ Result<SessionMeta> sessionLoadMeta(const std::string& id) {
     m.goalBrief = v.value.at("goal_brief").asStr();
     m.goalNext = v.value.at("goal_next").asStr();
     m.goalProgress = v.value.at("goal_progress").asStr();
+    m.lastStopReason = v.value.at("last_stop_reason").asStr().substr(0, 64);
+    m.lastStopDetail = v.value.at("last_stop_detail").asStr().substr(0, 1024);
+    m.lastStoppedAtMs = std::max(0L, v.value.at("last_stopped_at_ms").asInt());
+    m.originalRequest = v.value.at("original_request").asStr();
+    m.latestRequest = v.value.at("latest_request").asStr();
     for (const auto& [role, model] : v.value.at("roles").asObj())
         if (model.isStr()) m.roles[role] = model.asStr();
     return Result<SessionMeta>::Ok(m);
@@ -544,6 +554,11 @@ VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m) {
     o["goal_brief"] = m.goalBrief;
     o["goal_next"] = m.goalNext;
     o["goal_progress"] = m.goalProgress;
+    o["last_stop_reason"] = m.lastStopReason.substr(0, 64);
+    o["last_stop_detail"] = m.lastStopDetail.substr(0, 1024);
+    o["last_stopped_at_ms"] = json::Value(std::max<int64_t>(0, m.lastStoppedAtMs));
+    o["original_request"] = m.originalRequest;
+    o["latest_request"] = m.latestRequest;
     json::Object roles;
     for (const auto& [role, model] : m.roles) roles[role] = model;
     o["roles"] = json::Value(std::move(roles));

@@ -765,8 +765,8 @@ TEST(agent_Goal_Cancel_Persist_Resume_Clear) {
 }
 
 TEST(agent_Goal_Audit_Cancellation_Wins_And_Resumes_Audit_Only) {
-    // Both the decision model and the generative auditor can complete at
-    // the same moment as Esc. Neither may turn that pause into completion.
+    // Cancellation wins over a concurrent DONE verdict. Configuring a tiny
+    // decision model must not bypass the evidence auditor.
     for (bool decision : {false, true}) {
         std::string home = makeTempDir("pocket-goal-audit");
         CHECK(!home.empty());
@@ -781,7 +781,7 @@ TEST(agent_Goal_Audit_Cancellation_Wins_And_Resumes_Audit_Only) {
         int work = 0, audits = 0, decisions = 0;
         if (decision) opts.decide = [&](const json::Value&, const std::vector<Question>& questions, bool, double*) {
             for (const auto& q : questions) if (q.id == "met") {
-                if (++decisions == 1) cancel.store(true);
+                ++decisions;
                 return std::map<std::string, double>{{"met", 0.99}};
             }
             return std::map<std::string, double>{};
@@ -806,7 +806,8 @@ TEST(agent_Goal_Audit_Cancellation_Wins_And_Resumes_Audit_Only) {
         CHECK(resumed.resumeGoal().empty());
         CHECK(resumed.goalStatus() == GoalStatus::Completed);
         CHECK_EQ(work, 1);
-        CHECK_EQ(decision ? decisions : audits, 2);
+        CHECK_EQ(audits, 2);
+        CHECK_EQ(decisions, 0);
         rmRf(home);
     }
     return "";
@@ -1030,6 +1031,470 @@ TEST(agent_Goal_Audit_Sees_Earlier_Verified_Work_After_Resume) {
     CHECK_EQ(work, 2);
     CHECK_EQ(audits, 2);
     CHECK(sessionLoadMeta(id.value).value.goalProgress.size() <= 40000);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Goal_Queued_Guidance_Yields_After_Complete_Tool_Batch) {
+    std::string home = makeTempDir("pocket-batch-yield");
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    AgentOpts opts;
+    opts.sessionId = id.value;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    int work = 0, audits = 0;
+    bool queued = false;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish";
+        else if (req.system.find("audit") != std::string::npos) { ++audits; r.text = "DONE"; }
+        else if (++work == 1) {
+            queued = true;
+            r.calls = {{"one", "read", "{}"}, {"two", "read", "{}"}};
+        } else r.text = "Completed and verified.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    a.setGoalYield([&] { return queued; });
+    CHECK(a.runGoal("finish safely").empty());
+    CHECK_EQ(work, 1);
+    CHECK_EQ(audits, 0);
+    CHECK_EQ(a.stats().toolCalls, 2);
+    CHECK(validateHistory(a.messages()).empty());
+    auto checkpoint = sessionLoadMeta(id.value);
+    CHECK(checkpoint.ok);
+    CHECK_EQ(checkpoint.value.goalPhase, std::string("work"));
+    CHECK_EQ(checkpoint.value.goalStatus, std::string("paused"));
+    CHECK_EQ(checkpoint.value.lastStopReason, std::string("yielded"));
+    queued = false;
+    CHECK(a.resumeGoal("use the new direction").empty());
+    CHECK_EQ(work, 2);
+    CHECK_EQ(audits, 1);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Outcomes_Distinguish_Cancel_Limit_Provider_And_Completion) {
+    std::string home = makeTempDir("pocket-outcomes");
+    HomeGuard hg(home);
+    for (const std::string mode : {"cancelled", "round_limit", "provider_error", "completed"}) {
+        auto id = sessionCreate();
+        CHECK(id.ok);
+        AgentOpts opts;
+        opts.sessionId = id.value;
+        opts.model = resolveModel(defaultConfig(), "glm").value;
+        opts.maxRounds = 2;
+        std::atomic<bool> cancel{mode == "cancelled"};
+        opts.cancel = &cancel;
+        int calls = 0;
+        opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+            if (mode == "provider_error") return Result<ChatResponse>::Err("HTTP 400: " + std::string(2000, 'x'));
+            ChatResponse r;
+            if (mode == "round_limit") r.calls = {{"c" + std::to_string(++calls), "read", "{}"}};
+            else r.text = "done";
+            return Result<ChatResponse>::Ok(r);
+        };
+        Agent a(opts);
+        auto error = a.runTurn("do the work");
+        CHECK_EQ(error.empty(), mode == "completed");
+        auto meta = sessionLoadMeta(id.value);
+        CHECK(meta.ok && meta.value.lastStopReason == mode);
+        CHECK(meta.value.lastStopDetail.size() <= 1024);
+        CHECK(meta.value.lastStoppedAtMs > 1700000000000LL);
+        auto log = sessionLoad(id.value);
+        CHECK(log.ok && log.value.events.back().type == "outcome");
+        CHECK_EQ(log.value.events.back().replay.at("reason").asStr(), mode);
+        CHECK_EQ(log.value.events.back().replay.at("at_ms").asInt(), meta.value.lastStoppedAtMs);
+        auto listed = sessionList(30);
+        bool found = false;
+        for (const auto& item : listed) if (item.id == id.value) {
+            found = true;
+            CHECK_EQ(item.lastStopReason, mode);
+            CHECK_EQ(item.lastStoppedAtMs, meta.value.lastStoppedAtMs);
+        }
+        CHECK(found);
+        Agent restored(opts);
+        CHECK(restored.restore(id.value).ok);
+        CHECK_EQ(restored.messageCount(), a.messageCount()); // outcome is diagnostic, never model input
+    }
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Goal_Round_Limit_Checkpoints_Progress_And_Continues) {
+    std::string home = makeTempDir("pocket-goal-checkpoint");
+    HomeGuard hg(home);
+    auto authority = authorityInit(home, {}, {}, false);
+    CHECK(authority.ok);
+    Config cfg = defaultConfig();
+    ToolEnv env;
+    env.auth = &authority.value;
+    env.cfg = &cfg;
+    env.workspace = home;
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    AgentOpts opts;
+    opts.model = resolveModel(cfg, "glm").value;
+    opts.sessionId = id.value;
+    opts.tools = &env;
+    opts.maxRounds = 2;
+    for (int i = 1; i <= 5; ++i)
+        CHECK(atomicWriteFile(home + "/step" + std::to_string(i), "Evidence observed for completed step " + std::to_string(i)).ok);
+    int work = 0, audits = 0;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish";
+        else if (req.system.find("audit") != std::string::npos) { ++audits; r.text = "DONE"; }
+        else if (++work <= 5) {
+            r.calls = {{"r" + std::to_string(work), "read", json::stringify(json::Object{
+                {"path", home + "/step" + std::to_string(work)}})}};
+        } else r.text = "Completed and verified.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runGoal("complete five steps", 5).empty());
+    CHECK_EQ(work, 6);
+    CHECK_EQ(audits, 1);
+    CHECK(a.goalStatus() == GoalStatus::Completed);
+    auto log = sessionLoad(id.value);
+    CHECK(log.ok);
+    int checkpoints = 0;
+    for (const auto& event : log.value.events)
+        checkpoints += event.type == "outcome" && event.replay.at("reason").asStr() == "progress_checkpoint";
+    CHECK_EQ(checkpoints, 2);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Goal_Without_New_Progress_Does_Not_Extend_Round_Limit) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.maxRounds = 2;
+    int work = 0;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish";
+        else { ++work; r.calls = {{"x" + std::to_string(work), "read", "{}"}}; }
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runGoal("finish safely").find("no new successful observations") != std::string::npos);
+    CHECK(a.goalPaused());
+    CHECK_EQ(work, 2);
+    CHECK(validateHistory(a.messages()).empty());
+    return "";
+}
+
+TEST(agent_Working_Context_Checkpoint_Preserves_Constraints_And_Thinking) {
+    std::string home = makeTempDir("pocket-working-context");
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.model.context = 1000000;
+    opts.workingContextTokens = 96000;
+    opts.thinking = "high";
+    opts.sessionId = id.value;
+    int mainCalls = 0, summaries = 0;
+    bool anchors = false, thinkingPreserved = true;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (!req.stream) {
+            ++summaries;
+            r.text = "Work evidence retained; summaries do not restate every constraint.";
+        } else {
+            ++mainCalls;
+            thinkingPreserved &= req.thinking == "high";
+            r.inTokens = mainCalls == 7 ? 100000 : 100;
+            r.text = "Done. All tests passed.";
+            if (mainCalls == 8) {
+                for (const auto& message : req.messages)
+                    anchors |= message.content.find("ORIGINAL_CONSTRAINT") != std::string::npos &&
+                               message.content.find("LATEST_DIRECTION") != std::string::npos;
+            }
+        }
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runTurn("ORIGINAL_CONSTRAINT: preserve the user's data").empty());
+    for (int i = 0; i < 6; ++i) CHECK(a.runTurn("intermediate request").empty());
+    CHECK(a.runTurn("LATEST_DIRECTION: verify cancellation").empty());
+    CHECK_EQ(summaries, 1);
+    CHECK(thinkingPreserved && anchors);
+    Agent restored(opts);
+    CHECK(restored.restore(id.value).ok);
+    CHECK_EQ(restored.messages()[0].content, a.messages()[0].content);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Failed_Soft_Compaction_Has_Growth_Backoff) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.model.context = 1000000;
+    opts.workingContextTokens = 96000;
+    int mainCalls = 0, attempts = 0;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        if (!req.stream) { ++attempts; return Result<ChatResponse>::Err("summarizer unavailable"); }
+        ChatResponse r;
+        r.text = "Done.";
+        r.inTokens = ++mainCalls >= 7 ? 100000 : 100;
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    for (int i = 0; i < 12; ++i) CHECK(a.runTurn("continue the existing task").empty());
+    CHECK_EQ(attempts, 1);
+    CHECK_EQ(a.stats().compactions, 0);
+    return "";
+}
+
+TEST(agent_Autonomous_Prompt_And_Followup_Cross_Round_Checkpoints) {
+    std::string home = makeTempDir("pocket-plain-checkpoints");
+    HomeGuard hg(home);
+    auto authority = authorityInit(home, {}, {}, false);
+    CHECK(authority.ok);
+    for (int i = 1; i <= 6; ++i)
+        CHECK(atomicWriteFile(home + "/step" + std::to_string(i), "Concrete evidence for completed task step " + std::to_string(i)).ok);
+    ToolEnv env;
+    env.auth = &authority.value;
+    env.workspace = home;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &env;
+    opts.autonomy = true;
+    opts.maxRounds = 2;
+    int calls = 0;
+    bool followupSeen = false;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        ++calls;
+        for (const auto& message : req.messages)
+            followupSeen |= message.content == "also inspect the remaining steps";
+        if (calls == 4 || calls == 8) r.text = "All requested steps inspected and verified.";
+        else {
+            int step = calls <= 3 ? calls : calls - 1;
+            r.calls = {{"r" + std::to_string(calls), "read", json::stringify(json::Object{
+                {"path", home + "/step" + std::to_string(step)}})}};
+        }
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runTurn("inspect the first three steps").empty());
+    CHECK_EQ(calls, 4);
+    CHECK(a.runTurn("also inspect the remaining steps").empty());
+    CHECK_EQ(calls, 8);
+    CHECK(followupSeen);
+    CHECK(validateHistory(a.messages()).empty());
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Autonomous_Checkpoint_Remains_Cancellable) {
+    std::string home = makeTempDir("pocket-checkpoint-cancel");
+    HomeGuard hg(home);
+    auto authority = authorityInit(home, {}, {}, false);
+    CHECK(authority.ok);
+    CHECK(atomicWriteFile(home + "/evidence", "Concrete evidence verified by the tool").ok);
+    ToolEnv env;
+    env.auth = &authority.value;
+    env.workspace = home;
+    std::atomic<bool> cancel{false};
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &env;
+    opts.cancel = &cancel;
+    opts.autonomy = true;
+    opts.maxRounds = 1;
+    int calls = 0;
+    opts.onNotice = [&](const std::string& notice) {
+        if (notice.find("progress checkpoint") != std::string::npos) cancel.store(true);
+    };
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ++calls;
+        ChatResponse r;
+        r.calls = {{"r", "read", json::stringify(json::Object{{"path", home + "/evidence"}})}};
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK_EQ(a.runTurn("inspect the evidence"), std::string("cancelled"));
+    CHECK_EQ(calls, 1);
+    CHECK(validateHistory(a.messages()).empty());
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Progress_Advisory_Is_Bounded_And_Never_Completion) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.maxRounds = 26;
+    int calls = 0, checks = 0;
+    size_t traceSize = 0;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        if (++calls == 26) r.text = "Need to inspect the failure before any completion claim.";
+        else r.calls = {{"r" + std::to_string(calls), "read", "{\"attempt\":" + std::to_string(calls) + "}"}};
+        return Result<ChatResponse>::Ok(r);
+    };
+    opts.progress = [&](const std::string& trace, double*) {
+        ++checks;
+        traceSize = std::max(traceSize, trace.size());
+        return "Inspect the repeated failure before changing more files.";
+    };
+    Agent a(opts);
+    CHECK(a.runTurn("diagnose the issue").empty());
+    CHECK_EQ(calls, 26);
+    CHECK_EQ(checks, 2);
+    CHECK(traceSize <= 4096);
+    CHECK(a.goalStatus() == GoalStatus::None);
+    return "";
+}
+
+TEST(agent_Repeated_Compaction_Preserves_Intermediate_Requirement_Summary) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.model.context = 1000000;
+    opts.workingContextTokens = 96000;
+    int calls = 0, summaries = 0;
+    bool earlierAmendment = false;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (!req.stream) {
+            ++summaries;
+            if (summaries > 1)
+                earlierAmendment = req.messages[0].content.find("MIDDLE_REQUIREMENT: no dependencies") != std::string::npos;
+            r.text = "MIDDLE_REQUIREMENT: no dependencies. Preserve this requirement while continuing.";
+        } else {
+            ++calls;
+            r.inTokens = calls == 7 || calls == 15 ? 100000 : 100;
+            r.text = std::string(20000, 'x');
+        }
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runTurn("ORIGINAL_REQUIREMENT").empty());
+    CHECK(a.runTurn("MIDDLE_REQUIREMENT: no dependencies").empty());
+    for (int i = 2; i < 16; ++i) CHECK(a.runTurn("latest request " + std::to_string(i)).empty());
+    CHECK(summaries >= 2);
+    CHECK(earlierAmendment);
+    return "";
+}
+
+TEST(agent_Old_Progress_Does_Not_Renew_A_Failure_Only_Tail) {
+    std::string home = makeTempDir("pocket-progress-recency");
+    HomeGuard hg(home);
+    auto authority = authorityInit(home, {}, {}, false);
+    CHECK(authority.ok);
+    CHECK(atomicWriteFile(home + "/initial", "Useful initial discovery, before a long unresolved failure loop").ok);
+    ToolEnv env;
+    env.auth = &authority.value;
+    env.workspace = home;
+    for (bool goal : {false, true}) {
+        AgentOpts opts;
+        opts.model = resolveModel(defaultConfig(), "glm").value;
+        opts.tools = &env;
+        opts.autonomy = true;
+        opts.maxRounds = 14;
+        int calls = 0;
+        opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+            ChatResponse r;
+            if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: diagnose";
+            else {
+                ++calls;
+                r.calls = {{"r" + std::to_string(calls), "read", json::stringify(json::Object{
+                    {"path", home + (calls == 1 ? "/initial" : "/missing" + std::to_string(calls))}})}};
+            }
+            return Result<ChatResponse>::Ok(r);
+        };
+        Agent a(opts);
+        std::string error = goal ? a.runGoal("diagnose safely") : a.runTurn("diagnose safely");
+        CHECK(error.find("no new successful observations") != std::string::npos);
+        CHECK_EQ(calls, 14);
+        CHECK(!goal || a.goalPaused());
+    }
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Autonomous_Continuation_Judges_The_Whole_User_Request) {
+    std::string home = makeTempDir("pocket-continuation-evidence");
+    HomeGuard hg(home);
+    auto authority = authorityInit(home, {}, {}, false);
+    CHECK(authority.ok);
+    CHECK(atomicWriteFile(home + "/first", "FIRST_CHUNK_EVIDENCE: the original requirement was checked").ok);
+    CHECK(atomicWriteFile(home + "/second", "SECOND_CHUNK_EVIDENCE: the follow-up requirement was checked").ok);
+    ToolEnv env;
+    env.auth = &authority.value;
+    env.workspace = home;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &env;
+    opts.autonomy = true;
+    opts.maxRounds = 2;
+    bool criterionSeen = false, evidenceSeen = false;
+    opts.decide = [&](const json::Value& state, const std::vector<Question>&, bool, double*) {
+        for (const auto& message : state.at("input").asArr()) {
+            auto text = message.at("content").asStr();
+            criterionSeen |= text.find("ORIGINAL_ACCEPTANCE_CRITERION") != std::string::npos;
+            evidenceSeen |= text.find("FIRST_CHUNK_EVIDENCE") != std::string::npos;
+        }
+        return std::map<std::string, double>{{"ask", 0}, {"announce", 0}, {"premature", 0}, {"ignored", 0}};
+    };
+    int calls = 0;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        if (++calls <= 2) r.calls = {{"r" + std::to_string(calls), "read", json::stringify(json::Object{
+            {"path", home + (calls == 1 ? "/first" : "/second")}})}};
+        else r.text = "All requested criteria checked and verified.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runTurn("ORIGINAL_ACCEPTANCE_CRITERION: inspect both evidence files").empty());
+    CHECK_EQ(calls, 3);
+    CHECK(criterionSeen && evidenceSeen);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Goal_Completion_Notice_Follows_Durable_State) {
+    std::string home = makeTempDir("pocket-goal-notice");
+    HomeGuard hg(home);
+    for (int mode = 0; mode < 3; ++mode) {
+        auto id = sessionCreate();
+        CHECK(id.ok);
+        AgentOpts opts;
+        opts.model = resolveModel(defaultConfig(), "glm").value;
+        opts.sessionId = id.value;
+        std::atomic<bool> cancel{false};
+        opts.cancel = &cancel;
+        opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+            ChatResponse r;
+            if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish";
+            else if (req.system.find("You audit an autonomous agent") != std::string::npos) {
+                if (mode == 1) (void)atomicWriteFile(sessionDir() + "/" + id.value + ".meta.json", "corrupt fixture");
+                if (mode == 2) cancel.store(true);
+                r.text = "DONE";
+            } else r.text = "Completed and verified.";
+            return Result<ChatResponse>::Ok(r);
+        };
+        int notices = 0;
+        bool durableCompleted = false;
+        Agent* running = nullptr;
+        opts.onNotice = [&](const std::string& notice) {
+            if (!startsWith(notice, "goal met")) return;
+            ++notices;
+            auto meta = sessionLoadMeta(id.value);
+            durableCompleted = running && running->goalStatus() == GoalStatus::Completed && meta.ok &&
+                               meta.value.goalStatus == "completed" && meta.value.lastStopReason == "completed";
+        };
+        Agent a(opts);
+        running = &a;
+        std::string error = a.runGoal("finish fixture goal");
+        CHECK_EQ(error.empty(), mode == 0);
+        CHECK_EQ(notices, mode == 0 ? 1 : 0);
+        CHECK(mode != 0 || durableCompleted);
+    }
     rmRf(home);
     return "";
 }

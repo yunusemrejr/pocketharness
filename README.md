@@ -79,6 +79,7 @@ pocket -p "Review src/network.cpp for concurrency problems."
 pocket -m glm -p "Review src/network.cpp."
 pocket -m ollama:qwen3:8b -t none --max-tokens 2048 -p "Explain this project."
 pocket --resume         # newest idle session in this workspace
+pocket --resume ID      # continue a specific saved session
 pocket --sessions       # list workspaces, active/idle sessions, previews
 pocket -g "make the settings page elegant and fix the save bug"   # autonomous goal
 pocket --models flash   # fuzzy-search the live catalog (pocket --refresh-catalog)
@@ -96,13 +97,13 @@ export OPENROUTER_API_KEY=...     # also enables the Span/Jev judges
 
 Slash commands: `/models` (assign main · fast · fallback · review · subagent, fuzzy
 search over the catalog) `/model` `/goal` `/queue` `/thinking` `/compact` `/undo`
-`/skills` `/session` `/brain` `/catalog` `/security` `/help` `/quit`. Keys: Enter submits, Ctrl-J/Alt-Enter newline,
+`/skills` `/session` `/sessions` `/resume` `/brain` `/catalog` `/security` `/help` `/quit`. Keys: Enter submits, Ctrl-J/Alt-Enter newline,
 Up/Down history, Esc pauses work, Ctrl-C cancels (idle empty prompt quits), Ctrl-D quits.
 Paste is bracketed (multi-line paste never submits early); the pinned bottom
 bar shows the input box, full provider/model/thinking, combined metered cost,
-and context/tok-s/cache KPIs. The composer stays live during generation: Enter
-queues a message visibly, and queued messages run in order after the current
-turn. A running goal yields between work or audit steps to take queued input.
+and context/tok-s/cache KPIs, with the full session ID above them. The composer
+stays live during generation: Enter queues a message visibly. Work yields after
+the current tool batch so follow-ups take effect before another model request.
 Esc stops the current work and holds the queue until a new follow-up or
 explicit resume. `/queue` shows pending messages, `/queue clear` discards them,
 and `/queue resume` releases the held queue. Local commands such as `/session`
@@ -165,8 +166,8 @@ Weak and strong models get the same standards, enforced by the harness:
    `review` model answers LGTM or defects; a majority of objections goes
    back to the worker once.
 6. **Goals.** `/goal TEXT` (or `pocket -g`) runs turns until an audit says
-   the goal is met: Span confirms cheaply when it is sure, otherwise the
-   `fast` model audits the digest and lists what remains. Stricter limits,
+   the goal is met: the `fast` model audits the evidence digest and lists
+   what remains. A small decision model cannot certify completion. Stricter limits,
    review always on. `/goal` or `/goal status` shows the saved goal;
    `/goal pause`, `/goal resume`, and `/goal clear` control it. Esc pauses without
    deleting progress. A follow-up to a paused goal resumes it with that input.
@@ -176,6 +177,9 @@ Weak and strong models get the same standards, enforced by the harness:
 Judge activity appears in the transcript while work runs: Jev, Span, and the
 local LM report requests and outcomes. Cached answers are explicitly marked
 as reused; an unavailable or cancelled judge is not reported as successful.
+During long tool runs, a cached local progress check can suggest changing a
+failing approach. It uses only an already running local server, has a 1.5-second
+budget, and never starts a server or falls back to a paid model.
 
 Every check is bounded (a few nudges per turn); every remote judge
 refines and never gates; offline, the native classifier and heuristics
@@ -206,9 +210,13 @@ not an accounting or security boundary.
 
 The model-facing surface is exactly: `read` `write` `edit` `bash` `skill`.
 
-Sessions work autonomously by default: implement, verify, and continue up to the
-configured round limit. Three identical tool batches stop a stuck loop. Routine
-commands need no approval; the destructive-command guard still applies.
+Sessions work autonomously by default: implement, verify, and finish the requested
+work. `max_rounds` bounds one work chunk; new successful observations allow another
+chunk without a manual "go on". A request has at most 12 work checkpoints; goals
+share their work/audit checkpoint budget. Repeated tool batches or a chunk with no
+new successful observations pause work with a saved reason. `autonomy: false`
+retains the hard round limit. Routine commands need no approval; the
+destructive-command guard still applies.
 
 There are intentionally no tools for git, grep, find, curl, npm, python,
 compilers, test runners, todos, memory, or background jobs — the model uses
@@ -223,6 +231,9 @@ authority boundary, test surface, and context cost.
   in memory. FIFOs and devices are refused, and scanning is bounded to 64 MiB.
 - **write** — atomic create/replace (tmp file + rename), parents created
   inside allowed roots, never through symlinks.
+  Native read/write/edit accept `$TMPDIR/path` for private session scratch,
+  using the same directory as bash. Arbitrary `/tmp` writes require bash or
+  an explicit allowed write root.
 - **edit** — exact replacement; fails unless `old_text` occurs exactly
   `expected_matches` times (default 1). An `edits` array applies up to 64
   sequential replacements with one atomic write: any mismatch leaves the file
@@ -298,6 +309,7 @@ One transparent user config, optional project overlay. See
   "bash_timeout": 120,
   "output_limit": 262144,
   "max_rounds": 100,
+  "working_context_tokens": 96000,
   "allow_read": [],
   "allow_write": [],
   "expose_env": []
@@ -552,8 +564,8 @@ frontmatter `description:` (or first paragraph) are the metadata. The model sees
 loads one. `search` ranks by token overlap (name hits outrank heading,
 heading outranks preview). See `examples/skills/` for a starter skill, and
 `skills/web-research/` for the bundled curl-based web client guide
-(`make install-skills` copies bundled skills into the user skill dir;
-never part of `make install`).
+(`make install` refreshes the bundled skill directory; personal skills in
+`~/.config/pocketharness/skills` remain separate and take precedence).
 
 There is no `web_search` tool, fetch subsystem, or browser runtime: web
 research is `curl` via `bash`, taught by the skill, gated by the same
@@ -569,6 +581,13 @@ other sessions remain independent. Locks release on exit/crash. `--resume` selec
 an idle session in the current workspace; an explicit id from another workspace
 fails with its location. Legacy sessions without workspace metadata can be
 resumed by explicit id. Session listing reads only a small preview of each log.
+The TUI shows the full ID. `/sessions` or `/resume` opens a picker for this
+workspace; `/resume ID` and `/resume last` switch directly. Switching requires
+idle work with no pending draft, queued input or images. A failed switch leaves
+the current session intact. Models, roles, history, cost and goals belong to the
+selected session; restored goals wait paused for a follow-up. `/session` and the
+picker show the last recorded stop reason. Timestamped outcome events are saved
+separately from the conversation sent to the model.
 
 Same-workdir sessions exchange bounded status and file-change notices through a
 separate directory scoped to that workspace. Conversations, role choices and
@@ -586,14 +605,19 @@ SQLite, indexing, or daemons. Keys never touch session files.
 
 Context: the last provider token count plus estimated additions since that
 request, compared with the (possibly live-resolved) window. `/compact` on demand plus
-automatic summarization at ~90%, or whenever the next completion would no
+automatic summarization at the 96,000-token working target, near the model's
+window limit, or whenever the next completion would no
 longer fit (a full `maxTokens` of headroom is reserved for the answer).
+Set `working_context_tokens` to change the working target, or `0` to use only
+the model's window limit. Failed summaries back off instead of retrying each
+round. Original and latest user requests (up to 64 KiB each) are retained
+verbatim alongside the work summary; the summary must preserve intervening
+requirements too.
 Compaction summarizes older turns and keeps recent raw turns with tool
 pairs intact, including within long autonomous turns. Compaction checkpoints
 record the cut point so resume reconstructs the summary **and retained tail**.
 If compaction cannot make the next request fit, the harness stops locally.
-No memory graphs, no governors, no injected observations. Durable knowledge
-belongs in project files or skills.
+Durable knowledge belongs in project files or skills.
 
 ## Security architecture
 
@@ -629,6 +653,9 @@ Mechanisms (a few Linux primitives, not a policy framework):
   excludes unrelated secrets; only proxy and CA configuration is retained.
   Ambient curl config files and authenticated redirects are disabled, and
   loopback connections bypass proxies.
+  Versioned Node runtimes already selected by PATH under nvm, Volta, fnm,
+  mise or asdf receive read/execute access to that runtime directory only;
+  the containing home directory and other versions remain outside the grant.
 - **Key broker, not key sharing**: provider keys live only in the parent's
   environment and per-request 0600 staging. No keyfile is ever handed to a
   model tool child, no session id / depth / parent flag travels via env (a recursive

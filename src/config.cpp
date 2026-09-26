@@ -293,6 +293,12 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
         if (!o.at(key).isBool()) return typeErr(key, "a boolean");
         *dst = o.at(key).asBool();
     }
+    if (v.has("working_context_tokens")) {
+        long n = integer(o.at("working_context_tokens"));
+        if (n != 0 && (n < 4096 || n > 1048576))
+            return typeErr("working_context_tokens", "0 (disabled) or 4096..1048576 tokens");
+        cfg.workingContextTokens = n;
+    }
     // Security authority: user config only. Project config must not escalate.
     auto secKey = [&](const char* k) -> bool {
         if (!v.has(k)) return false;
@@ -452,7 +458,8 @@ VoidResult stageChildConfig(const Config& cfg, const std::string& childHome) {
     for (const auto& name : cfg.exposeEnv) exposed.push_back(name);
     json::Value settings = json::Object{{"providers", providers}, {"models", models}, {"roles", roles},
         {"default_model", model}, {"thinking", cfg.thinking}, {"review", cfg.review}, {"autonomy", cfg.autonomy},
-        {"jev", cfg.jev}, {"max_rounds", cfg.maxRounds}, {"bash_timeout", cfg.bashTimeoutSec},
+        {"jev", cfg.jev}, {"working_context_tokens", cfg.workingContextTokens},
+        {"max_rounds", cfg.maxRounds}, {"bash_timeout", cfg.bashTimeoutSec},
         {"tool_network", cfg.toolNetwork}, {"output_limit", cfg.outputLimitBytes}, {"expose_env", exposed}};
     // The fake HOME is tool-writable. Anchor every parent directory so a model
     // cannot redirect the trusted harness into a symlink outside scratch.

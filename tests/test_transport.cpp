@@ -414,3 +414,73 @@ TEST(transport_Judge_Activity_Never_Reports_Cancelled_Request_As_Success) {
     rmRf(dir);
     return "";
 }
+
+TEST(transport_Progress_Check_Is_Local_Cached_And_Advisory) {
+    std::string dir = makeTempDir("pocket-progress");
+    HomeGuard hg(dir);
+    EnvGuard key("OPENROUTER_API_KEY", "unused-fixture-key");
+    LocalServer server({http(R"({"completion_probabilities":[{"probs":[{"tok_str":"yes","prob":1}]}]})"),
+                        http(R"({"completion_probabilities":[{"probs":[{"tok_str":"yes","prob":0.6},{"tok_str":"no","prob":0.4}]}]})")});
+    CHECK(!server.url.empty());
+    Config cfg;
+    cfg.jev = true;  // this helper must never use the remote decision routes
+    cfg.localLm.port = std::stoi(server.url.substr(server.url.find_last_of(':') + 1));
+    std::vector<std::string> notices;
+    auto activity = [&](const std::string& note) { notices.push_back(note); };
+    const std::string advice = progressHint(cfg, "private-repeated-failure-marker", nullptr, activity);
+    CHECK(advice.find("Recent tool results") == 0);
+    CHECK(advice.find("not a reason to stop or claim completion") != std::string::npos);
+    CHECK(advice.find("private-") == std::string::npos);
+    CHECK(notices == std::vector<std::string>({"judge: local LM checking recent progress",
+                                             "judge: local LM ran successfully (1 answer)"}));
+    notices.clear();
+    CHECK(progressHint(cfg, "private-repeated-failure-marker", nullptr, activity) == advice);
+    CHECK(notices == std::vector<std::string>{"judge: local LM cached answers reused (1; no model request)"});
+    CHECK(progressHint(cfg, "uncertain progress").empty());
+    std::atomic<bool> cancel{true};
+    CHECK(progressHint(cfg, "private-repeated-failure-marker", &cancel).empty());
+    server.join();
+    CHECK(server.requests.size() == 2);
+    rmRf(dir);
+    return "";
+}
+
+TEST(transport_Progress_Check_Does_Not_Start_A_Server) {
+    std::string dir = makeTempDir("pocket-progress-offline");
+    HomeGuard hg(dir);
+    struct Socket { int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0); ~Socket() { if (fd >= 0) close(fd); } } reserved;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof(addr);
+    CHECK(reserved.fd >= 0 && bind(reserved.fd, (sockaddr*)&addr, len) == 0);
+    CHECK(getsockname(reserved.fd, (sockaddr*)&addr, &len) == 0);
+    Config cfg;
+    cfg.localLm.port = ntohs(addr.sin_port);  // reserved, but no listener
+    cfg.localLm.server = dir + "/server";
+    cfg.localLm.model = dir + "/model";
+    CHECK(atomicWriteFile(cfg.localLm.server, "#!/bin/sh\ntouch '" + dir + "/started'\n", 0700).ok);
+    CHECK(atomicWriteFile(cfg.localLm.model, "fixture").ok);
+    CHECK(progressHint(cfg, "repeat failure").empty());
+    CHECK(access((dir + "/started").c_str(), F_OK) != 0);
+    CHECK(judgeStatus(cfg).find("cooldown") == std::string::npos);
+    rmRf(dir);
+    return "";
+}
+
+TEST(transport_Progress_Deadline_Does_Not_Disable_Normal_Judges) {
+    std::string dir = makeTempDir("pocket-progress-deadline");
+    HomeGuard hg(dir);
+    LocalServer server({http(R"({"completion_probabilities":[{"probs":[{"tok_str":"yes","prob":1}]}]})")}, 2500);
+    CHECK(!server.url.empty());
+    Config cfg;
+    cfg.localLm.port = std::stoi(server.url.substr(server.url.find_last_of(':') + 1));
+    int64_t started = nowMs();
+    CHECK(progressHint(cfg, "repeat failure").empty());
+    CHECK(nowMs() - started < 2300);  // short check returns before the slow model
+    CHECK(judgeStatus(cfg).find("cooldown") == std::string::npos);
+    server.join();
+    CHECK(server.requests.size() == 1);
+    rmRf(dir);
+    return "";
+}

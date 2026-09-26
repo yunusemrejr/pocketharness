@@ -48,6 +48,7 @@
   "allow_write": [],
   "expose_env": [],
   "max_rounds": 100,
+  "working_context_tokens": 96000,
   "roles": {
     "subagent": "deepseek",
     "fast": "deepseek",

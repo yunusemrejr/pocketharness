@@ -6,9 +6,11 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 
 #include <utility>
 #include <algorithm>
+#include <exception>
 #include <map>
 #include <set>
 
@@ -134,6 +136,13 @@ VoidResult Agent::restore(const std::string& sessionId) {
     auto meta = sessionLoadMeta(sessionId);
     if (!meta.ok) return VoidResult::Err(meta.error);
     SessionMeta m = meta.value;
+    lastStopReason_ = m.lastStopReason;
+    lastStopDetail_ = m.lastStopDetail;
+    lastStoppedAtMs_ = m.lastStoppedAtMs;
+    originalRequest_ = m.originalRequest;
+    latestRequest_ = m.latestRequest;
+    if (originalRequest_.size() > 65536 || latestRequest_.size() > 65536)
+        return VoidResult::Err("user request checkpoint exceeds size limit");
     if (m.goal.size() > 65536 || m.goalBrief.size() > 16384 ||
         m.goalNext.size() > 131072 || m.goalProgress.size() > 40000)
         return VoidResult::Err("goal checkpoint exceeds size limit");
@@ -182,6 +191,13 @@ VoidResult Agent::restore(const std::string& sessionId) {
     for (size_t i = 0; i < loaded.value.events.size(); ++i) {
         const auto& ev = loaded.value.events[i];
         if (ev.type == "user") {
+            // Old sessions predate explicit request anchors. Keep their real
+            // directions, skipping harness-only continuation annotations.
+            if (m.originalRequest.empty() && !startsWith(ev.text, "[harness]") &&
+                !startsWith(ev.text, "[overseer") && !startsWith(ev.text, "[workspace activity")) {
+                if (originalRequest_.empty()) originalRequest_ = ev.text.substr(0, 65536);
+                latestRequest_ = ev.text.substr(0, 65536);
+            }
             ChatMessage m{"user", ev.text, {}, ""};
             m.images = std::move(imgBuf);
             imgBuf.clear();
@@ -223,6 +239,8 @@ VoidResult Agent::restore(const std::string& sessionId) {
             if (cut > messages_.size()) return VoidResult::Err("invalid compaction checkpoint");
             messages_.erase(messages_.begin(), messages_.begin() + cut);
             messages_.insert(messages_.begin(), ChatMessage{"user", "[Summary of earlier work]\n" + ev.text, {}, ""});
+            messages_.front().replay = json::Object{{"compact_summary",
+                ev.replay.has("summary") ? ev.replay.at("summary").asStr() : ev.text.substr(0, 24000)}};
         }
     }
     // A crash after dispatch has an unknown outcome. Close the transcript
@@ -244,7 +262,8 @@ VoidResult Agent::restore(const std::string& sessionId) {
     if (!bad.empty()) return VoidResult::Err(bad);
     // Opening a session never starts autonomous work. A process interrupted
     // while active needs an explicit resume, just like an intentional pause.
-    if (m.goalStatus == "active") saveStats();
+    if (m.goalStatus == "active")
+        recordOutcome("goal", "interrupted", "previous process ended while the goal was active; inspect state before resuming");
     if (!persistenceError_.empty()) return VoidResult::Err(persistenceError_);
     return VoidResult::Ok();
 }
@@ -255,6 +274,11 @@ void Agent::appendSession(const SessionEvent& ev) {
     if (!appended.ok) { persistenceError_ = appended.error; return; }
     if (ev.type == "tool_call" || ev.type == "tool_result" || ev.type == "image") return;
     saveStats();
+}
+
+std::string Agent::flushUsage() {
+    saveStats();
+    return persistenceError_.empty() ? "" : "session persistence failed: " + persistenceError_;
 }
 
 void Agent::saveStats() {
@@ -296,6 +320,11 @@ void Agent::saveStats() {
     m.goalBrief = goalBrief_;
     m.goalNext = goalNext_;
     m.goalProgress = goalProgress_;
+    m.lastStopReason = lastStopReason_;
+    m.lastStopDetail = lastStopDetail_;
+    m.lastStoppedAtMs = lastStoppedAtMs_;
+    m.originalRequest = originalRequest_;
+    m.latestRequest = latestRequest_;
     auto saved = sessionSaveMeta(opts_.sessionId, m);
     if (!saved.ok) persistenceError_ = saved.error;
     if (!opts_.parentUsageDir.empty()) {
@@ -631,8 +660,19 @@ std::string Agent::maybeCompact() {
     // reuse every resent token is full price, so compact earlier at 75%.
     long warm = stats_.cacheWindow.size() >= 3 && stats_.recentHit * 2 > stats_.recentMiss;
     long pct = warm ? 90 : 75;
-    if (used < max * pct / 100 && used + completionBudget() <= max) return "";
-    return compactNow();
+    bool hard = used + completionBudget() > max;
+    bool soft = opts_.workingContextTokens > 0 && used >= opts_.workingContextTokens;
+    if (!hard && !soft && used < max * pct / 100) return "";
+    long growth = std::max(2048L, std::min(max, opts_.workingContextTokens > 0 ? opts_.workingContextTokens : max) / 8);
+    if (!hard && compactAttemptTokens_ >= 0 &&
+        (used < compactAttemptTokens_ + growth || nowMs() < compactRetryAfterMs_)) return "";
+    int before = stats_.compactions;
+    std::string error = compactNow();
+    if (!error.empty() || stats_.compactions != before) {
+        compactAttemptTokens_ = contextUsed();
+        compactRetryAfterMs_ = error.empty() ? 0 : nowMs() + 30000;
+    }
+    return error;
 }
 
 size_t compactCutPoint(const std::vector<ChatMessage>& msgs, size_t keepLast) {
@@ -657,6 +697,15 @@ std::string Agent::compactNow() {
         for (const auto& tc : m.toolCalls)
             old += "(tool " + tc.name + " " + tc.argsJson + ")\n";
     }
+    // Keep the user's constraints verbatim in the resulting history. A
+    // summarizer may compress work evidence, but cannot silently rewrite the
+    // original request or drop the latest change of direction.
+    std::string constraints;
+    if (!goal_.empty() && goalStatus_ != GoalStatus::Completed)
+        constraints = "[Active goal]\n" + goal_ + "\n" + goalBrief_ + "\n";
+    else if (!originalRequest_.empty()) constraints = "[Original user request]\n" + originalRequest_ + "\n";
+    if (!latestRequest_.empty() && latestRequest_ != originalRequest_ && latestRequest_ != goal_)
+        constraints += "[Latest user direction]\n" + latestRequest_ + "\n";
     if (old.size() > 120000) old = old.substr(old.size() - 120000);
     ChatRequest req;
     req.model = opts_.fast.empty() ? opts_.model : opts_.fast[0];  // cheaper summarizer when set
@@ -669,7 +718,15 @@ std::string Agent::compactNow() {
     // Reserve prompt/schema overhead on small local context windows too.
     req.maxTokens = std::min(req.maxTokens, std::max(1L, req.model.context / 4));
     size_t maxChars = (size_t)std::max(1L, req.model.context - req.maxTokens - 512) * 3;
-    if (old.size() > maxChars) old = old.substr(old.size() - maxChars);
+    size_t anchorChars = std::min(constraints.size(), maxChars / 2);
+    // The previous summary carries intermediate requirement amendments and
+    // older verified evidence. Tail clipping must never silently remove it.
+    std::string previous = messages_.front().replay.at("compact_summary").asStr();
+    if (!previous.empty()) previous = "[Previous summary: preserve its requirements and verified findings]\n" + previous;
+    previous = previous.substr(0, std::min<size_t>(24000, (maxChars - anchorChars) / 2));
+    size_t recentChars = maxChars - anchorChars - previous.size();
+    if (old.size() > recentChars) old = old.substr(old.size() - recentChars);
+    old = constraints.substr(0, anchorChars) + previous + old;
     req.messages[0].content = old;
     ChatCallbacks cb;
     cb.cancel = opts_.cancel;
@@ -681,8 +738,9 @@ std::string Agent::compactNow() {
     if (!r.ok) return "compaction failed: " + r.error;
     if (!usageSeen) recordResponse(r.value, nowMs() - t0, &req.model, true);
     if (r.value.text.empty()) return "compaction returned an empty summary";
-    SessionEvent checkpoint{"compact", r.value.text, "", "", "", true};
-    checkpoint.replay = json::Object{{"cut", (long)keepFrom}};
+    std::string summary = constraints + "[Work evidence summary]\n" + r.value.text;
+    SessionEvent checkpoint{"compact", summary, "", "", "", true};
+    checkpoint.replay = json::Object{{"cut", (long)keepFrom}, {"summary", r.value.text.substr(0, 24000)}};
     ++stats_.compactions;
     stats_.lastPrompt = -1;
     lastEstimate_ = 0;
@@ -690,7 +748,8 @@ std::string Agent::compactNow() {
     if (!persistenceError_.empty()) return persistenceError_;
     std::vector<ChatMessage> kept(messages_.begin() + (long)keepFrom, messages_.end());
     messages_.clear();
-    messages_.push_back(ChatMessage{"user", "[Summary of earlier work]\n" + r.value.text, {}, ""});
+    messages_.push_back(ChatMessage{"user", "[Summary of earlier work]\n" + summary, {}, ""});
+    messages_.front().replay = json::Object{{"compact_summary", r.value.text.substr(0, 24000)}};
     messages_.insert(messages_.end(), kept.begin(), kept.end());
     turnStart_ = turnStart_ >= keepFrom ? turnStart_ - keepFrom + 1 : 0;
     if (opts_.onNotice) opts_.onNotice("context compacted (" + std::to_string(keepFrom) + " messages summarized)");
@@ -998,7 +1057,80 @@ std::string Agent::makeBrief(const std::string& request) {
     return "[brief — the harness's expert interpretation; the request above wins on conflict]\n" + trim(r.value.text);
 }
 
+namespace {
+std::string outcomeReason(const std::string& error) {
+    if (error.empty()) return "completed";
+    if (error == "cancelled") return "cancelled";
+    if (startsWith(error, "turn stopped after ")) return "round_limit";
+    if (startsWith(error, "goal not confirmed after ")) return "cycle_limit";
+    if (startsWith(error, "goal audit ")) return "audit_error";
+    if (startsWith(error, "session persistence failed:")) return "persistence_error";
+    if (startsWith(error, "context budget exhausted")) return "context_limit";
+    if (startsWith(error, "stopped: three identical")) return "repeated_tools";
+    return "error";
+}
+}  // namespace
+
+void Agent::recordOutcome(const std::string& scope, const std::string& reason, const std::string& detail) {
+    struct timespec wall{};
+    clock_gettime(CLOCK_REALTIME, &wall);
+    lastStoppedAtMs_ = (int64_t)wall.tv_sec * 1000 + wall.tv_nsec / 1000000;
+    lastStopReason_ = reason.substr(0, 64);
+    lastStopDetail_ = detail.substr(0, 1024);
+    if (!opts_.sessionId.empty() && persistenceError_.empty()) {
+        SessionEvent event{"outcome", lastStopDetail_, "", "", "", true};
+        event.replay = json::Object{{"scope", scope}, {"reason", lastStopReason_}, {"at_ms", lastStoppedAtMs_}};
+        auto saved = sessionAppend(opts_.sessionId, event);
+        if (!saved.ok) persistenceError_ = saved.error;
+    }
+    saveStats();
+}
+
 std::string Agent::runTurn(const std::string& userText) {
+    goalYielded_ = false;
+    turnStopReason_.clear();
+    turnMadeProgress_ = false;
+    if (goalStatus_ != GoalStatus::Active) {
+        if (originalRequest_.empty()) originalRequest_ = userText.substr(0, 65536);
+        latestRequest_ = userText.substr(0, 65536);
+    }
+    if (goalStatus_ != GoalStatus::Active) goalObservations_.clear();
+    std::string error, next = userText;
+    int chunks = opts_.autonomy && goalStatus_ != GoalStatus::Active ? 12 : 1;
+    try {
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            turnMadeProgress_ = false;
+            turnStopReason_.clear();
+            error = runTurnImpl(next, chunk > 0);
+            if (!startsWith(error, "turn stopped after ") || chunks == 1) break;
+            if (!turnMadeProgress_) {
+                error = "autonomous work paused: no new successful observations; change approach before resuming";
+                turnStopReason_ = "no_progress";
+                break;
+            }
+            if (chunk + 1 == chunks) {
+                error = "autonomous work paused after 12 progress checkpoints (work is saved)";
+                turnStopReason_ = "cycle_limit";
+                break;
+            }
+            recordOutcome("turn", "progress_checkpoint", error);
+            if (goalYield_ && goalYield_()) { goalYielded_ = true; error.clear(); break; }
+            if (opts_.onNotice) opts_.onNotice("progress checkpoint: continuing from saved work");
+            next = "[work checkpoint] Continue the latest user request from the existing history and current files. "
+                   "Use verified results already obtained; do not repeat completed work. Change approach for unresolved "
+                   "failures and finish once the requested work is verified.";
+        }
+    }
+    catch (const std::exception& e) { recordOutcome("turn", "exception", e.what()); throw; }
+    catch (...) { recordOutcome("turn", "exception", "unknown exception"); throw; }
+
+    std::string reason = error == "cancelled" ? "cancelled" :
+        goalYielded_ ? "yielded" : !turnStopReason_.empty() ? turnStopReason_ : outcomeReason(error);
+    recordOutcome("turn", reason, error);
+    return persistenceError_.empty() ? error : "session persistence failed: " + persistenceError_;
+}
+
+std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
     if (!persistenceError_.empty()) return "session persistence failed: " + persistenceError_;
     if (opts_.cancel && opts_.cancel->load()) return "cancelled";
     if (opts_.tools && !opts_.sessionId.empty()) {
@@ -1014,17 +1146,20 @@ std::string Agent::runTurn(const std::string& userText) {
                                              "turn stopped; inspect transcript for outcome");
         }
     } turnEnd{this};
-    turnStart_ = messages_.size();
+    if (!continuation) turnStart_ = messages_.size();
     turnNudges_ = turnGates_ = 0;
-    unverified_ = verifyNudged_ = reviewed_ = false;
+    verifyNudged_ = reviewed_ = false;
     hookNagged_.clear();
-    if (opts_.tools) opts_.tools->changedFiles.clear();
+    if (!continuation && goalStatus_ != GoalStatus::Active) {
+        unverified_ = false;
+        if (opts_.tools) opts_.tools->changedFiles.clear();
+    }
     std::string text = userText;
-    if (opts_.brief && goalStatus_ != GoalStatus::Active && needsBrief(userText)) {
+    if (!continuation && opts_.brief && goalStatus_ != GoalStatus::Active && needsBrief(userText)) {
         std::string b = makeBrief(userText);
         if (!b.empty()) text += "\n\n" + b;
     }
-    if (opts_.hint) {
+    if (!continuation && opts_.hint) {
         double cost = 0;
         std::string h = opts_.hint(userText, &cost);
         if (cost > 0) { stats_.sideCost += cost; stats_.cost += cost; stats_.costSeen = true; }
@@ -1036,6 +1171,9 @@ std::string Agent::runTurn(const std::string& userText) {
     int repeats = 0;
     std::map<std::string, int> failures;
     int emptyReplies = 0, lengthRetries = 0;
+    int progressAdvisories = 0;
+    int lastProgressRound = -1;
+    std::deque<std::string> recentTools;
 
     for (int round = 0; round < opts_.maxRounds; ++round) {
         if (opts_.cancel && opts_.cancel->load()) return "cancelled";
@@ -1070,7 +1208,7 @@ std::string Agent::runTurn(const std::string& userText) {
                      "in pieces (a skeleton first, then edit or append sections) and keep reasoning brief.");
             continue;
         }
-        if (!response.ok) return response.error;
+        if (!response.ok) { turnStopReason_ = "provider_error"; return response.error; }
         auto& calls = response.value.calls;
         auto& answer = response.value.text;
         std::set<std::string> ids;
@@ -1118,6 +1256,25 @@ std::string Agent::runTurn(const std::string& userText) {
                 unverified_ = true;
             std::string content = tr.output;
             if (!tr.ok) content = "TOOL FAILED: " + content;
+            std::string observation = trim(tr.output);
+            bool explicitFailure = observation.find("Traceback (most recent call last):") != std::string::npos ||
+                startsWith(observation, "FAIL ") || startsWith(observation, "FAILED (") ||
+                observation.find("\nFAIL ") != std::string::npos || observation.find("\nFAILED (") != std::string::npos ||
+                observation.find("\nok: False") != std::string::npos || startsWith(observation, "ok: False");
+            if (tr.ok && !explicitFailure && (observation.size() >= 24 || tc.name == "write" ||
+                                              tc.name == "edit" || tc.name == "bash")) {
+                size_t fingerprint = std::hash<std::string>{}(
+                    (tc.name == "write" || tc.name == "edit" || tc.name == "bash" ? tc.argsJson : "") + observation);
+                if (std::find(goalObservations_.begin(), goalObservations_.end(), fingerprint) == goalObservations_.end()) {
+                    turnMadeProgress_ = true;
+                    lastProgressRound = round;
+                    goalObservations_.push_back(fingerprint);
+                    if (goalObservations_.size() > 1024) goalObservations_.pop_front();
+                }
+            }
+            recentTools.push_back(tc.name + " " + tc.argsJson.substr(0, 120) + "\n" + content.substr(0, 200) +
+                (content.size() > 200 ? "\n[...]" + content.substr(content.size() > 300 ? content.size() - 100 : 200) : ""));
+            if (recentTools.size() > 8) recentTools.pop_front();
             signature += tc.name + tc.argsJson + content;  // before any overseer annotation
             // Watchmaker: an identical call failing again is a strategy problem.
             if (!tr.ok && ++failures[tc.name + tc.argsJson] == 3)
@@ -1149,16 +1306,40 @@ std::string Agent::runTurn(const std::string& userText) {
                                         " rounds in: if not converging, step back and simplify the approach.";
         saveStats();  // one sidecar update per batch, not per individual tool
         if (opts_.cancel && opts_.cancel->load()) return "cancelled";
+        if (goalYield_ && goalYield_()) {
+            goalYielded_ = true;
+            return "";
+        }
+        if (opts_.progress && progressAdvisories < 2 && (round + 1) % 12 == 0) {
+            std::string trace;
+            for (const auto& item : recentTools) trace += item + "\n\n";
+            double cost = 0;
+            std::string hint = opts_.progress(trace, &cost);
+            if (cost > 0) { stats_.cost += cost; stats_.sideCost += cost; stats_.costSeen = true; }
+            if (opts_.cancel && opts_.cancel->load()) return "cancelled";
+            if (!hint.empty()) {
+                ++progressAdvisories;
+                if (opts_.onNotice) opts_.onNotice("progress check: suggests changing approach after repeated failures");
+                pushUser("[progress check] " + hint.substr(0, 1600));
+            }
+        }
+        if (opts_.maxRounds >= 4 && round + 3 == opts_.maxRounds)
+            pushUser("[harness checkpoint] Two tool rounds remain in this work chunk. Consolidate verified progress and "
+                     "identify the precise remaining work. Finish only if the task is verified; otherwise continue "
+                     "with the next concrete action. Do not end with an incomplete status report or repeat completed work.");
         if (signature == previousBatch) ++repeats;
         else repeats = 0;
         previousBatch = std::move(signature);
         if (repeats >= 2) return "stopped: three identical tool batches made no progress";
     }
+    // Earlier discovery must not buy another full chunk after a long tail of
+    // failed repairs. Only evidence in the most recent twelve rounds renews it.
+    turnMadeProgress_ = lastProgressRound >= std::max(0, opts_.maxRounds - 12);
     return "turn stopped after " + std::to_string(opts_.maxRounds) +
            " tool rounds (partial work is saved; raise with --max-rounds N)";
 }
 
-std::string Agent::finishGoal(std::string error, bool completed) {
+std::string Agent::finishGoal(std::string error, bool completed, const std::string& reason) {
     if (completed && opts_.cancel && opts_.cancel->load()) {
         completed = false;
         error = "cancelled";
@@ -1168,7 +1349,10 @@ std::string Agent::finishGoal(std::string error, bool completed) {
         goalPhase_.clear();
         goalNext_.clear();
     }
-    saveStats();
+    std::string why = error == "cancelled" ? "cancelled" : !reason.empty() ? reason :
+        error.empty() ? (completed ? "completed" : "paused") :
+        error.substr(0, 1024) == lastStopDetail_ ? lastStopReason_ : outcomeReason(error);
+    recordOutcome("goal", why, error);
     if (!persistenceError_.empty()) return "session persistence failed: " + persistenceError_;
     return error;
 }
@@ -1186,7 +1370,8 @@ std::string Agent::clearGoal() {
     goalBrief_.clear();
     goalNext_.clear();
     goalProgress_.clear();
-    saveStats();
+    goalObservations_.clear();
+    recordOutcome("goal", "cleared", "");
     return persistenceError_.empty() ? "" : "session persistence failed: " + persistenceError_;
 }
 
@@ -1196,11 +1381,16 @@ std::string Agent::runGoal(const std::string& goal, int maxCycles) {
     if (goal.size() > 65536) return "goal exceeds 64 KiB limit";
     if (maxCycles < 1) return "goal cycle limit must be positive";
     goal_ = goal;
+    unverified_ = false;
+    if (opts_.tools) opts_.tools->changedFiles.clear();
+    if (originalRequest_.empty()) originalRequest_ = goal;
+    latestRequest_ = goal;
     goalStatus_ = GoalStatus::Active;
     goalPhase_ = "plan";
     goalBrief_.clear();
     goalNext_.clear();
     goalProgress_.clear();
+    goalObservations_.clear();
     return continueGoal(maxCycles);
 }
 
@@ -1211,6 +1401,7 @@ std::string Agent::resumeGoal(const std::string& followup, int maxCycles) {
     if (followup.size() > 16384) return "goal follow-up exceeds 16 KiB limit";
     goalStatus_ = GoalStatus::Active;
     if (!trim(followup).empty()) {
+        latestRequest_ = followup;
         // An explicit change of direction needs work, even if an earlier
         // interruption happened during the audit. Keep the original brief.
         goalPhase_ = "work";
@@ -1229,7 +1420,8 @@ std::string Agent::continueGoal(int maxCycles) {
         ~PauseOnExit() noexcept {
             if (agent->goalStatus_ == GoalStatus::Active) {
                 agent->goalStatus_ = GoalStatus::Paused;
-                try { agent->saveStats(); } catch (...) {}
+                try { agent->recordOutcome("goal", "exception", agent->lastStopReason_ == "exception" ?
+                    agent->lastStopDetail_ : "goal interrupted by an exception"); } catch (...) {}
             }
         }
     } pauseOnExit{this};
@@ -1273,50 +1465,56 @@ std::string Agent::continueGoal(int maxCycles) {
                         goalProgress_.substr(goalProgress_.size() - (30000 - omitted.size()));
                 }
             }
-            if (!err.empty()) return finishGoal(err);
+            if (!err.empty()) {
+                if (lastStopReason_ != "round_limit") return finishGoal(err);
+                if (!turnMadeProgress_)
+                    return finishGoal("goal paused: work chunk made no new successful observations; change approach before resuming",
+                                      false, "no_progress");
+                // A goal's round limit is a work checkpoint, not an implicit
+                // request for the user to type 'go on'. The existing cycle
+                // budget bounds continuation, and completion still needs audit.
+                goalNext_ = continuation() + "\n[Work checkpoint] Continue the remaining work from the saved history; "
+                    "use the verified results already obtained and change approach for unresolved failures.";
+                recordOutcome("goal", "progress_checkpoint", err);
+                if (goalYield_ && goalYield_()) return finishGoal("", false, "yielded");
+                if (opts_.onNotice && cycle + 1 < maxCycles)
+                    opts_.onNotice("goal progress checkpoint: continuing from saved work");
+                continue;
+            }
+            if (goalYielded_) return finishGoal("", false, "yielded");
             goalPhase_ = "audit";
             saveStats();
         }
         if (cancelled()) return finishGoal("cancelled");
         if (!persistenceError_.empty()) return finishGoal("session persistence failed: " + persistenceError_);
-        if (goalYield_ && goalYield_()) return finishGoal("");
-        // Persisting the bounded digest lets a resumed audit inspect the same
-        // evidence without re-running completed work or relying on stale indexes.
-        json::Value evidence = json::Object{
-            {"input", json::Array{json::Object{{"role", "user"}, {"content", goal_ + "\n" + goalBrief_}}}},
-            {"output", json::Object{{"role", "assistant"}, {"content", goalProgress_}}}};
-        auto span = ask(evidence,
-                        {{"met", "Has the assistant fully achieved this goal, with verification evidence? Goal: " + goal_.substr(0, 1500)}},
-                        true);
-        if (cancelled()) return finishGoal("cancelled");
-        if (goalYield_ && goalYield_()) return finishGoal("");
-        if (span.count("met") && span["met"] >= 0.9) {
-            if (opts_.onNotice) opts_.onNotice("goal met (decision audit after " + std::to_string(cycle + 1) + " cycle(s))");
-            return finishGoal("", true);
-        }
+        if (goalYield_ && goalYield_()) return finishGoal("", false, "yielded");
+        // A small decision model can suggest a change of strategy, but may
+        // never certify completion. The evidence auditor checks the full goal.
         auto r = sideRequest(auditor,
                              "You audit an autonomous agent. Decide if the GOAL is fully achieved, judging only by "
                              "evidence in the transcript digest (commands run, results, changes). First line: DONE or "
                              "CONTINUE. If CONTINUE, list precisely what remains.",
                              "GOAL: " + goal_ + "\n" + goalBrief_ + "\n\nDIGEST:\n" + goalProgress_, 800);
         if (cancelled()) return finishGoal("cancelled");
-        if (goalYield_ && goalYield_()) return finishGoal("");
+        if (goalYield_ && goalYield_()) return finishGoal("", false, "yielded");
         if (!r.ok) return finishGoal("goal audit failed: " + r.error);
         std::string verdict = trim(r.value.text);
         std::string first = toLower(trim(verdict.substr(0, verdict.find('\n'))));
         if (first == "done") {
-            if (opts_.onNotice) opts_.onNotice("goal met (audited after " + std::to_string(cycle + 1) + " cycle(s))");
-            return finishGoal("", true);
+            std::string error = finishGoal("", true);
+            if (error.empty() && goalStatus_ == GoalStatus::Completed && opts_.onNotice)
+                opts_.onNotice("goal met (audited after " + std::to_string(cycle + 1) + " cycle(s))");
+            return error;
         }
         if (first != "continue" && !startsWith(first, "continue:"))
             return finishGoal("goal audit returned no valid DONE/CONTINUE verdict; goal paused");
         goalPhase_ = "work";
         goalNext_ = continuation() + "\n[goal audit] Remaining work:\n" + verdict.substr(0, 3000);
         saveStats();
-        if (goalYield_ && goalYield_()) return finishGoal("");
+        if (goalYield_ && goalYield_()) return finishGoal("", false, "yielded");
         if (cycle + 1 < maxCycles && opts_.onNotice) opts_.onNotice("goal audit: not yet — continuing");
     }
-    return finishGoal("goal not confirmed after " + std::to_string(maxCycles) + " audit cycles (goal paused; work is saved)");
+    return finishGoal("goal not confirmed after " + std::to_string(maxCycles) + " work/audit checkpoints (goal paused; work is saved)");
 }
 
 }  // namespace pocket

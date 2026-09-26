@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <thread>
@@ -16,6 +17,10 @@ using namespace pocket;
 using namespace pocket::test;
 
 namespace {
+const std::string kCurrentSession = "20260927-030000-current";
+const std::string kPreviousSession = "20260927-020000-previous";
+const std::string kLockedSession = "20260927-040000-locked";
+const std::string kForeignSession = "20260927-050000-other-workspace";
 // A real PTY exercises terminal ownership and raw-mode input without network
 // requests or a terminal framework. A pipe holds the first mock response open.
 struct TuiFixture {
@@ -24,7 +29,8 @@ struct TuiFixture {
     pid_t child = -1;
     std::string output;
     bool plain = false;
-    explicit TuiFixture(int width = 80, int height = 24, bool lineMode = false, bool pausedGoal = false) : plain(lineMode) {
+    explicit TuiFixture(int width = 80, int height = 24, bool lineMode = false, bool pausedGoal = false,
+                        bool sessionMode = false, bool attachedImage = false, bool heldAudit = false) : plain(lineMode) {
         master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
         if (master < 0 || grantpt(master) || unlockpt(master)) return;
         char* path = ptsname(master);
@@ -63,16 +69,42 @@ struct TuiFixture {
             AgentOpts ao;
             ao.model = resolveModel(cfg, "glm").value;
             ao.tools = &env;
+            int currentLease = -1, lockedLease = -1, targetLease = -1;
+            if (sessionMode) {
+                ensureDir(sessionDir(), 0700);
+                for (const auto& id : {kCurrentSession, kPreviousSession, kLockedSession, kForeignSession}) {
+                    atomicWriteFile(sessionDir() + "/" + id + ".jsonl", "", 0600);
+                    SessionMeta meta;
+                    meta.workspace = id == kForeignSession ? home + "/elsewhere" : home;
+                    meta.modelSpec = ao.model.spec;
+                    sessionSaveMeta(id, meta);
+                    if (id != kCurrentSession) {
+                        sessionAppend(id, {"user", "old question for " + id, "", "", "", true});
+                        sessionAppend(id, {"assistant", "old answer", "", "", "", true});
+                    }
+                }
+                currentLease = sessionLock(kCurrentSession).value;
+                lockedLease = sessionLock(kLockedSession).value;
+                ao.sessionId = env.sessionId = kCurrentSession;
+            }
             bool holdGoalWork = false;
             ao.request = [&](const ChatRequest& req, const ChatCallbacks& cb) -> Result<ChatResponse> {
-                std::string user = req.messages.back().content;
+                const ChatMessage* latest = &req.messages.back();
+                for (auto it = req.messages.rbegin(); it != req.messages.rend(); ++it)
+                    if (it->role == "user" && !startsWith(it->content, "[workspace activity")) { latest = &*it; break; }
+                std::string user = latest->content;
+                if (user == "image check" && cb.onToken)
+                    cb.onToken("IMAGE_COUNT:" + std::to_string(latest->images.size()) + "\n");
                 if (req.system.find("You are the planning council") != std::string::npos)
                     holdGoalWork = user.find("REQUEST:\nhold") != std::string::npos;
                 bool heldGoal = req.stream && holdGoalWork && user.find("[goal") != std::string::npos;
                 if (heldGoal) holdGoalWork = false;
-                if (user == "first" || user == "delayed approval" || heldGoal) {
+                bool auditGate = heldAudit && req.system.find("You audit an autonomous agent") != std::string::npos;
+                if (user == "first" || user == "delayed approval" || user == "viewportstream" || heldGoal || auditGate) {
                     if (env.onEvent) env.onEvent("judge: local LM ran successfully (fixture)");
-                    if (cb.onToken) cb.onToken(heldGoal ? "GOAL_RUNNING\n" : "FIRST_RUNNING\n");
+                    if (auditGate && env.onEvent) env.onEvent("AUDIT_READY");
+                    if (!auditGate && cb.onToken) cb.onToken(user == "viewportstream" ? std::string(600, 'z') + "TAIL_READY" :
+                                              heldGoal ? "GOAL_RUNNING\n" : "FIRST_RUNNING\n");
                     for (;;) {
                         if (cb.cancel && cb.cancel->load()) return Result<ChatResponse>::Err("cancelled");
                         pollfd ready{gate[0], POLLIN, 0};
@@ -102,6 +134,11 @@ struct TuiFixture {
                 return Result<ChatResponse>::Ok(reply);
             };
             Agent agent(ao);
+            if (attachedImage) {
+                std::string imagePath = home + "/pending.png";
+                atomicWriteFile(imagePath, std::string("\x89PNG\r\n\x1a\nPAYLOAD", 15), 0600);
+                if (!agent.attachImage(imagePath).empty()) _exit(94);
+            }
             if (pausedGoal) {
                 std::atomic<bool> stopped{true};
                 agent.setCancel(&stopped);
@@ -114,8 +151,31 @@ struct TuiFixture {
             opts.cfg = &cfg;
             opts.model = ao.model;
             opts.workspace = home;
-            int rc = plain ? lineRun(opts) : tuiRun(opts);
-            if (env.cancel || env.onEvent || env.onToolDone || env.askApproval) rc = 91;
+            opts.sessionId = ao.sessionId;
+            if (sessionMode) opts.prepareResume = [&](const std::string& id) {
+                auto resolved = sessionResolve(id, home);
+                if (!resolved.ok) return resolved.error;
+                auto lease = sessionLock(id);
+                if (!lease.ok) return lease.error;
+                targetLease = lease.value;
+                return std::string();
+            };
+            int rc;
+            for (;;) {
+                rc = plain ? lineRun(opts) : tuiRun(opts);
+                if (env.cancel || env.onEvent || env.onToolDone || env.askApproval) { rc = 91; break; }
+                if (rc != kTuiResume) break;
+                if (targetLease < 0) { rc = 92; break; }
+                close(currentLease);
+                currentLease = targetLease;
+                targetLease = -1;
+                ao.sessionId = env.sessionId = opts.sessionId = opts.resumeId;
+                agent = Agent(ao);
+                if (!agent.restore(opts.sessionId).ok) { rc = 93; break; }
+            }
+            if (currentLease >= 0) close(currentLease);
+            if (lockedLease >= 0) close(lockedLease);
+            if (targetLease >= 0) close(targetLease);
             _exit(rc);
         }
         close(slave);
@@ -340,7 +400,7 @@ TEST(tui_Goal_Controls_While_Busy) {
     CHECK(t.send("/goal resume\r"));
     CHECK(t.waitFor("goal met"));
     CHECK(t.send("/goal status\r"));
-    CHECK(t.waitFor("goal: completed"));
+    if (!t.waitFor("goal: completed")) return "goal status after completion notice: " + sanitizeTerminal(t.output);
     CHECK(t.waitFor("goal completed"));
     t.output.clear();
     CHECK(t.send("/goal hold\r"));
@@ -350,6 +410,30 @@ TEST(tui_Goal_Controls_While_Busy) {
     CHECK(t.waitFor("(paused;"));
     CHECK(t.send("/goal status\r"));
     CHECK(t.waitFor("goal: none"));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Goal_Completion_Notice_Follows_Saved_State) {
+    TuiFixture t(80, 24, false, false, true, false, true);
+    CHECK(t.ready());
+    CHECK(t.send("/goal finish once\r"));
+    CHECK(t.waitFor("AUDIT_READY"));
+    struct TranscriptLock {
+        int fd = -1;
+        ~TranscriptLock() { if (fd >= 0) close(fd); }
+    } transcript;
+    transcript.fd = open((t.home + "/.local/share/pocketharness/sessions/" + kCurrentSession + ".jsonl").c_str(), O_RDWR | O_CLOEXEC);
+    CHECK(transcript.fd >= 0);
+    CHECK(flock(transcript.fd, LOCK_EX) == 0);
+    t.finishFirst();
+    CHECK(t.send("/goal status\r"));
+    CHECK(t.waitFor("goal: active"));  // UI still pumps while final persistence is held
+    CHECK(!t.waitFor("goal met", 150));
+    CHECK(flock(transcript.fd, LOCK_UN) == 0);
+    CHECK(t.waitFor("goal met"));
+    CHECK(t.send("/goal status\r"));
+    if (!t.waitFor("goal: completed")) return "goal status after committed completion: " + sanitizeTerminal(t.output);
     CHECK(t.quit());
     return "";
 }
@@ -566,6 +650,137 @@ TEST(tui_Queued_Picker_Overflow_Preserves_Paste_Boundary) {
     CHECK(t.waitFor("REPLY:\"after overflow\""));
     CHECK(t.quit());
     }
+    return "";
+}
+
+TEST(tui_Session_Identity_And_Resume_Last) {
+    TuiFixture t(80, 24, false, false, true);
+    CHECK(t.ready());
+    CHECK(t.waitFor("session " + kCurrentSession));
+    CHECK(t.send("/resume last\r"));
+    CHECK(t.waitFor("continuing session: " + kPreviousSession));
+    CHECK(t.waitFor("session " + kPreviousSession));
+    CHECK(t.send("/session\r"));
+    CHECK(t.waitFor("messages: 2"));
+    CHECK(t.send("follow up\r"));
+    CHECK(t.waitFor("REPLY:\"follow up\""));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Session_Picker_And_Failed_Resume_Keep_Current) {
+    TuiFixture t(80, 24, false, false, true);
+    CHECK(t.ready());
+    CHECK(t.send("/sessions\r"));
+    CHECK(t.waitFor("Resume a session"));
+    CHECK(t.waitFor("active (unavailable)"));
+    CHECK(t.output.find(kForeignSession) == std::string::npos);
+    CHECK(t.send("\033"));
+    CHECK(t.waitFor("session unchanged"));
+    CHECK(t.send("/resume " + kCurrentSession + "\r"));
+    CHECK(t.waitFor("already in session"));
+    CHECK(t.send("/resume missing\r"));
+    CHECK(t.waitFor("session not found: missing"));
+    CHECK(t.send("/resume " + kForeignSession + "\r"));
+    CHECK(t.waitFor("session belongs to workspace"));
+    CHECK(t.send("/resume " + kLockedSession + "\r"));
+    CHECK(t.waitFor("is active in another process"));
+    CHECK(t.send("/sessions\rprevious\r"));
+    CHECK(t.waitFor("continuing session: " + kPreviousSession));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Session_Resume_Does_Not_Migrate_Queued_Input) {
+    TuiFixture t(80, 24, false, false, true);
+    CHECK(t.ready());
+    CHECK(t.send("first\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    CHECK(t.send("/resume last\r"));
+    CHECK(t.waitFor("pause active work with Esc"));
+    CHECK(t.send("held follow-up\r"));
+    CHECK(t.waitFor("queued 1"));
+    CHECK(t.send("\033"));
+    CHECK(t.waitFor("(paused;"));
+    CHECK(t.send("/resume last\r"));
+    CHECK(t.waitFor("finish or clear your draft and held follow-ups"));
+    CHECK(t.output.find("continuing session:") == std::string::npos);
+    CHECK(t.send("/queue clear\r"));
+    CHECK(t.waitFor("queue: 0 held"));
+    CHECK(t.send("/resume last\rtypeahead stays here\r"));
+    CHECK(t.waitFor("finish or clear buffered input"));
+    CHECK(t.waitFor("REPLY:\"typeahead stays here\""));
+    // Wait for a local command to confirm the worker has handed back stdin.
+    CHECK(t.send("/session\r"));
+    CHECK(t.waitFor("session: " + kCurrentSession));
+    CHECK(t.send("/resume last\r"));
+    CHECK(t.waitFor("continuing session: " + kPreviousSession));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Line_Mode_Resume_Uses_Same_Handoff) {
+    TuiFixture t(80, 24, true, false, true);
+    CHECK(t.ready());
+    // Cooked/pipe input is sequential: lines after /resume intentionally run
+    // in the chosen session, including lines already buffered by std::cin.
+    CHECK(t.send("/resume last\n/session\nline followup\n"));
+    CHECK(t.waitFor("continuing session: " + kPreviousSession));
+    CHECK(t.waitFor("messages: 2"));
+    CHECK(t.waitFor("REPLY:\"line followup\""));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Session_Resume_Preserves_Unsent_Images) {
+    TuiFixture t(80, 24, false, false, true, true);
+    CHECK(t.ready());
+    CHECK(t.send("/resume last\r"));
+    CHECK(t.waitFor("send attached images before switching"));
+    CHECK(t.output.find("continuing session:") == std::string::npos);
+    CHECK(t.send("image check\r"));
+    CHECK(t.waitFor("IMAGE_COUNT:1"));
+    CHECK(t.send("/session\r"));
+    CHECK(t.waitFor("session: " + kCurrentSession));
+    CHECK(t.send("/resume last\r"));
+    CHECK(t.waitFor("continuing session: " + kPreviousSession));
+    CHECK(t.send("image check\r"));
+    CHECK(t.waitFor("IMAGE_COUNT:0"));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Session_Footer_Limits_Streaming_To_Transcript_Region) {
+    TuiFixture t(20, 24, false, false, true);
+    CHECK(t.ready());
+    t.output.clear();
+    CHECK(t.send("viewportstream\r"));
+    CHECK(t.waitFor("TAIL_READY"));  // force one tail repaint after it is visible
+    t.finishFirst();
+    CHECK(t.waitFor("REPLY:\"viewportstream\""));
+    const std::string regionPrefix = "\033[1;";
+    const std::string clearPrevious = "\033[A\r\033[K";
+    size_t region = 24, most = 0;
+    for (size_t at = 0; at < t.output.size();) {
+        if (t.output.compare(at, regionPrefix.size(), regionPrefix) == 0) {
+            size_t end = t.output.find('r', at + regionPrefix.size());
+            if (end != std::string::npos) {
+                std::string rows = t.output.substr(at + regionPrefix.size(), end - at - regionPrefix.size());
+                if (rows.find_first_not_of("0123456789") == std::string::npos)
+                    region = std::min(region, (size_t)strtoul(rows.c_str(), nullptr, 10));
+            }
+        }
+        size_t count = 0;
+        while (t.output.compare(at, clearPrevious.size(), clearPrevious) == 0) {
+            ++count;
+            at += clearPrevious.size();
+        }
+        most = std::max(most, count);
+        if (!count) ++at;
+    }
+    CHECK(region < 16);  // identity/model/status wrap into a substantial footer
+    CHECK(most < region);
+    CHECK(t.quit());
     return "";
 }
 

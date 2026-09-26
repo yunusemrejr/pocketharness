@@ -78,6 +78,24 @@ TEST(tools_Read_Write_Edit) {
     return "";
 }
 
+TEST(tools_Private_Scratch_Uses_The_Same_Path_Across_Native_Tools) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(authorityAddWriteRoot(f.auth, f.tmp).ok);
+    CHECK(runTool(f.env, "write", R"({"path":"$TMPDIR/parts/code.js","content":"one"})").ok);
+    CHECK(readFileBounded(f.tmp + "/parts/code.js", 100).value == "one");
+    CHECK(runTool(f.env, "edit", R"({"path":"$TMPDIR/parts/code.js","old_text":"one","new_text":"two"})").ok);
+    auto read = runTool(f.env, "read", R"({"path":"$TMPDIR/parts/code.js"})");
+    CHECK(read.ok && read.output.find("two") != std::string::npos);
+    CHECK(f.env.changedFiles.empty());
+    CHECK(!runTool(f.env, "write", R"({"path":"$TMPDIR/../other-session.txt","content":"no"})").ok);
+    CHECK(access((f.base + "/other-session.txt").c_str(), F_OK) != 0);
+    CHECK(ensureDir(f.base + "/peer", 0700).ok);
+    CHECK(symlink((f.base + "/peer").c_str(), (f.tmp + "/escape").c_str()) == 0);
+    CHECK(!runTool(f.env, "write", R"({"path":"$TMPDIR/escape/no.txt","content":"no"})").ok);
+    return "";
+}
+
 TEST(tools_Bash_Capture_And_Guard) {
     ToolFixture f;
     CHECK(f.ok);

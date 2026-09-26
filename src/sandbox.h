@@ -46,6 +46,11 @@ void authorityClose(Authority& a);
 // Grant one more read root after init (the session tmp dir, created after
 // the authority). Dedupes; unsafe mode skips fds exactly like init.
 VoidResult authorityAddReadRoot(Authority& a, const std::string& path);
+VoidResult authorityAddWriteRoot(Authority& a, const std::string& path);
+
+// Versioned Node installations already on the user's PATH. Grants only the
+// selected runtime tree, never the containing home or manager configuration.
+std::vector<std::string> discoverRuntimeRoots(const char* path, const std::string& home);
 
 // Contained file operations for the native tools.
 Result<int> boxOpenRead(const Authority& a, const std::string& path);  // owned fd, regular files only
@@ -80,13 +85,14 @@ void childEnterSandbox(const ChildSpec& spec);
 // via explicit expose_env passthrough.
 std::vector<std::string> buildChildEnv(const std::vector<std::string>& exposeEnv,
                                        const std::string& workspace,
-                                       const std::string& tmpdir, const std::string& home);
+                                       const std::string& tmpdir, const std::string& home,
+                                       const Authority* auth = nullptr);
 
 // Keep only PATH entries the sandbox can actually execute (Landlock would
 // deny the rest with a confusing exit 126). Empty entries mean the child
 // cwd, i.e. the workspace. Exposed for tests.
 std::string filterChildPath(const char* path, const std::string& workspace,
-                            const std::string& tmpdir);
+                            const std::string& tmpdir, const Authority* auth = nullptr);
 
 // True when an env name looks credential-like (defense in depth; the
 // allowlist already drops everything not explicitly permitted).

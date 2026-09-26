@@ -345,6 +345,26 @@ TEST(provider_Reasoning_Replay_And_Grouped_Results) {
     return "";
 }
 
+TEST(provider_DeepSeek_Tool_History_Preserves_Reasoning_Across_User_Turns) {
+    ChatRequest req;
+    req.model = mkModel("deepseek");
+    req.thinking = "high";
+    req.tools = {{"read", "read a file", R"({"type":"object"})"}};
+    ChatMessage tool{"assistant", "", {{"one", "read", "{}"}}, ""};
+    ChatMessage final{"assistant", "first answer", {}, ""};
+    const std::string tag = req.model.provider.name + ":" + req.model.model;
+    tool.replay = json::Object{{"model", tag}, {"reasoning_content", "tool reasoning"}};
+    final.replay = json::Object{{"model", tag}, {"reasoning_content", "answer reasoning"}};
+    req.messages = {{"user", "first request", {}, ""}, tool,
+                    {"tool", "result", {}, "one"}, final, {"user", "next request", {}, ""}};
+    // DeepSeek's thinking-mode contract requires all prior reasoning while
+    // tools are present, including final answers before a new user turn.
+    const auto body = buildOpenAiBody(req);
+    CHECK(body.at("messages").at(1).at("reasoning_content").asStr() == "tool reasoning");
+    CHECK(body.at("messages").at(3).at("reasoning_content").asStr() == "answer reasoning");
+    return "";
+}
+
 TEST(provider_Sse_Multiline_And_Key_Injection) {
     std::string carry;
     CHECK(sseSplit("data: {\"x\":\n", carry).empty());

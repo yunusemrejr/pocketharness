@@ -226,6 +226,52 @@ VoidResult authorityAddReadRoot(Authority& a, const std::string& path) {
     return VoidResult::Ok();
 }
 
+VoidResult authorityAddWriteRoot(Authority& a, const std::string& path) {
+    auto c = canonicalDir(expandHome(path));
+    if (!c.ok) return VoidResult::Err(c.error);
+    if (std::find(a.writeRoots.begin(), a.writeRoots.end(), c.value) != a.writeRoots.end())
+        return VoidResult::Ok();
+    int fd = a.unsafe ? -1 : openRootFd(c.value);
+    if (!a.unsafe && fd < 0) return VoidResult::Err("cannot open root fd for " + c.value);
+    auto read = authorityAddReadRoot(a, c.value);
+    if (!read.ok) { if (fd >= 0) close(fd); return read; }
+    if (!a.unsafe) a.writeFds.push_back(fd);
+    a.writeRoots.push_back(c.value);
+    return VoidResult::Ok();
+}
+
+std::vector<std::string> discoverRuntimeRoots(const char* path, const std::string& home) {
+    std::vector<std::string> roots;
+    auto owner = canonicalDir(home);
+    if (!owner.ok) return roots;
+    const char* managers[] = {"/.nvm/versions/node/", "/.volta/tools/image/node/",
+        "/.local/share/fnm/node-versions/", "/.local/share/mise/installs/node/", "/.asdf/installs/nodejs/"};
+    std::string paths = path ? path : "";
+    std::replace(paths.begin(), paths.end(), ':', '\n');
+    for (const auto& entry : splitLines(paths)) {
+        if (entry.empty() || entry[0] != '/') continue;
+        auto bin = canonicalDir(entry);
+        if (!bin.ok || !endsWith(bin.value, "/bin")) continue;
+        std::string root = bin.value.substr(0, bin.value.size() - 4);
+        for (const char* manager : managers) {
+            std::string prefix = owner.value + manager;
+            if (!startsWith(root, prefix)) continue;
+            std::string version = root.substr(prefix.size());
+            if (std::string(manager).find("fnm") != std::string::npos) {
+                if (!endsWith(version, "/installation")) continue;
+                version.resize(version.size() - std::string("/installation").size());
+            }
+            if (version.empty() || version.find('/') != std::string::npos) continue;
+            std::string node = bin.value + "/node";
+            struct stat st{};
+            if (lstat(node.c_str(), &st) || !S_ISREG(st.st_mode) || access(node.c_str(), X_OK)) continue;
+            if (std::find(roots.begin(), roots.end(), root) == roots.end()) roots.push_back(root);
+            break;
+        }
+    }
+    return roots;
+}
+
 // ---------------------------------------------------------------------------
 // Contained opens
 // ---------------------------------------------------------------------------
@@ -984,11 +1030,15 @@ void copyIfSet(std::vector<std::string>& out, const char* name) {
 }  // namespace
 
 std::string filterChildPath(const char* path, const std::string& workspace,
-                            const std::string& tmpdir) {
+                            const std::string& tmpdir, const Authority* auth) {
     const char* roots[] = {"/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/snap", nullptr};
     auto under = [&](const std::string& e) {
+        if (auth && auth->unsafe) return true;
         if (e == workspace || e == tmpdir) return true;
         if (startsWith(e, workspace + "/") || startsWith(e, tmpdir + "/")) return true;
+        if (auth)
+            for (const auto& root : auth->readRoots)
+                if (e == root || startsWith(e, root + "/")) return true;
         for (const char** r = roots; *r; ++r) {
             if (e == *r || startsWith(e, std::string(*r) + "/")) return true;
         }
@@ -1001,7 +1051,13 @@ std::string filterChildPath(const char* path, const std::string& workspace,
         std::string e = rest.substr(0, c);
         while (e.size() > 1 && e.back() == '/') e.pop_back();
         if (e.empty()) e = workspace;  // empty entry = child cwd
-        if (!e.empty() && e[0] == '/' && under(e)) out += (out.empty() ? "" : ":") + e;
+        if (!e.empty() && e[0] == '/') {
+            // Canonicalize existing entries before checking grants; a .. or
+            // symlink must not make an unrelated home directory look allowed.
+            auto real = canonicalDir(e);
+            if (real.ok) e = real.value;
+            if (under(e)) out += (out.empty() ? "" : ":") + e;
+        }
         if (c == std::string::npos) break;
         rest = rest.substr(c + 1);
     }
@@ -1011,7 +1067,7 @@ std::string filterChildPath(const char* path, const std::string& workspace,
 
 std::vector<std::string> buildChildEnv(const std::vector<std::string>& exposeEnv,
                                        const std::string& workspace, const std::string& tmpdir,
-                                       const std::string& home) {
+                                       const std::string& home, const Authority* auth) {
     std::vector<std::string> env;
     // Fixed allowlist of ordinary tool variables.
     static const char* kKeep[] = {"PATH", "USER",       "LOGNAME", "LANG",     "LANGUAGE",
@@ -1054,7 +1110,7 @@ std::vector<std::string> buildChildEnv(const std::vector<std::string>& exposeEnv
     set("HOME=" + home);
     set("SHELL=/bin/bash");
     // $TMPDIR/bin holds the session's staged copy of pocket (kit + recursion).
-    set("PATH=" + tmpdir + "/bin:" + filterChildPath(getenv("PATH"), workspace, tmpdir));
+    set("PATH=" + tmpdir + "/bin:" + filterChildPath(getenv("PATH"), workspace, tmpdir, auth));
     // Marker only (lets scripts detect the harness). Everything else a
     // recursive pocket needs lives in $TMPDIR/pocket.parent, never here.
     set("POCKETHARNESS=1");

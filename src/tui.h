@@ -4,6 +4,7 @@
 // prompt-embedded status (model, thinking, context %).
 #pragma once
 
+#include <functional>
 #include <string>
 
 #include "agent.h"
@@ -20,12 +21,19 @@ struct TuiOpts {
     std::string thinking = "off";
     std::string workspace;
     std::string sessionId;
+    // Idle-only handoff: main validates/reserves the target, then reuses its
+    // startup/restore path after the UI has restored terminal ownership.
+    std::function<std::string(const std::string&)> prepareResume;
+    std::string resumeId;  // set only after prepareResume succeeds
     std::string systemSource;  // "" = built-in base prompt
     bool unsafe = false;
     bool allowNet = false;
 };
 
-// Full interactive session. Returns process exit code.
+inline constexpr int kTuiResume = 75;
+
+// Full interactive session. Returns process exit code, or kTuiResume with
+// opts.resumeId set after the terminal and callbacks have been restored.
 int tuiRun(TuiOpts& opts);
 
 // Plain line-based fallback when stdin/stdout are not TTYs.

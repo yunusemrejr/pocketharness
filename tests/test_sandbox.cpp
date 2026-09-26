@@ -158,6 +158,50 @@ TEST(sandbox_Env_Sanitized) {
     return "";
 }
 
+TEST(sandbox_Installed_Node_Runtime_Is_Usable_Without_Exposing_Home) {
+    CHECK(setup().empty());
+    std::string home = g_outside + "/runtime-home";
+    std::string runtime = home + "/.nvm/versions/node/v24.test";
+    CHECK(ensureDir(runtime + "/bin", 0700).ok);
+    CHECK(ensureDir(runtime + "/lib", 0700).ok);
+    CHECK(atomicWriteFile(runtime + "/lib/value", "runtime-present", 0600).ok);
+    CHECK(atomicWriteFile(runtime + "/bin/node", "#!/bin/sh\ncat \"$(dirname \"$0\")/../lib/value\"\n", 0700).ok);
+    CHECK(atomicWriteFile(home + "/private-token", "must-stay-private", 0600).ok);
+    std::string path = runtime + "/bin:/usr/bin:/bin";
+    auto roots = discoverRuntimeRoots(path.c_str(), home);
+    CHECK(roots == std::vector<std::string>{runtime});
+    CHECK(discoverRuntimeRoots((home + ":/usr/bin").c_str(), home).empty());
+    CHECK(symlink(home.c_str(), (home + "/.nvm/versions/node/escape").c_str()) == 0);
+    CHECK(discoverRuntimeRoots((home + "/.nvm/versions/node/escape/bin").c_str(), home).empty());
+    auto granted = authorityInit(g_ws, roots, {}, false);
+    CHECK(granted.ok);
+    struct Close { Authority& a; ~Close() { authorityClose(a); } } close{granted.value};
+    CHECK(filterChildPath(path.c_str(), g_ws, "/tmp/task", &granted.value).find(runtime + "/bin") != std::string::npos);
+    CHECK(filterChildPath(path.c_str(), g_ws, "/tmp/task").find(runtime + "/bin") == std::string::npos);
+    CHECK(!boxRead(granted.value, home + "/private-token", 100).ok);
+    CHECK(!boxWrite(granted.value, runtime + "/lib/value", "modified").ok);
+    if (sandboxCaps().landlock) {
+        std::string tmp = makeTempDir("pocket-runtime");
+        struct Cleanup { std::string p; ~Cleanup() { rmRf(p); } } cleanup{tmp};
+        CHECK(ensureDir(tmp + "/home", 0700).ok);
+        EnvGuard runtimePath("PATH", path);
+        ChildSpec cs;
+        cs.auth = &granted.value; cs.workspace = g_ws; cs.sessionTmp = tmp;
+        SpawnOpts o;
+        o.exe = "/bin/bash";
+        o.argv = {"bash", "--noprofile", "--norc", "-c", "node"};
+        o.env = buildChildEnv({}, g_ws, tmp, tmp + "/home", &granted.value);
+        o.workdir = g_ws;
+        o.childSetup = [cs] { childEnterSandbox(cs); };
+        auto ran = spawn(o);
+        CHECK(ran.ok && ran.exitCode == 0 && ran.out == "runtime-present");
+        o.argv.back() = "cat '" + home + "/private-token'";
+        auto denied = spawn(o);
+        CHECK(denied.exitCode != 0 && denied.out.find("must-stay-private") == std::string::npos);
+    }
+    return "";
+}
+
 TEST(sandbox_Guard) {
     struct Case {
         const char* cmd;

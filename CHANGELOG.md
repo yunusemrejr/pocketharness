@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.2
+
+- Deliver queued follow-ups after the current tool batch, including during long
+  autonomous turns. Preserve goal progress when yielding to new input.
+- Treat the round limit as a progress checkpoint for autonomous prompts and
+  goals. Continue useful work within a bounded checkpoint budget; pause repeated
+  or unproductive work with a saved reason. Goal completion always requires the
+  evidence auditor, not a small classifier's verdict.
+- Compact growing context at a configurable 96,000-token working target, retain
+  original and latest user requirements, preserve complete reasoning/tool pairs,
+  and back off after failed summaries. Keep DeepSeek's required reasoning replay.
+- Add a bounded, cached local LM advisory during long tool runs. It uses an
+  already running server, never starts one or falls back to a paid model, and
+  cannot approve completion or block useful work.
+- Show the full session ID; add `/sessions` and `/resume [ID|last]` inside the
+  TUI. Restore history, model, roles, cost and paused goal under an exclusive
+  session lease. Reject switches with pending input, images or queued work.
+- Flush outstanding child usage to its owning session before switching or
+  exiting. Preflight validation cannot consume another session's receipts.
+- Publish goal completion only after its checkpoint is saved, and update busy
+  TUI goal status from worker snapshots so `/goal status` stays consistent.
+- Persist timestamped completion, cancellation and failure outcomes so resumed
+  sessions and `/session` explain why work stopped. Keep diagnostics out of model
+  replay. Repair footer/transcript overlap on narrow terminals.
+- Preserve access to an installed Node runtime selected by PATH without exposing
+  its containing home directory. Make native read/write/edit and bash share the
+  private `$TMPDIR` scratch path, with traversal and symlink checks.
+
 ## 0.5.1
 
 - Keep the composer live while the agent works. Show queued messages, process

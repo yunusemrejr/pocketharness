@@ -76,6 +76,7 @@ struct Config {
     bool review = true;    // overseer reviews changed work before a turn ends
     bool autonomy = true;  // nudge models that stop early or ask permission
     bool jev = true;       // OpenRouter Jev judge (when OPENROUTER_API_KEY is set)
+    long workingContextTokens = 96000;  // soft summary checkpoint; 0 keeps only the model's hard window
     struct LocalLm {       // optional llama.cpp judge, started on demand
         std::string server, model, keyFile;
         int port = 18735, threads = 4, ctx = 4096;

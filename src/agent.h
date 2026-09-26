@@ -91,6 +91,10 @@ struct AgentOpts {
     // Skill hint for a new user message ("" = none).
     std::function<std::string(const std::string& userText, double* cost)> hint;
     bool brief = false;              // expert brief before substantial requests
+    long workingContextTokens = 96000;  // soft checkpoint independent of the model window; 0 disables
+    // Cheap advisory check of a bounded recent tool trace. Never a completion
+    // verdict or permission gate; empty means no change of direction suggested.
+    std::function<std::string(const std::string& recentTools, double* cost)> progress;
 };
 
 // True for requests that deserve an expert brief (imperative work, not a
@@ -138,6 +142,7 @@ class Agent {
 
     // Restore history from a session file (resume).
     VoidResult restore(const std::string& sessionId);
+    std::string flushUsage();  // idle handoff/exit: collect child receipts before scratch is removed
 
     // Run one user turn to completion (may involve many model<->tool rounds).
     // Returns error text, or "" on success. Partial work is already in the
@@ -196,6 +201,8 @@ class Agent {
     const std::string& sessionTag() const { return orSessionId_; }
 
   private:
+    std::string runTurnImpl(const std::string& userText, bool continuation = false);
+    void recordOutcome(const std::string& scope, const std::string& reason, const std::string& detail);
     Result<ChatResponse> requestOnce();
     Result<ChatResponse> sideRequest(const ResolvedModel& m, const std::string& system,
                                      const std::string& user, long maxTokens);
@@ -219,7 +226,7 @@ class Agent {
     // Empty sessionId (unit tests) skips persistence but still builds once.
     void ensureMeta();
     std::string continueGoal(int maxCycles);
-    std::string finishGoal(std::string error, bool completed = false);
+    std::string finishGoal(std::string error, bool completed = false, const std::string& reason = "");
 
     AgentOpts opts_;
     std::string system_;
@@ -234,6 +241,15 @@ class Agent {
     GoalStatus goalStatus_ = GoalStatus::None;
     std::string goalPhase_, goalBrief_, goalNext_, goalProgress_;
     std::function<bool()> goalYield_;
+    bool goalYielded_ = false;
+    std::string turnStopReason_;
+    std::string lastStopReason_, lastStopDetail_;
+    int64_t lastStoppedAtMs_ = 0;
+    long compactAttemptTokens_ = -1;
+    int64_t compactRetryAfterMs_ = 0;
+    std::string originalRequest_, latestRequest_;
+    bool turnMadeProgress_ = false;
+    std::deque<size_t> goalObservations_;  // bounded fingerprints; never a completion verdict
     long outputBoost_ = 1;  // doubled when replies hit the output cap (session-wide)
     long workspaceSequence_ = 0;
     // Per-turn overseer state.

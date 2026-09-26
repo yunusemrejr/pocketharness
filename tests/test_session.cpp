@@ -407,3 +407,31 @@ TEST(session_Recursive_Coordination_Does_Not_Share_Transcripts) {
     rmRf(dir);
     return "";
 }
+
+TEST(session_Outcome_Summary_Is_Bounded_And_Legacy_Compatible) {
+    std::string home = makeTempDir("pocket-outcome-meta");
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    auto legacy = sessionLoadMeta(id.value);
+    CHECK(legacy.ok && legacy.value.lastStopReason.empty() && legacy.value.lastStoppedAtMs == 0);
+    SessionMeta meta;
+    meta.workspace = home;
+    meta.goal = std::string(512, 'g');
+    meta.goalStatus = "paused";
+    meta.lastStopReason = std::string(128, 'r');
+    meta.lastStopDetail = std::string(2048, 'd');
+    meta.lastStoppedAtMs = 1790450000123LL;
+    CHECK(sessionSaveMeta(id.value, meta).ok);
+    auto loaded = sessionLoadMeta(id.value);
+    CHECK(loaded.ok);
+    CHECK_EQ(loaded.value.lastStopReason.size(), size_t(64));
+    CHECK_EQ(loaded.value.lastStopDetail.size(), size_t(1024));
+    auto listed = sessionList(1, home);
+    CHECK_EQ(listed.size(), size_t(1));
+    CHECK_EQ(listed[0].goal.size(), size_t(256));
+    CHECK_EQ(listed[0].goalStatus, std::string("paused"));
+    CHECK_EQ(listed[0].lastStoppedAtMs, meta.lastStoppedAtMs);
+    rmRf(home);
+    return "";
+}

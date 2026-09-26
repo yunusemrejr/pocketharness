@@ -1,6 +1,7 @@
 // End-to-end recursive CLI with a real confined curl transport and local fixture.
 #include "mini.h"
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <thread>
@@ -26,6 +27,7 @@ struct RecursiveServer {
     std::atomic<bool> completeAudit{false};
     int audits = 0, work = 0;
     bool sawFollowup = false;
+    bool sawRestoredHistory = false;
     int completions = 0;
     explicit RecursiveServer(CliFixture mode = CliFixture::Recursive) : fixture(mode) {
         fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -64,6 +66,8 @@ struct RecursiveServer {
                     auto body = json::parse(request.substr(boundary + 4));
                     std::string model = body.value.at("model").asStr();
                     models.push_back(model);
+                    for (const auto& message : body.value.at("messages").asArr())
+                        sawRestoredHistory |= message.at("content").asStr() == "remember the target session marker";
                     if (fixture == CliFixture::Goal) {
                         const auto& messages = body.value.at("messages").asArr();
                         const std::string system = messages.empty() ? "" : messages.front().at("content").asStr();
@@ -242,5 +246,106 @@ TEST(cli_Resume_Followup_Continues_Paused_Goal) {
     CHECK_EQ(server.work, 2);
     CHECK_EQ(server.audits, 2);
     rmRf(dir);
+    return "";
+}
+
+TEST(cli_Interactive_Resume_Handoff_Restores_Target_And_Releases_Leases) {
+    const std::string dir = makeTempDir("pocket-session-handoff"), workspace = dir + "/workspace";
+    struct Cleanup { std::string path; ~Cleanup() { rmRf(path); } } cleanup{dir};
+    HomeGuard hg(dir);
+    CHECK(ensureDir(workspace, 0700).ok);
+    CHECK(ensureDir(userConfigDir(), 0700).ok);
+    const std::string scratchRoot = dir + "/scratch";
+    CHECK(ensureDir(scratchRoot, 0700).ok);
+    EnvGuard tmpdir("TMPDIR", scratchRoot);
+    RecursiveServer server(CliFixture::Judge);
+    CHECK(!server.url.empty());
+    CHECK(atomicWriteFile(userConfigPath(), json::stringify(json::Object{
+        {"providers", json::Object{{"fixture", json::Object{{"base_url", server.url}}}}},
+        {"default_model", "fixture:source-model"}, {"autonomy", false}, {"review", false}, {"jev", false}})).ok);
+    auto source = sessionCreate(), target = sessionCreate();
+    CHECK(source.ok && target.ok);
+    SessionMeta old;
+    old.workspace = workspace; old.modelSpec = "fixture:source-model";
+    old.thinking = "off"; old.cost = 1.25; old.costSeen = true; old.turns = 2;
+    CHECK(sessionSaveMeta(source.value, old).ok);
+    SessionMeta wanted;
+    wanted.workspace = workspace; wanted.modelSpec = "fixture:target-model";
+    wanted.thinking = "none"; wanted.cost = .25; wanted.costSeen = true; wanted.turns = 7;
+    // Restoring an active goal writes a paused checkpoint during preflight.
+    // That write must never collect receipts from the currently open session.
+    wanted.goal = "saved target goal"; wanted.goalStatus = "active"; wanted.goalPhase = "work";
+    wanted.rolesSet = true; wanted.roles["subagent"] = "fixture:target-child";
+    CHECK(sessionSaveMeta(target.value, wanted).ok);
+    CHECK(sessionAppend(target.value, {"user", "remember the target session marker", "", "", "", true}).ok);
+    CHECK(sessionAppend(target.value, {"assistant", "remembered", "", "", "", true}).ok);
+    SpawnOpts opts;
+    opts.exe = "./pocket";
+    opts.argv = {opts.exe, "--allow-root", workspace, "--resume", source.value,
+                 "--model", "fixture:temporary-cli-override", "--thinking", "high"};
+    struct InputPipe {
+        int fds[2]{-1, -1};
+        ~InputPipe() { for (int fd : fds) if (fd >= 0) close(fd); }
+    } input;
+    CHECK(pipe2(input.fds, O_CLOEXEC) == 0);
+    const std::string sourceInfo = "/session\n";
+    CHECK(write(input.fds[1], sourceInfo.data(), sourceInfo.size()) == (ssize_t)sourceInfo.size());
+    opts.childSetup = [&] {
+        if (dup2(input.fds[0], STDIN_FILENO) < 0) _exit(125);
+        close(input.fds[0]);
+        close(input.fds[1]);
+    };
+    std::string observed, preparationError;
+    bool injected = false;
+    opts.onChunk = [&](std::string_view chunk, bool isError) {
+        if (isError || injected || !preparationError.empty()) return;
+        observed.append(chunk);
+        if (observed.find("session: " + source.value) == std::string::npos) return;
+        // The source UI is waiting for its next command, so no turn can race
+        // receipt collection before the target's preflight restore.
+        std::string scratch;
+        for (const auto& entry : std::filesystem::directory_iterator(scratchRoot))
+            if (startsWith(entry.path().filename().string(), "pocket-" + source.value + "-"))
+                scratch = entry.path().string();
+        if (scratch.empty()) { preparationError = "source scratch not found"; return; }
+        auto receipt = atomicWriteFile(scratch + "/pocket-child-pending.json", json::stringify(json::Object{
+            {"cost", 7.0}, {"side_cost", 2.0}, {"children", 0}, {"seen", true}}), 0600);
+        if (!receipt.ok) { preparationError = receipt.error; return; }
+        injected = true;
+        std::string followup = "/resume " + target.value +
+            "\n/session\n/goal clear\ncontinue with target history\n/quit\n";
+        if (write(input.fds[1], followup.data(), followup.size()) != (ssize_t)followup.size())
+            preparationError = "cannot send handoff commands";
+        close(input.fds[1]);
+        input.fds[1] = -1;
+    };
+    opts.timeoutMs = 15000;
+    auto result = spawn(opts);
+    server.stop();
+    CHECK(preparationError.empty() && injected);
+    if (!result.ok || result.exitCode != 0) return "session handoff failed: " + result.error + "\n" + result.out + result.err;
+    CHECK(result.out.find("continuing session: " + target.value) != std::string::npos);
+    CHECK(result.out.find("model: target-model") != std::string::npos);
+    CHECK(result.out.find("thinking: none") != std::string::npos);
+    CHECK(server.models == std::vector<std::string>{"target-model"});
+    CHECK(server.sawRestoredHistory);
+    auto saved = sessionLoadMeta(target.value), previous = sessionLoadMeta(source.value);
+    CHECK(saved.ok && previous.ok);
+    CHECK_EQ(saved.value.turns, 8);
+    if (std::fabs(saved.value.cost - .35) >= 1e-9)
+        return "target cost should be $0.35 without source child usage; got $" + std::to_string(saved.value.cost) +
+               " (side $" + std::to_string(saved.value.sideCost) + ", children " + std::to_string(saved.value.childSessions) + ")";
+    CHECK(saved.value.sideCost == 0 && saved.value.childSessions == 0);
+    CHECK(saved.value.roles.at("subagent") == "fixture:target-child");
+    // Leaving the source must collect its outstanding receipt exactly once,
+    // without inventing a turn or transferring usage to the target.
+    CHECK(previous.value.turns == 2 && previous.value.cost == 8.25);
+    CHECK(previous.value.sideCost == 2 && previous.value.childSessions == 1);
+    for (const auto& id : {source.value, target.value}) {
+        auto lease = sessionLock(id);
+        CHECK(lease.ok);
+        close(lease.value);
+    }
+    CHECK(sessionList(10, workspace).size() == 2);
     return "";
 }

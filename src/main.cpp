@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <locale.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -362,6 +363,16 @@ int pocketMain(int argc, char** argv) {
         return 0;
     }
 
+    const Config baseConfig = cfg;
+    struct PendingSession {
+        int fd = -1;
+        std::string id;
+        ~PendingSession() { if (fd >= 0) close(fd); }
+    } pendingSession;
+    // A TUI handoff leaves the old terminal, agent, scratch and lease before
+    // entering the same startup/restore path used by --resume.
+    for (;;) {
+    cfg = baseConfig;
     // --- session first: resume restores its own model/thinking, so
     // concurrent sessions never observe each other (no shared UI state). ---
     std::string sessionId;
@@ -380,8 +391,10 @@ int pocketMain(int argc, char** argv) {
         }
         sessionId = s.value;
     }
-    auto lease = sessionLock(sessionId);
+    auto lease = pendingSession.fd >= 0 && pendingSession.id == sessionId ?
+        Result<int>::Ok(pendingSession.fd) : sessionLock(sessionId);
     if (!lease.ok) { fprintf(stderr, "pocket: %s\n", lease.error.c_str()); return 1; }
+    if (lease.value == pendingSession.fd) { pendingSession.fd = -1; pendingSession.id.clear(); }
     struct Lease { int fd; ~Lease() { close(fd); } } sessionLease{lease.value};
     auto loadedMeta = sessionLoadMeta(sessionId);
     if (!loadedMeta.ok) { fprintf(stderr, "pocket: %s\n", loadedMeta.error.c_str()); return 1; }
@@ -444,6 +457,12 @@ int pocketMain(int argc, char** argv) {
     if (!coordinationReady.ok) { fprintf(stderr, "pocket: %s\n", coordinationReady.error.c_str()); return 1; }
     std::string coordination = coordinationReady.value;
     std::vector<std::string> readRoots = cfg.allowRead, writeRoots = cfg.allowWrite;
+    // Shell startup files are intentionally not sourced. Keep selected Node
+    // toolchains usable without granting access to the rest of the real HOME.
+    // passwd (rather than the fake child HOME) also works for recursive Pocket.
+    const passwd* account = getpwuid(geteuid());
+    for (const auto& runtime : discoverRuntimeRoots(getenv("PATH"), account ? account->pw_dir : homeDir()))
+        readRoots.push_back(runtime);
     // Only bounded informational notices are shared; transcripts and credentials
     // stay in the private state directory outside this narrow grant.
     readRoots.push_back(coordination);
@@ -472,10 +491,12 @@ int pocketMain(int argc, char** argv) {
     struct Scratch { std::string path; ~Scratch() { nftw(path.c_str(), removeTmp, 16, FTW_DEPTH | FTW_PHYS); } } scratch{sessionTmp};
     std::string sandboxHome = sessionTmp + "/home";
     ensureDir(sandboxHome, 0700);
-    // The native `read` tool can see session scratch (pasted images land
-    // here too); model bash children already could.
-    if (auto rr = authorityAddReadRoot(auth, sessionTmp); !rr.ok)
-        fprintf(stderr, "pocket: note: %s\n", rr.error.c_str());
+    // All native file tools and bash share the same private scratch grant.
+    if (auto rr = authorityAddWriteRoot(auth, sessionTmp); !rr.ok) {
+        fprintf(stderr, "pocket: %s\n", rr.error.c_str());
+        authorityClose(auth);
+        return 1;
+    }
     // Parent-state file for a recursive `pocket` (depth/workspace/net grant).
     // Keys are deliberately NOT inherited: recursive instances authenticate
     // via explicit expose_env passthrough only.
@@ -563,6 +584,10 @@ int pocketMain(int argc, char** argv) {
     };
     ao.thinking = thinking;
     ao.maxRounds = optMaxRounds > 0 ? optMaxRounds : cfg.maxRounds;
+    ao.workingContextTokens = cfg.workingContextTokens;
+    ao.progress = [&cfg, &tools](const std::string& recent, double*) {
+        return progressHint(cfg, recent, tools.cancel, tools.onEvent);
+    };
     ao.maxTokens = optMaxTokens;
     ao.tools = &tools;
     ao.sessionId = sessionId;
@@ -588,6 +613,7 @@ int pocketMain(int argc, char** argv) {
 
     std::string sysSrc = sessionLoadMeta(sessionId).value.systemSource;
     int rc = 0;
+    std::string nextSession;
     if (!prompt.empty()) {
         // --- non-interactive: stdout = streamed answer, stderr = activity ---
         if (!sysSrc.empty()) fprintf(stderr, "pocket: system prompt: %s\n", sysSrc.c_str());
@@ -664,16 +690,69 @@ int pocketMain(int argc, char** argv) {
             to.systemSource = sysSrc;
             to.unsafe = optUnsafe;
             to.allowNet = allowNet;
+            to.prepareResume = [&](const std::string& id) -> std::string {
+                if (id == sessionId) return "this session is already open";
+                auto held = sessionLock(id);
+                if (!held.ok) return held.error;
+                Lease target{held.value};
+                auto metadata = sessionLoadMeta(id);
+                if (!metadata.ok) return metadata.error;
+                if (!metadata.value.workspace.empty() && metadata.value.workspace != workspace)
+                    return "session belongs to another workspace";
+                Config targetConfig = baseConfig;
+                if (metadata.value.rolesSet) targetConfig.roles = metadata.value.roles;
+                auto selected = resolveModel(targetConfig, metadata.value.modelSpec);
+                if (!selected.ok) return selected.error;
+                // Validate with the existing restore implementation while the
+                // old UI is still available to report a failure. No requests.
+                AgentOpts check = ao;
+                // Preflight must not consume child receipts, stage images or
+                // publish usage through the source session's accounting state.
+                ToolEnv validationTools;
+                validationTools.workspace = workspace;
+                check.tools = &validationTools;
+                check.parentUsageDir.clear();
+                check.sessionId = id;
+                check.model = selected.value;
+                check.thinking = validThinking(metadata.value.thinking) ? metadata.value.thinking : targetConfig.thinking;
+                check.onNotice = {};
+                Agent candidate(check);
+                auto restored = candidate.restore(id);
+                if (!restored.ok) return restored.error;
+                std::string usageError = agent.flushUsage();
+                if (!usageError.empty()) return usageError;
+                if (pendingSession.fd >= 0) close(pendingSession.fd);
+                pendingSession.fd = target.fd;
+                pendingSession.id = id;
+                target.fd = -1;
+                return "";
+            };
             if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO))
                 rc = tuiRun(to);
             else
                 rc = lineRun(to);
+            nextSession = to.resumeId;
         }
     }
 
+    std::string usageError = agent.flushUsage();
+    if (!usageError.empty()) {
+        fprintf(stderr, "pocket: %s\n", sanitizeTerminal(usageError).c_str());
+        rc = 1;
+    }
     judgeShutdown();
     authorityClose(auth);
+    if (rc == kTuiResume && !nextSession.empty()) {
+        resume = true;
+        resumeId = std::move(nextSession);
+        modelSpec.clear();
+        thinkingCli.clear();
+        thinkingFlag.clear();
+        optImages.clear();
+        continue;
+    }
     return rc;
+    }
 }
 
 }  // namespace pocket

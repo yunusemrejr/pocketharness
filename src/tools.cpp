@@ -21,22 +21,23 @@ std::vector<ToolDef> nativeToolDefs() {
     return {
         {"read",
          "Read a file (lines are 1-based, numbered). Paths relative to the workspace "
-         "or absolute inside allowed roots (/tmp is readable too). Bounded output.",
+         "or absolute inside allowed roots (/tmp is readable too). $TMPDIR/ means private session scratch. Bounded output.",
          R"({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]})"},
         {"write",
          "Create or replace a file atomically. Parent directories are created inside "
-         "allowed roots. Refuses to follow symlinks.",
+         "allowed roots. Use $TMPDIR/name for private scratch files, not arbitrary /tmp paths. Refuses to follow symlinks.",
          R"({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]})"},
         {"edit",
          "Atomic exact replacement(s). Supply old_text/new_text OR edits array. Each old_text must occur exactly expected_matches times "
-         "(default 1), else the edit fails without touching the file.",
+         "(default 1), else the edit fails without touching the file. $TMPDIR/ means private session scratch.",
          R"({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"expected_matches":{"type":"integer"},"edits":{"type":"array","items":{"type":"object","properties":{"old_text":{"type":"string"},"new_text":{"type":"string"},"expected_matches":{"type":"integer"}},"required":["old_text","new_text"]}}},"required":["path"]})"},
         {"bash",
          "Run a Linux command (bash -c) with captured stdout/stderr, timeout, "
          "filesystem sandboxing and network access. The workspace is already the "
          "working directory: never cd there first. Use normal programs (git, grep, "
          "make, ssh, ...) through this tool. When the session is offline, network "
-         "commands are blocked for the whole session: do not retry them.",
+         "commands are blocked for the whole session: do not retry them. Chain dependent steps with &&; "
+         "a failed command can leave earlier side effects, so inspect state before retrying.",
          R"({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]})"},
         {"skill",
          "Discover and load Markdown skills. Check the catalog (list) before domain "
@@ -92,6 +93,9 @@ void rememberUndo(ToolEnv& env, const std::string& path, const Result<std::strin
 // Guardian pass after every successful change: built-in anti-slop checks
 // plus post_edit hooks. Findings go straight back to the model.
 std::string afterChange(ToolEnv& env, const std::string& path, const std::string& content) {
+    // Staging a file is not a project edit; don't run paid style judges or
+    // broadcast scratch paths to peer sessions for temporary working pieces.
+    if (!env.sessionTmp.empty() && startsWith(path, env.sessionTmp + "/")) return "";
     if (std::find(env.changedFiles.begin(), env.changedFiles.end(), path) == env.changedFiles.end())
         env.changedFiles.push_back(path);
     if (!env.sessionId.empty())
@@ -264,7 +268,7 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
     o.exe = "/bin/bash";
     o.argv = {"bash", "--noprofile", "--norc", "-o", "pipefail", "-c", cmd};
     o.env = buildChildEnv(env.cfg ? env.cfg->exposeEnv : std::vector<std::string>(), env.workspace,
-                          env.sessionTmp, env.sandboxHome);
+                          env.sessionTmp, env.sandboxHome, env.auth);
     o.workdir = env.workspace;
     o.timeoutMs = timeoutSec * 1000L;
     o.outLimit = env.cfg ? (size_t)env.cfg->outputLimitBytes : 262144;
@@ -433,6 +437,10 @@ ToolResult runTool(ToolEnv& env, const std::string& name, const std::string& arg
     }
     if (env.cancel && env.cancel->load()) return {false, "cancelled"};
     if (name != "skill" && !env.auth) return {false, "tool authority unavailable"};
+    if ((name == "read" || name == "write" || name == "edit") && startsWith(args.at("path").asStr(), "$TMPDIR/")) {
+        if (env.sessionTmp.empty()) return {false, "session scratch unavailable"};
+        args.asObj()["path"] = env.sessionTmp + "/" + args.at("path").asStr().substr(8);
+    }
     ToolResult done;
     bool dispatched = true;
     if (name == "read") done = toolRead(env, args);

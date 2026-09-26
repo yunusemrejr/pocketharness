@@ -25,6 +25,13 @@ double judgeYes(const Config& cfg, const std::string& question, const std::strin
                 double* cost = nullptr, std::atomic<bool>* cancel = nullptr,
                 const std::function<void(const std::string&)>& activity = {});
 
+// Cheap advisory for long tool-only runs. Uses only an already-running local
+// model, with a 1.5-second total budget; never starts a server, calls a remote
+// model, stops work, or certifies completion. Empty means no reliable advice.
+std::string progressHint(const Config& cfg, const std::string& recentTools,
+                         std::atomic<bool>* cancel = nullptr,
+                         const std::function<void(const std::string&)>& activity = {});
+
 // Batched structured judgment on OpenRouter's decisions API: one call
 // answers many yes/no questions with calibrated probabilities.
 //   transcript=true: Span (respan/span-01) judges a conversation; `state`

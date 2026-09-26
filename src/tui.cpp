@@ -960,6 +960,7 @@ struct StreamRenderer {
     std::string carry;  // live tail: already on screen, no newline yet
     bool fence = false;
     int partRows = 0;  // physical rows of the live tail on screen
+    int viewportRows = 0;  // actual transcript region; 0 = unpinned fallback
     void clearPart() {
         if (partRows <= 0) return;
         std::string out = "\r\033[K";
@@ -995,7 +996,9 @@ struct StreamRenderer {
         carry.append(tok.data(), tok.size());
         // Keep the rewritable tail inside the transcript viewport. Otherwise
         // a long line scrolls offscreen and clearPart erases older messages.
-        size_t maxCells = (size_t)std::max(1, termRows() - 8) * (size_t)termWidth();
+        int maxRows = std::max(1, termRows() - 8);
+        if (viewportRows > 0) maxRows = std::min(maxRows, viewportRows);
+        size_t maxCells = (size_t)maxRows * (size_t)termWidth();
         while (carry.find('\n') == std::string::npos &&
                (carry.size() > 8192 || visibleWidth(carry) > maxCells)) {
             size_t cut = cutBytes(carry, std::min((size_t)8192, maxCells)).size();
@@ -1084,7 +1087,8 @@ std::string kpiText(TuiOpts& opts, Agent& agent, int) {
         trio = std::string("◎ goal ") + state + " · " + trio;
     }
     if (!st.costSeen) trio += " · total unreported";
-    return trio + "\nprovider " + sanitizeTerminal(opts.model.provider.name) +
+    std::string identity = opts.sessionId.empty() ? "" : "session " + sanitizeTerminal(opts.sessionId) + "\n";
+    return identity + trio + "\nprovider " + sanitizeTerminal(opts.model.provider.name) +
            " · model " + sanitizeTerminal(opts.model.model) +
            " · thinking " + sanitizeTerminal(opts.thinking);
 }
@@ -1207,7 +1211,8 @@ std::string promptFor(TuiOpts& opts, Agent& agent) {
                     sanitizeTerminal(shortModel(opts.model.spec)) + "·" +
                     sanitizeTerminal(opts.thinking) + "·" + std::to_string(pct) + "%" +
                     (opts.unsafe ? "·UNSAFE" : "") + (opts.allowNet ? "·NET" : "") + "] " +
-                    sanitizeTerminal(baseName(opts.workspace)) + "> " + col(C_RESET);
+                    sanitizeTerminal(baseName(opts.workspace)) +
+                    (opts.sessionId.empty() ? "" : " · session " + sanitizeTerminal(opts.sessionId)) + "> " + col(C_RESET);
     return p;
 }
 
@@ -1287,6 +1292,11 @@ void printBanner(TuiOpts& opts) {
         }
     } else writeAll(STDOUT_FILENO, frame(2));
     std::string b;
+    if (opts.agent && opts.agent->messageCount()) {
+        b += "restored " + std::to_string(opts.agent->messageCount()) + " messages";
+        if (opts.agent->goalPaused()) b += " · goal paused · send a follow-up or /goal resume to continue";
+        b += "\n";
+    }
     if (!opts.systemSource.empty())
         b += col(C_DIM) + std::string("system prompt: ") + sanitizeTerminal(opts.systemSource) + col(C_RESET) + "\n";
     if (opts.unsafe)
@@ -1538,6 +1548,8 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
         bar->draw();
     };
     auto output = [&](const std::function<void()>& emit) {
+        if (bar->active && (g_tstp || termRows() != bar->rows || termWidth() != bar->cols)) draw();
+        rend.viewportRows = bar->active ? std::max(1, bar->region) : 0;
         if (bar->active) {
             writeAll(STDOUT_FILENO, "\0338");
             emit();
@@ -1566,14 +1578,16 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
         int64_t now = nowMs();
         if (force || now - lastStatus >= 250) {
             lastStatus = now;
-            post(Kind::Status, kpiText(opts, agent, termWidth()));
+            post(Kind::Status, kpiText(opts, agent, termWidth()), goalDescription(agent));
         }
     };
     // These callbacks execute only on the agent worker. Agent stats and goal
     // strings are therefore never read concurrently by the editor thread.
     agent.setCallbacks(
         [&](std::string_view text) { if (!cancel.load()) post(Kind::Token, std::string(text)); updateStatus(); },
-        [&](const std::string& text) { post(Kind::Notice, text); updateStatus(); },
+        // Notices may announce a lifecycle transition. Publish its snapshot
+        // first so an immediate /goal status cannot read the turn-start state.
+        [&](const std::string& text) { updateStatus(true); post(Kind::Notice, text); },
         [&](std::string_view text) { if (!cancel.load()) post(Kind::Reasoning, std::string(text)); updateStatus(); });
     opts.tools->onEvent = [&](const std::string& text) { post(Kind::Tool, text); updateStatus(); };
     opts.tools->onToolDone = [&](const std::string& name, bool ok, const std::string& summary) {
@@ -1621,7 +1635,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
             events.cv.notify_all();
         }
         for (const auto& event : batch) {
-            if (event.kind == Kind::Status) status = event.text;
+            if (event.kind == Kind::Status) { status = event.text; goalStatus = event.extra; }
             else if (event.kind == Kind::Done) { finished = true; result = event.text; }
             else if (event.kind == Kind::Approval) {
                 waitingApproval = event;
@@ -1713,6 +1727,8 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
         } else if (command == "/quit" || command == "/exit" || command == "/q") {
             queue.quit = true;
             interrupt();
+        } else if (command == "/resume" || command == "/sessions") {
+            output([&] { rend.write("session unchanged: pause active work with Esc, then use /resume; clear held follow-ups with /queue clear first\n"); });
         } else {
             if (!enqueue(queue, text, opensPicker(*opts.cfg, text))) {
                 ed.setLines(text);
@@ -1965,6 +1981,73 @@ PickResult pickOne(const std::string& title, const std::vector<std::string>& lab
     return pickCooked(title, labels, initial);
 }
 
+// Return true only after main has reserved the target. The current Agent and
+// terminal stay intact on picker cancellation or any validation failure.
+bool prepareSessionResume(TuiOpts& opts, Agent& agent, const std::string& args) {
+    auto say = [&](const std::string& text) { writeAll(STDOUT_FILENO, sanitizeTerminal(text) + "\n"); };
+    if (!opts.prepareResume) {
+        say("session switching is unavailable here; use pocket --resume <id>");
+        return false;
+    }
+    if (agent.pendingImages()) {
+        say("session unchanged: send attached images before switching sessions");
+        return false;
+    }
+    std::string id = args;
+    if (id == "last") {
+        auto latest = sessionResolve("last", opts.workspace);
+        if (!latest.ok) { say("cannot resume: " + latest.error); return false; }
+        id = latest.value;
+    }
+    if (id.empty()) {
+        std::vector<SessionInfo> sessions;
+        std::vector<std::string> labels;
+        for (const auto& session : sessionList(50, opts.workspace)) {
+            if (session.id == opts.sessionId) continue;
+            sessions.push_back(session);
+            std::string state = session.active ? "active (unavailable)" : "saved";
+            if (!session.goalStatus.empty()) state += " · goal " + session.goalStatus;
+            if (!session.lastStopReason.empty()) state += " · " + session.lastStopReason;
+            labels.push_back(session.id + " · " + state +
+                             (session.firstLine.empty() ? "" : " · " + session.firstLine));
+        }
+        if (sessions.empty()) {
+            say("no other saved sessions in this workspace");
+            return false;
+        }
+        PickResult picked = pickOne("Resume a session · " + opts.workspace + " · Esc cancel", labels, "");
+        if (!picked.submitted) { say("session unchanged"); return false; }
+        if (picked.index < 0) {
+            say("no matching session; use /resume <exact id>");
+            return false;
+        }
+        const auto& selected = sessions[(size_t)picked.index];
+        if (selected.active) {
+            say("session unchanged: that session is active in another process");
+            return false;
+        }
+        id = selected.id;
+    }
+    if (id == opts.sessionId) {
+        say("already in session " + id);
+        return false;
+    }
+    // Picker selection keys are consumed above; anything still buffered is a
+    // separate draft/command and must not silently move to another session.
+    if (g_term && g_term->active && (!g_stdinPend.empty() || stdinReady())) {
+        say("session unchanged: finish or clear buffered input before /resume");
+        return false;
+    }
+    std::string error = opts.prepareResume(id);
+    if (!error.empty()) {
+        say("cannot resume: " + error);
+        return false;
+    }
+    opts.resumeId = id;
+    say("continuing session: " + id);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Slash commands. Returns false when the session should end.
 // ---------------------------------------------------------------------------
@@ -1978,6 +2061,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
     auto say = [&](const std::string& s) { writeAll(STDOUT_FILENO, sanitizeTerminal(s)); };
 
     if (cmd == "quit" || cmd == "exit" || cmd == "q") return false;
+    if (cmd == "resume" || cmd == "sessions") return !prepareSessionResume(opts, agent, args);
     if (cmd == "goal" && (args.empty() || args == "status" || args == "pause" || args == "clear")) {
         std::string error = args == "clear" ? agent.clearGoal() : args == "pause" ? agent.pauseGoal() : "";
         if (!error.empty()) say("error: " + error + "\n");
@@ -1990,6 +2074,8 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             "  /model [spec]     switch the main model directly\n"
             "  /goal [text]      start a goal; /goal status|pause|resume|clear controls it\n"
             "  /queue [action]   status, clear, or resume held follow-ups\n"
+            "  /sessions         choose a saved session in this workspace\n"
+            "  /resume [id|last]  continue a saved session (no argument opens the picker)\n"
             "  /undo             revert the newest file change made by the agent\n"
             "  /brain            learned quirks, provider health, judges, overseer stats\n"
             "  /catalog          refresh the live model catalog now\n"
@@ -2214,6 +2300,10 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             std::to_string(agent.contextUsed()) + " / " + std::to_string(agent.contextMax()) +
             " tokens" + " · usage in/out: " + std::to_string(st.inTokens) + "/" +
             std::to_string(st.outTokens) + "\n");
+        auto meta = sessionLoadMeta(opts.sessionId);
+        if (meta.ok && !meta.value.lastStopReason.empty())
+            say("last stop: " + meta.value.lastStopReason +
+                (meta.value.lastStopDetail.empty() ? "" : " · " + meta.value.lastStopDetail) + "\n");
         say("provider: " + opts.model.provider.name + " · model: " + opts.model.model +
             " · thinking: " + opts.thinking + "\n");
         say("gen: " + tpsText(st) + " avg · child sessions: " + std::to_string(st.childSessions) + "\n");
@@ -2267,6 +2357,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
 }  // namespace
 
 int tuiRun(TuiOpts& opts) {
+    opts.resumeId.clear();
     TermGuard term;
     SignalGuard signals;
     g_term = &term;
@@ -2376,6 +2467,11 @@ int tuiRun(TuiOpts& opts) {
             runCommand(opts, agent, text);
             continue;
         }
+        if ((command == "/resume" || command == "/sessions") &&
+            (!queue.messages.empty() || !ed.empty() || ed.pasting || ed.inEscape)) {
+            writeAll(STDOUT_FILENO, "session unchanged: finish or clear your draft and held follow-ups (/queue clear) before /resume\n");
+            continue;
+        }
         bool wasHeld = queue.held, wasContinuation = queue.continueGoal;
         if (!fromQueue && queue.held && (command.empty() || (command == "/goal" && args == "resume"))) {
             queue.held = false;
@@ -2405,7 +2501,10 @@ int tuiRun(TuiOpts& opts) {
             // The saved bytes belong to this modal command, not to older FIFO
             // turns, the live composer, or a destructive-command approval.
             g_stdinPend = pickerKeys + g_stdinPend;
-            if (!runCommand(opts, agent, text)) break;
+            if (!runCommand(opts, agent, text)) {
+                if (!opts.resumeId.empty()) rc = kTuiResume;
+                break;
+            }
         } else {
             bool resume = agent.goalPaused();
             queue.continueGoal = false;
@@ -2426,6 +2525,7 @@ int tuiRun(TuiOpts& opts) {
 }
 
 int lineRun(TuiOpts& opts) {
+    opts.resumeId.clear();
     bool g_plain = !isatty(STDOUT_FILENO);
     bool ttyIn = isatty(STDIN_FILENO);
     Agent& agent = *opts.agent;
@@ -2450,7 +2550,7 @@ int lineRun(TuiOpts& opts) {
     };
     if (ttyIn) {
         std::string b = "pocket " + std::string(kVersion) + " (" + opts.workspace + ") model " +
-                        opts.model.spec + "\n";
+                        opts.model.spec + "\n" + (opts.sessionId.empty() ? "" : "session " + opts.sessionId + "\n");
         writeAll(STDOUT_FILENO, b);
     }
     StreamRenderer rend;
@@ -2510,7 +2610,7 @@ int lineRun(TuiOpts& opts) {
             writeAll(STDOUT_FILENO, "error: " + sanitizeTerminal(err) + "\n");
         if (g_plain) writeAll(STDOUT_FILENO, "\n");
     }
-    return 0;
+    return opts.resumeId.empty() ? 0 : kTuiResume;
 }
 
 }  // namespace pocket

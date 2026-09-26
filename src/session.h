@@ -12,7 +12,7 @@
 namespace pocket {
 
 struct SessionEvent {
-    std::string type;  // user|assistant|tool_call|tool_result|system|compact|image
+    std::string type;  // user|assistant|tool_call|tool_result|system|compact|image|outcome
     std::string text;
     std::string toolId;
     std::string toolName;
@@ -32,6 +32,9 @@ struct SessionInfo {
     std::string firstLine;  // short summary for --sessions
     std::string workspace;
     bool active = false;
+    std::string goalStatus, goal;
+    std::string lastStopReason, lastStopDetail;
+    int64_t lastStoppedAtMs = 0;  // Unix milliseconds, not a monotonic duration
 };
 
 // Create a new session file, return its id.
@@ -119,6 +122,9 @@ struct SessionMeta {
     // Goal checkpoints are session-local. Active goals restore as paused; only
     // an explicit resume/follow-up may start work again.
     std::string goal, goalStatus, goalPhase, goalBrief, goalNext, goalProgress;
+    std::string lastStopReason, lastStopDetail;
+    int64_t lastStoppedAtMs = 0;
+    std::string originalRequest, latestRequest;  // bounded verbatim constraints retained across summaries
 };
 Result<SessionMeta> sessionLoadMeta(const std::string& id);  // missing => Ok(empty)
 VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m);
