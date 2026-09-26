@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cstdio>
 
 #include "agent.h"
@@ -83,6 +84,7 @@ struct ParentState {
     int depth = 0;
     std::string workspace;
     bool net = false;
+    std::string coordination;
 };
 ParentState readParentState() {
     ParentState ps;
@@ -92,8 +94,16 @@ ParentState readParentState() {
     struct stat st;
     if (lstat(p.c_str(), &st) != 0) return ps;
     if (!S_ISREG(st.st_mode) || st.st_uid != geteuid()) return ps;
-    auto t = readFileBounded(p, 4096);
+    auto t = readFileBounded(p, 16384);
     if (!t.ok) return ps;
+    auto data = json::parse(t.value);
+    if (data.ok && data.value.isObj()) {
+        ps.depth = (int)data.value.at("depth").asInt();
+        ps.workspace = data.value.at("workspace").asStr();
+        ps.net = data.value.at("net").asBool();
+        ps.coordination = data.value.at("coordination").asStr();
+        return ps;
+    }
     for (const std::string& ln : splitLines(t.value)) {
         if (startsWith(ln, "depth=")) ps.depth = atoi(ln.c_str() + 6);
         else if (startsWith(ln, "workspace=")) ps.workspace = ln.substr(10);
@@ -135,6 +145,7 @@ int pocketMain(int argc, char** argv) {
     bool optNetwork = false, optUnsafe = false, optAllowRoot = false, optNoNetwork = false;
     bool optAllowDestructive = false;
     bool optHelp = false, optVersion = false;
+    bool printRequested = false, goalRequested = false, endOptions = false;
     int optMaxRounds = 0, optMaxTokens = 0;  // 0 = model/config defaults
     std::vector<std::string> allowRead, allowWrite, optImages;
 
@@ -147,10 +158,15 @@ int pocketMain(int argc, char** argv) {
             }
             return argv[++i];
         };
-        if (a == "--help" || a == "-h") optHelp = true;
+        if (endOptions) {
+            if (!positional.empty()) { fprintf(stderr, "pocket: unexpected workspace argument\n"); return 2; }
+            positional = a;
+        }
+        else if (a == "--") endOptions = true;
+        else if (a == "--help" || a == "-h") optHelp = true;
         else if (a == "--version" || a == "-v") optVersion = true;
-        else if (a == "-p" || a == "--print") prompt = needVal("-p");
-        else if (a == "-g" || a == "--goal") prompt = goalText = needVal("--goal");
+        else if (a == "-p" || a == "--print") { printRequested = true; prompt = needVal("-p"); }
+        else if (a == "-g" || a == "--goal") { goalRequested = true; prompt = goalText = needVal("--goal"); }
         else if (a == "--refresh-catalog") refreshCatalog = true;
         else if (a == "--models") {
             listModels = true;
@@ -197,6 +213,10 @@ int pocketMain(int argc, char** argv) {
     if (optVersion) {
         printf("pocket %s\n", kVersion);
         return 0;
+    }
+    if ((printRequested && goalRequested) || ((printRequested || goalRequested) && trim(prompt).empty())) {
+        fprintf(stderr, "pocket: use either --print or --goal with a nonempty prompt\n");
+        return 2;
     }
 
     // --- privilege boundary: refuse root agent execution by default ---
@@ -340,6 +360,23 @@ int pocketMain(int argc, char** argv) {
     auto loadedMeta = sessionLoadMeta(sessionId);
     if (!loadedMeta.ok) { fprintf(stderr, "pocket: %s\n", loadedMeta.error.c_str()); return 1; }
     SessionMeta sm = loadedMeta.value;
+    if (sm.rolesSet) cfg.roles = sm.roles;
+    // Freeze actual model identities, not aliases whose definitions may change
+    // in another session's user/project config before this one resumes.
+    for (auto& [name, selections] : cfg.roles) {
+        (void)name;
+        std::string list = selections;
+        std::replace(list.begin(), list.end(), ',', '\n');
+        std::vector<std::string> specs;
+        for (const auto& entry : splitLines(list)) {
+            if (trim(entry).empty()) continue;
+            auto resolved = resolveModel(cfg, trim(entry));
+            specs.push_back(resolved.ok ? resolved.value.spec : trim(entry));
+        }
+        selections = join(specs, ",");
+    }
+    sm.roles = cfg.roles;
+    sm.rolesSet = true;
     if (!sm.workspace.empty() && sm.workspace != workspace) {
         fprintf(stderr, "pocket: session belongs to workspace %s; run pocket there to resume\n",
                 sanitizeTerminal(sm.workspace).c_str());
@@ -364,6 +401,8 @@ int pocketMain(int argc, char** argv) {
     ResolvedModel model = rmR.value;
     std::string thinking = !thinkingFlag.empty() ? thinkingFlag : sm.thinking;
     if (!validThinking(thinking)) thinking = cfg.thinking;
+    cfg.defaultModel = model.spec;
+    cfg.thinking = thinking;
 
     if (!curlAvailable()) {
         fprintf(stderr, "pocket: the `curl` executable is required but not runnable\n");
@@ -371,7 +410,19 @@ int pocketMain(int argc, char** argv) {
     }
 
     // --- authority ---
-    auto authR = authorityInit(workspace, cfg.allowRead, cfg.allowWrite, optUnsafe);
+    if (depth > 0 && !ps.coordination.empty()) {
+        auto shared = sessionSetWorkspaceCoordinationDir(ps.coordination);
+        if (!shared.ok) { fprintf(stderr, "pocket: %s\n", shared.error.c_str()); return 1; }
+    }
+    auto coordinationReady = sessionWorkspaceDirectory(workspace);
+    if (!coordinationReady.ok) { fprintf(stderr, "pocket: %s\n", coordinationReady.error.c_str()); return 1; }
+    std::string coordination = coordinationReady.value;
+    std::vector<std::string> readRoots = cfg.allowRead, writeRoots = cfg.allowWrite;
+    // Only bounded informational notices are shared; transcripts and credentials
+    // stay in the private state directory outside this narrow grant.
+    readRoots.push_back(coordination);
+    writeRoots.push_back(coordination);
+    auto authR = authorityInit(workspace, readRoots, writeRoots, optUnsafe);
     if (!authR.ok) {
         fprintf(stderr, "pocket: %s\n", authR.error.c_str());
         return 1;
@@ -402,10 +453,10 @@ int pocketMain(int argc, char** argv) {
     // Parent-state file for a recursive `pocket` (depth/workspace/net grant).
     // Keys are deliberately NOT inherited: recursive instances authenticate
     // via explicit expose_env passthrough only.
-    atomicWriteFile(sessionTmp + "/pocket.parent",
-                    "depth=" + std::to_string(depth + 1) + "\nworkspace=" + workspace +
-                        "\nnet=" + (allowNet ? "1" : "0") + "\n",
-                    0600);
+    auto parentSaved = atomicWriteFile(sessionTmp + "/pocket.parent",
+                    json::stringify(json::Object{{"depth", depth + 1}, {"workspace", workspace},
+                                                {"net", allowNet}, {"coordination", coordination}}), 0600);
+    if (!parentSaved.ok) { fprintf(stderr, "pocket: %s\n", parentSaved.error.c_str()); return 1; }
 
     // Catalog: live window/reasoning/prices; daily background refresh.
     catalogApply(cfg, model);
@@ -427,6 +478,8 @@ int pocketMain(int argc, char** argv) {
     tools.workspace = workspace;
     tools.sessionTmp = sessionTmp;
     tools.sandboxHome = sandboxHome;
+    tools.sessionId = sessionId;
+    tools.depth = depth;
     tools.allowNet = allowNet;
     tools.unsafe = optUnsafe;
     tools.interactive = prompt.empty();
@@ -460,13 +513,13 @@ int pocketMain(int argc, char** argv) {
     if (cfg.hooks.count("stop")) ao.stopHooks = cfg.hooks["stop"];
     ao.awareness = awarenessBlock(workspace, cfg, allowNet, optUnsafe, prompt.empty(),
                                   optMaxRounds > 0 ? optMaxRounds : cfg.maxRounds);
-    ao.judge = [&cfg](const std::string& q, const std::string& text, double* cost) {
-        return judgeYes(cfg, q, text, cost);
+    ao.judge = [&cfg, &tools](const std::string& q, const std::string& text, double* cost) {
+        return judgeYes(cfg, q, text, cost, tools.cancel);
     };
-    ao.decide = [&cfg](const json::Value& state, const std::vector<Question>& qs, bool transcript, double* cost) {
-        return decide(cfg, state, qs, transcript, cost);
+    ao.decide = [&cfg, &tools](const json::Value& state, const std::vector<Question>& qs, bool transcript, double* cost) {
+        return decide(cfg, state, qs, transcript, cost, tools.cancel);
     };
-    ao.hint = [&cfg, workspace](const std::string& text) -> std::string {
+    ao.hint = [&cfg, &tools, workspace](const std::string& text, double* cost) -> std::string {
         if (!needsBrief(text)) return "";
         auto hits = skillSearch(skillDiscover(workspace), text);
         if (hits.size() > 3) hits.resize(3);
@@ -475,7 +528,7 @@ int pocketMain(int argc, char** argv) {
         for (size_t i = 0; i < hits.size(); ++i)
             qs.push_back({"s" + std::to_string(i), "Would the guide \"" + hits[i].name + ": " + hits[i].preview.substr(0, 200) +
                                                        "\" materially help an expert do this task well?"});
-        auto p = decide(cfg, json::Object{{"task", text.substr(0, 2000)}}, qs, false);
+        auto p = decide(cfg, json::Object{{"task", text.substr(0, 2000)}}, qs, false, cost, tools.cancel);
         std::vector<std::string> keep;
         for (size_t i = 0; i < hits.size(); ++i)
             if (p.empty() ? i == 0 : p["s" + std::to_string(i)] >= 0.7) keep.push_back(hits[i].name);
@@ -488,6 +541,7 @@ int pocketMain(int argc, char** argv) {
     ao.maxTokens = optMaxTokens;
     ao.tools = &tools;
     ao.sessionId = sessionId;
+    if (depth > 0 && getenv("TMPDIR")) ao.parentUsageDir = getenv("TMPDIR");
     Agent agent(ao);
     if (resume) {
         auto r = agent.restore(sessionId);
@@ -556,7 +610,10 @@ int pocketMain(int argc, char** argv) {
                     st.cacheMiss, pct);
         }
         if (st.costSeen)
-            fprintf(stderr, "cost: %s$%.4f (overseer $%.4f)\n", st.costEstimated ? "~" : "", st.cost, st.sideCost);
+            fprintf(stderr, "cost: %s$%.4f%s (overseer $%.4f; %ld child sessions)\n",
+                    st.costEstimated ? "~" : "", st.cost, st.costIncomplete ? " + unreported" : "",
+                    st.sideCost, st.childSessions);
+        else if (st.costIncomplete) fprintf(stderr, "cost: unreported\n");
         if (err == "cancelled") {
             fprintf(stderr, "cancelled\n");
             rc = 130;

@@ -2,6 +2,10 @@
 #include "mini.h"
 
 int main() {
+    const std::string scratch = pocket::test::makeTempDir("pocket-tests-home");
+    if (scratch.empty()) return 1;
+    struct Cleanup { std::string path; ~Cleanup() { pocket::test::rmRf(path); } } cleanup{scratch};
+    pocket::test::HomeGuard isolated(scratch);
     for (const auto& c : pocket::test::registry()) {
         std::string err = c.fn();
         if (err.empty()) {

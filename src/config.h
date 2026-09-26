@@ -116,6 +116,8 @@ Config defaultConfig();
 
 // Persist one role -> spec in roles.json (user config dir, 0600).
 VoidResult saveRole(const std::string& role, const std::string& spec);
+// Credential-free settings for recursive Pocket processes in their fake HOME.
+VoidResult stageChildConfig(const Config& cfg, const std::string& childHome);
 
 // Load KEY=value / export KEY=value lines from the user env file into the
 // process environment (never overriding). Refused unless owned by the user

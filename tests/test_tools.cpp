@@ -172,3 +172,85 @@ TEST(tools_Pipelines_And_Command_Validation) {
         CHECK(classifyCommand(command, f.ws, false).verdict == Verdict::Deny);
     return "";
 }
+
+TEST(tools_Undo_Protects_Other_Writers_And_Failed_Writes) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(runTool(f.env, "write", R"({"path":"a","content":"ours"})").ok);
+    CHECK(boxWrite(f.auth, "a", "theirs").ok);
+    CHECK(undoLast(f.env).find("changed since") != std::string::npos);
+    CHECK_EQ(boxRead(f.auth, "a", 100).value, std::string("theirs"));
+    CHECK_EQ(f.env.undo.size(), size_t(1));
+    CHECK(boxWrite(f.auth, "a", "ours").ok);
+    CHECK(ensureDir(f.ws + "/directory", 0700).ok);
+    CHECK(!runTool(f.env, "write", R"({"path":"directory","content":"bad"})").ok);
+    CHECK_EQ(f.env.undo.size(), size_t(1));
+    CHECK(undoLast(f.env).find("removed a") != std::string::npos);
+    CHECK(!boxExists(f.auth, "a").value);
+    return "";
+}
+
+TEST(tools_Undo_Rejects_Replaced_Parent_Symlink) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(runTool(f.env, "write", R"({"path":"sub/a","content":"same"})").ok);
+    CHECK(rename((f.ws + "/sub").c_str(), (f.ws + "/old").c_str()) == 0);
+    CHECK(atomicWriteFile(f.tmp + "/a", "same").ok);
+    CHECK(symlink(f.tmp.c_str(), (f.ws + "/sub").c_str()) == 0);
+    CHECK(undoLast(f.env).find("undo:") == 0);
+    CHECK_EQ(readFileBounded(f.tmp + "/a", 100).value, std::string("same"));
+    return "";
+}
+
+TEST(tools_Hook_Substitution_Is_Single_Pass_And_Quoted) {
+    ToolFixture f;
+    CHECK(f.ok);
+    auto r = runHook(f.env, "printf '%s' {file}", "file", "{file} $(touch BAD) 'quote'");
+    CHECK(r.ok);
+    CHECK(r.output.find("{file} $(touch BAD) 'quote'") != std::string::npos);
+    CHECK(!boxExists(f.auth, "BAD").value);
+    return "";
+}
+
+TEST(tools_Empty_File_Is_Readable_And_Private_Modes_Persist) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(boxWrite(f.auth, "private", "", 0600).ok);
+    CHECK(runTool(f.env, "read", R"({"path":"private"})").ok);
+    CHECK(runTool(f.env, "write", R"({"path":"private","content":"secret"})").ok);
+    struct stat st{};
+    CHECK(stat((f.ws + "/private").c_str(), &st) == 0);
+    CHECK_EQ(st.st_mode & 0777, mode_t(0600));
+    CHECK(boxWrite(f.auth, "script", "old", 0700).ok);
+    CHECK(runTool(f.env, "edit", R"({"path":"script","old_text":"old","new_text":"new"})").ok);
+    CHECK(stat((f.ws + "/script").c_str(), &st) == 0);
+    CHECK_EQ(st.st_mode & 0777, mode_t(0700));
+    return "";
+}
+
+TEST(tools_Child_Usage_Is_Cumulative_And_Not_Double_Counted) {
+    ToolFixture f;
+    CHECK(f.ok);
+    std::string path = f.tmp + "/pocket-child-one.json";
+    CHECK(atomicWriteFile(path, R"({"cost":0.25,"side_cost":0.05,"children":2,"estimated":true,"seen":true})").ok);
+    auto a = collectChildUsage(f.env);
+    CHECK_EQ(a.cost, .25);
+    CHECK_EQ(a.count, 3L);
+    CHECK(a.estimated && a.seen);
+    auto b = collectChildUsage(f.env);
+    CHECK_EQ(b.cost, 0.0);
+    CHECK_EQ(b.count, 0L);
+    CHECK(atomicWriteFile(path, R"({"cost":0.5,"side_cost":0.1,"children":2,"estimated":true,"seen":true})").ok);
+    auto c = collectChildUsage(f.env);
+    CHECK_EQ(c.cost, .25);
+    CHECK_EQ(c.count, 0L);
+    return "";
+}
+
+TEST(tools_Child_Receipt_FIFO_Is_Refused_Without_Blocking) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(mkfifo((f.tmp + "/pocket-child-fifo.json").c_str(), 0600) == 0);
+    CHECK_EQ(collectChildUsage(f.env).count, 0L);
+    return "";
+}

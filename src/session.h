@@ -1,6 +1,8 @@
 // PocketHarness - boring append-only JSONL sessions.
 #pragma once
 
+#include <atomic>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -57,6 +59,37 @@ Result<std::string> sessionResolve(const std::string& idOrEmpty, const std::stri
 // Caller owns the returned fd until session exit; no lock file is unlinked.
 Result<int> sessionLock(const std::string& id);
 
+// A separate advisory lock for short workspace mutations (write/edit/undo).
+// Caller closes the fd. Do not hold across bash/subprocess execution: a child
+// may itself run Pocket. Waiting is interruptible through cancel.
+Result<int> sessionWorkspaceLock(const std::string& workspace,
+                                 std::atomic<bool>* cancel = nullptr);
+
+// Recursive children may share only this coordination directory while keeping
+// their HOME, transcripts and credentials isolated. Set during startup only,
+// before threads start; the directory must already exist and be private/owned.
+std::string sessionWorkspaceCoordinationDir();
+VoidResult sessionSetWorkspaceCoordinationDir(const std::string& path);
+// Create/return the scope to grant a workspace's model tools and descendants.
+// Never grant the unscoped default coordination root to model tools.
+Result<std::string> sessionWorkspaceDirectory(const std::string& workspace);
+
+// Bounded notices between sessions in the same canonical workspace. These are
+// coordination data, never another session's conversation or instructions.
+struct WorkspaceEvent {
+    long sequence = 0;
+    std::string sessionId, type, text;
+};
+struct WorkspaceUpdates {
+    long lastSequence = 0;
+    bool missed = false;  // cursor predates retained notices; reread affected files
+    std::vector<WorkspaceEvent> events;
+};
+VoidResult sessionWorkspacePublish(const std::string& workspace, const std::string& sessionId,
+                                    const std::string& type, const std::string& text);
+Result<WorkspaceUpdates> sessionWorkspaceRead(const std::string& workspace, long after = 0,
+                                              const std::string& ownSession = "");
+
 json::Value sessionEventToJson(const SessionEvent& ev);
 SessionEvent sessionEventFromJson(const json::Value& v);
 
@@ -76,6 +109,13 @@ struct SessionMeta {
     long lastPrompt = -1;
     double cost = 0;
     bool cacheSeen = false, costSeen = false;
+    double sideCost = 0;
+    bool costEstimated = false;
+    bool costIncomplete = false;
+    long genTokens = 0;
+    long childSessions = 0;
+    std::map<std::string, std::string> roles;
+    bool rolesSet = false;
 };
 Result<SessionMeta> sessionLoadMeta(const std::string& id);  // missing => Ok(empty)
 VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m);

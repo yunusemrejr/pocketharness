@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <wchar.h>
 
 #include "brain.h"
 #include "catalog.h"
@@ -65,11 +66,11 @@ struct TermGuard {
         raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
         raw.c_cc[VMIN] = 1;
         raw.c_cc[VTIME] = 0;
-        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0) active = true;
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) active = true;
     }
     void leave() {
         if (!active) return;
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
+        tcsetattr(STDIN_FILENO, TCSANOW, &orig);
         active = false;
     }
     ~TermGuard() { leave(); }
@@ -88,14 +89,33 @@ volatile sig_atomic_t g_tstp = 0;  // suspend/resume: BottomBar must re-sync
 void onTstp(int) {
     writeAll(STDOUT_FILENO, "\033[r\033[?2004l");
     if (g_term) g_term->leave();
-    signal(SIGTSTP, SIG_DFL);
-    raise(SIGTSTP);
-    signal(SIGTSTP, onTstp);  // back via fg: restore everything
+    // SIGTSTP is blocked inside its handler. Re-raising it and reinstalling
+    // this handler before returning recurses instead of suspending.
+    raise(SIGSTOP);
     if (g_term) g_term->enter();
     writeAll(STDOUT_FILENO, "\033[?2004h");
     g_winch = 1;
     g_tstp = 1;
 }
+
+struct SignalGuard {
+    static constexpr int signals[] = {SIGINT, SIGTERM, SIGHUP, SIGPIPE, SIGWINCH, SIGTSTP};
+    struct sigaction previous[std::size(signals)] {};
+    SignalGuard() {
+        for (size_t i = 0; i < std::size(signals); ++i) {
+            struct sigaction action {};
+            sigemptyset(&action.sa_mask);
+            action.sa_handler = signals[i] == SIGPIPE ? SIG_IGN :
+                                signals[i] == SIGWINCH ? onWinch :
+                                signals[i] == SIGTSTP ? onTstp : onFatalSignal;
+            sigaction(signals[i], &action, &previous[i]);
+        }
+    }
+    ~SignalGuard() {
+        for (size_t i = 0; i < std::size(signals); ++i)
+            sigaction(signals[i], &previous[i], nullptr);
+    }
+};
 
 }  // namespace
 
@@ -186,18 +206,35 @@ size_t stepBack(const std::string& l, size_t col) {
 
 size_t stepFwd(const std::string& l, size_t col) {
     if (col >= l.size()) return l.size();
-    return col + (size_t)utf8Len((unsigned char)l[col]);
+    size_t n = (size_t)utf8Len((unsigned char)l[col]);
+    if (col + n > l.size()) return col + 1;
+    for (size_t i = 1; i < n; ++i)
+        if (((unsigned char)l[col + i] & 0xc0) != 0x80) return col + 1;
+    unsigned char c = (unsigned char)l[col];
+    if ((n == 2 && c < 0xc2) || c > 0xf4) return col + 1;
+    if (n >= 3) {
+        unsigned char second = (unsigned char)l[col + 1];
+        if ((c == 0xe0 && second < 0xa0) || (c == 0xed && second >= 0xa0) ||
+            (c == 0xf0 && second < 0x90) || (c == 0xf4 && second >= 0x90)) return col + 1;
+    }
+    return col + n;
+}
+
+size_t columnBoundary(const std::string& line, size_t col) {
+    col = std::min(col, line.size());
+    while (col > 0 && col < line.size() && ((unsigned char)line[col] & 0xc0) == 0x80) --col;
+    return col;
 }
 
 int termWidth() {
     struct winsize ws {};
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col >= 20) return ws.ws_col;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
     return 80;
 }
 
 int termRows() {
     struct winsize ws {};
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row >= 5) return ws.ws_row;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) return ws.ws_row;
     return 24;
 }
 
@@ -218,55 +255,39 @@ struct Editor {
     std::string histSaved;
     std::string prompt;
     int lastRows = 1;
-    size_t winStart = 0;  // first visible logical line (bottom-area window)
+    bool pinned = false;
 
     bool empty() const { return lines.size() == 1 && lines[0].empty(); }
 
-    // Physical terminal rows per logical line (long lines wrap).
-    std::vector<int> physRows(int W) const {
-        std::vector<int> out;
-        out.reserve(lines.size());
-        for (size_t r = 0; r < lines.size(); ++r) {
-            size_t pre = (r == 0 ? visibleWidth(prompt) : 4);
-            int pr = (int)((pre + visibleWidth(lines[r]) + (size_t)W - 1) / (size_t)W);
-            if (pr < 1) pr = 1;
-            out.push_back(pr);
-        }
-        return out;
+    size_t lastCursorRow = 0;
+
+    TuiInputLayout layout() const {
+        return layoutTuiInput(lines, row, col, prompt, (size_t)termWidth());
     }
 
     void redraw() {
-        int W = termWidth();
-        std::vector<int> phys = physRows(W);
-        if (winStart >= lines.size()) winStart = lines.size() - 1;
-        if (row < winStart) winStart = row;  // cursor always visible
-        int total = 0;
-        for (size_t r = winStart; r < phys.size(); ++r) total += phys[r];
-        std::string out;
-        out += "\r\033[K";
-        for (int i = 1; i < lastRows; ++i) out += "\033[A\r\033[K";
-        for (size_t r = winStart; r < lines.size(); ++r) {
-            if (r == 0) out += prompt;
-            else out += "\033[K... ";
-            out += sanitizeTerminal(lines[r]);
+        auto view = layout();
+        size_t height = (size_t)std::max(1, termRows() - 1);
+        size_t start = view.cursorRow >= height ? view.cursorRow - height + 1 : 0;
+        size_t count = std::min(height, view.rows.size() - start);
+        std::string out = "\r";
+        if (lastCursorRow) out += "\033[" + std::to_string(lastCursorRow) + "A";
+        for (int i = 0; i < lastRows; ++i) {
             out += "\033[K";
-            if (r + 1 < lines.size()) out += "\n";
+            if (i + 1 < lastRows) out += "\033[B\r";
         }
-        // Wrap-aware cursor placement.
-        size_t pre = (row == 0 ? visibleWidth(prompt) : 4);
-        size_t abs = pre + visibleWidth(lines[row].substr(0, col));
-        int above = 0;
-        for (size_t r = winStart; r < row; ++r) above += phys[r];
-        int off = (int)(abs / (size_t)W);
-        int tcol = (int)(abs % (size_t)W);
-        // Cursor at end of a width-exact line has auto-wrapped to the next row.
-        bool wrappedEnd = (col == lines[row].size() && tcol == 0 && abs > 0);
-        int below = total - 1 - (above + off + (wrappedEnd ? 1 : 0));
-        if (below > 0) out += "\033[" + std::to_string(below) + "A";
+        if (lastRows > 1) out += "\033[" + std::to_string(lastRows - 1) + "A";
+        for (size_t i = 0; i < count; ++i) {
+            if (i) out += "\r\n";
+            out += view.rows[start + i] + "\033[K";
+        }
+        size_t cursor = view.cursorRow - start;
+        if (count - 1 > cursor) out += "\033[" + std::to_string(count - 1 - cursor) + "A";
         out += "\r";
-        if (!wrappedEnd && tcol > 0) out += "\033[" + std::to_string(tcol) + "C";
+        if (view.cursorCol) out += "\033[" + std::to_string(view.cursorCol) + "C";
         writeAll(STDOUT_FILENO, out);
-        lastRows = total;
+        lastRows = (int)count;
+        lastCursorRow = cursor;
     }
 
     void insertBytes(const char* p, size_t n) {
@@ -376,7 +397,7 @@ struct Editor {
         row = col = 0;
         histIdx = -1;
         lastRows = 1;
-        winStart = 0;
+        lastCursorRow = 0;
     }
 };
 
@@ -392,13 +413,16 @@ bool readChunk(std::string& chunk) {
         return true;
     }
     char buf[128];
-    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+    ssize_t n;
+    do { n = read(STDIN_FILENO, buf, sizeof(buf)); } while (n < 0 && errno == EINTR && !g_winch);
+    if (n < 0 && errno == EINTR) { chunk.clear(); return true; }
     if (n <= 0) return false;
     chunk.assign(buf, (size_t)n);
     return true;
 }
 
 bool readMore(std::string& extra, int ms) {
+    if (!g_stdinPend.empty()) return readChunk(extra);
     struct pollfd pfd{STDIN_FILENO, POLLIN, 0};
     if (poll(&pfd, 1, ms) <= 0) return false;
     char buf[64];
@@ -416,7 +440,6 @@ bool stdinReady() {
 // Returns submitted text, or nullopt when the user asked to exit.
 std::optional<std::string> editLine(Editor& ed, const std::function<void()>& draw,
                                     bool& exitFlag) {
-    ed.lastRows = 1;
     draw();
     std::string esc;  // pending escape sequence (after ESC)
     bool inEsc = false;
@@ -431,13 +454,13 @@ std::optional<std::string> editLine(Editor& ed, const std::function<void()>& dra
             draw();
         }
         std::string chunk;
-        if (inEsc && esc.empty()) {
+        if (inEsc) {
             // Lone ESC vs sequence: wait briefly for more bytes.
             if (!readMore(chunk, 40)) {
+                bool lone = esc.empty();
                 endEsc();
-                if (!ed.empty() && !paste) {
-                    ed.lines = {""};
-                    ed.row = ed.col = 0;  // Esc clears the draft
+                if (lone && !ed.empty() && !paste) {
+                    ed.reset();  // Esc clears the draft, including history state
                     draw();
                 }
                 continue;
@@ -479,26 +502,26 @@ std::optional<std::string> editLine(Editor& ed, const std::function<void()>& dra
                     endEsc();
                     continue;
                 }
-                if (esc == "[A") {  // Up
+                if (esc == "[A" || esc == "OA") {  // Up
                     if (ed.lines.size() > 1 && ed.row > 0) {
                         --ed.row;
-                        if (ed.col > ed.lines[ed.row].size()) ed.col = ed.lines[ed.row].size();
+                        ed.col = columnBoundary(ed.lines[ed.row], ed.col);
                     } else if (ed.lines.size() == 1) {
                         ed.histPrev();
                     }
                     endEsc();
-                } else if (esc == "[B") {  // Down
+                } else if (esc == "[B" || esc == "OB") {  // Down
                     if (ed.row + 1 < ed.lines.size()) {
                         ++ed.row;
-                        if (ed.col > ed.lines[ed.row].size()) ed.col = ed.lines[ed.row].size();
+                        ed.col = columnBoundary(ed.lines[ed.row], ed.col);
                     } else if (ed.lines.size() == 1) {
                         ed.histNext();
                     }
                     endEsc();
-                } else if (esc == "[C") {  // Right
+                } else if (esc == "[C" || esc == "OC") {  // Right
                     ed.col = stepFwd(ed.lines[ed.row], ed.col);
                     endEsc();
-                } else if (esc == "[D") {  // Left
+                } else if (esc == "[D" || esc == "OD") {  // Left
                     ed.col = stepBack(ed.lines[ed.row], ed.col);
                     endEsc();
                 } else if (esc == "[H" || esc == "[1~") {
@@ -510,10 +533,16 @@ std::optional<std::string> editLine(Editor& ed, const std::function<void()>& dra
                 } else if (esc == "[3~") {
                     ed.deleteFwd();
                     endEsc();
-                } else if (esc.size() >= 6) {
+                } else if (esc == "OH") {
+                    ed.col = 0;
+                    endEsc();
+                } else if (esc == "OF") {
+                    ed.col = ed.lines[ed.row].size();
+                    endEsc();
+                } else if (esc.size() >= 32 || (esc.size() == 1 && esc[0] != '[' && esc[0] != 'O')) {
                     endEsc();  // unknown sequence: ignore
-                } else if (esc.size() >= 2 && esc[0] == '[' &&
-                           (isalpha((unsigned char)esc.back()) || esc.back() == '~')) {
+                } else if (esc.size() >= 2 && (esc[0] == '[' || esc[0] == 'O') &&
+                           esc.back() >= 0x40 && esc.back() <= 0x7e) {
                     endEsc();  // terminated unknown CSI: ignore
                 }
                 // else: need more bytes; if chunk exhausted, next read continues
@@ -545,7 +574,12 @@ std::optional<std::string> editLine(Editor& ed, const std::function<void()>& dra
                     if (ed.history.empty() || ed.history.back() != t) ed.history.push_back(t);
                     if (ed.history.size() > 200) ed.history.erase(ed.history.begin());
                     g_stdinPend = chunk.substr(i + 1);  // keep typeahead for next reader
-                    writeAll(STDOUT_FILENO, "\n");
+                    if (!ed.pinned) {
+                        std::string out;
+                        if ((size_t)ed.lastRows > ed.lastCursorRow + 1)
+                            out += "\033[" + std::to_string((size_t)ed.lastRows - ed.lastCursorRow - 1) + "B";
+                        writeAll(STDOUT_FILENO, out + "\r\n");
+                    }
                     return t;
                 }
                 case '\n':  // Ctrl-J: newline
@@ -556,8 +590,7 @@ std::optional<std::string> editLine(Editor& ed, const std::function<void()>& dra
                         exitFlag = true;
                         return std::nullopt;
                     }
-                    ed.lines = {""};
-                    ed.row = ed.col = 0;
+                    ed.reset();
                     break;
                 case 0x04:  // Ctrl-D
                     if (ed.empty()) {
@@ -598,8 +631,12 @@ std::optional<std::string> editLine(Editor& ed, const std::function<void()>& dra
                 case 0x0c:
                     writeAll(STDOUT_FILENO, "\033[H\033[2J");
                     ed.lastRows = 1;  // screen cleared: next redraw starts fresh
+                    ed.lastCursorRow = 0;
                     draw();
                     break;  // Ctrl-L
+                case 0x1a:
+                    raise(SIGTSTP);
+                    break;
                 default:
                     if (c >= 0x20 || c >= 0x80) ed.insertBytes(chunk.data() + i, 1);
                     break;
@@ -618,12 +655,44 @@ struct SharedInput {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<char> q;
+    std::string draft;
     std::atomic<bool> stop{false};
+    std::atomic<bool> eof{false};
     std::atomic<bool> approvalMode{false};
     // True only while the agent streams a turn. While the editor owns stdin
     // the watcher must not read at all: competing reads swallow keystrokes.
     std::atomic<bool> enabled{false};
     std::atomic<bool>* cancel = nullptr;
+    bool paste = false;  // only the watcher mutates this
+    void queueDraft(char c) {  // called while mu is held
+        if (c == 0x03 && !paste) {
+            if (cancel) cancel->store(true);
+            return;
+        }
+        draft.push_back(c);
+        if (endsWith(draft, "\033[200~")) paste = true;
+        else if (endsWith(draft, "\033[201~")) paste = false;
+    }
+};
+
+struct InputGate {
+    SharedInput* input;
+    explicit InputGate(SharedInput* in) : input(in) {
+        if (!input) return;
+        std::lock_guard<std::mutex> lk(input->mu);
+        if (input->cancel) input->cancel->store(false);
+        for (char c : g_stdinPend) input->queueDraft(c);
+        g_stdinPend.clear();
+        input->enabled.store(true);
+    }
+    ~InputGate() {
+        if (!input) return;
+        std::lock_guard<std::mutex> lk(input->mu);
+        input->enabled.store(false);
+        g_stdinPend += input->draft;
+        input->draft.clear();
+        input->paste = false;
+    }
 };
 
 void watcherMain(SharedInput* in) {
@@ -634,19 +703,28 @@ void watcherMain(SharedInput* in) {
         }
         struct pollfd pfd{STDIN_FILENO, POLLIN, 0};
         if (poll(&pfd, 1, 60) <= 0) continue;
+        // The gate and this final ownership check share a lock. Otherwise a
+        // read already past the check may race the next editor and eat keys.
+        std::lock_guard<std::mutex> lk(in->mu);
         if (!in->enabled.load() && !in->approvalMode.load()) continue;  // turn ended: leave bytes for the editor
         char buf[64];
         ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
-        if (n <= 0) continue;
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            in->eof.store(true);
+            if (in->cancel) in->cancel->store(true);
+            in->cv.notify_all();
+            return;
+        }
         for (ssize_t i = 0; i < n; ++i) {
             if (in->approvalMode.load()) {
-                std::lock_guard<std::mutex> lk(in->mu);
                 in->q.push_back(buf[i]);
                 in->cv.notify_one();
-            } else if (buf[i] == 0x03) {
-                if (in->cancel) in->cancel->store(true);
+            } else {
+                in->queueDraft(buf[i]);
             }
-            // Anything else typed mid-generation is discarded (no echo anyway).
+            // Preserve typeahead exactly, including paste delimiters, for the
+            // editor after this turn. It must never act as approval input.
         }
     }
 }
@@ -663,7 +741,7 @@ std::function<void()> g_endPartial;
 
 // Visible terminal columns: ANSI sequences are zero-width, tabs stop at
 // multiples of 8, other C0 controls are dropped (matching sanitizeTerminal).
-// Wide CJK chars count 1; acceptable imprecision.
+// Use the active terminal locale for wide and combining Unicode characters.
 size_t visibleWidth(const std::string& s) {
     size_t w = 0;
     for (size_t i = 0; i < s.size();) {
@@ -672,7 +750,7 @@ size_t visibleWidth(const std::string& s) {
             ++i;
             if (i < s.size() && s[i] == '[') {
                 ++i;
-                while (i < s.size() && !isalpha((unsigned char)s[i]) && s[i] != '~')
+                while (i < s.size() && !((unsigned char)s[i] >= 0x40 && (unsigned char)s[i] <= 0x7e))
                     ++i;
                 if (i < s.size()) ++i;
             } else if (i < s.size() && s[i] == ']') {
@@ -699,10 +777,65 @@ size_t visibleWidth(const std::string& s) {
             ++i;
             continue;
         }
-        i += (size_t)utf8Len(c);
-        ++w;
+        size_t next = stepFwd(s, i);
+        unsigned cp = c;
+        if (next - i > 1) {
+            cp = c & (0x7f >> (next - i));
+            for (size_t j = i + 1; j < next; ++j) cp = (cp << 6) | ((unsigned char)s[j] & 0x3f);
+        }
+        int cells = wcwidth((wchar_t)cp);
+        w += (size_t)(cells < 0 ? 1 : cells);
+        i = next;
     }
     return w;
+}
+
+TuiInputLayout layoutTuiInput(const std::vector<std::string>& lines, size_t row,
+                             size_t col, const std::string& prompt, size_t width) {
+    TuiInputLayout out;
+    out.rows.push_back("");
+    width = std::max((size_t)1, width);
+    size_t cell = 0;
+    auto nextRow = [&] { out.rows.push_back(""); cell = 0; };
+    auto append = [&](const std::string& text, bool track, size_t cursor) {
+        for (size_t i = 0; i < text.size();) {
+            if (track && i == cursor) {
+                out.cursorRow = out.rows.size() - 1;
+                out.cursorCol = cell;
+            }
+            size_t end = stepFwd(text, i);
+            std::string glyph = text.substr(i, end - i);
+            size_t n = glyph == "\t" ? 8 - cell % 8 : visibleWidth(glyph);
+            if (glyph == "\t") {
+                while (n--) {
+                    out.rows.back() += ' ';
+                    if (++cell == width) nextRow();
+                }
+            } else {
+                if (n > width) { glyph = "?"; n = 1; }
+                if (!n && cell == 0 && out.rows.size() > 1 && out.rows.back().empty()) {
+                    out.rows[out.rows.size() - 2] += glyph;
+                    i = end;
+                    continue;
+                }
+                if (n && cell + n > width) nextRow();
+                out.rows.back() += glyph;
+                cell += n;
+                if (cell >= width) nextRow();
+            }
+            i = end;
+        }
+        if (track && cursor >= text.size()) {
+            out.cursorRow = out.rows.size() - 1;
+            out.cursorCol = cell;
+        }
+    };
+    for (size_t r = 0; r < lines.size(); ++r) {
+        if (r) nextRow();
+        append(sanitizeTerminal(r == 0 ? prompt : "... "), false, 0);
+        append(sanitizeTerminal(lines[r]), r == row, col);
+    }
+    return out;
 }
 
 std::string fmtK(long n) {
@@ -746,21 +879,25 @@ bool askApprovalCli(const std::string& cmd, const std::string& reason) {
     if (g_endPartial) g_endPartial();  // don't draw over the live stream tail
     std::string box = std::string(col(C_YELLOW)) + col(C_BOLD) +
                       "\nPocketHarness blocked a potentially destructive command.\n" + col(C_RESET) +
-                      col(C_DIM) + reason + col(C_RESET) + "\n\n  " + sanitizeTerminal(cmd) +
+                      col(C_DIM) + sanitizeTerminal(reason) + col(C_RESET) + "\n\n  " + sanitizeTerminal(cmd) +
                       "\n\nAllow once? [y/N] ";
-    writeAll(STDOUT_FILENO, box);
     if (g_approval && g_approval->in) {
         SharedInput* in = g_approval->in;
-        in->approvalMode.store(true);
         {
             std::lock_guard<std::mutex> lk(in->mu);
             in->q.clear();
+            in->approvalMode.store(true);
         }
+        writeAll(STDOUT_FILENO, box);
         bool allow = false;
         for (;;) {
             std::unique_lock<std::mutex> lk(in->mu);
-            in->cv.wait(lk, [&] { return !in->q.empty() || in->stop.load(); });
-            if (in->stop.load()) break;
+            in->cv.wait_for(lk, std::chrono::milliseconds(100), [&] {
+                return !in->q.empty() || in->stop.load() || in->eof.load() ||
+                       (in->cancel && in->cancel->load());
+            });
+            if (in->stop.load() || in->eof.load() || (in->cancel && in->cancel->load())) break;
+            if (in->q.empty()) continue;
             char c = in->q.front();
             in->q.pop_front();
             lk.unlock();
@@ -768,13 +905,19 @@ bool askApprovalCli(const std::string& cmd, const std::string& reason) {
                 allow = true;
                 break;
             }
+            if (c == 0x03 && in->cancel) in->cancel->store(true);
             if (c == 'n' || c == 'N' || c == '\r' || c == '\n' || c == 0x1b || c == 0x03 || c == 0x04)
                 break;  // default = reject
         }
-        in->approvalMode.store(false);
+        {
+            std::lock_guard<std::mutex> lk(in->mu);
+            in->approvalMode.store(false);
+            in->q.clear();  // never replay approval keystrokes as a user turn
+        }
         writeAll(STDOUT_FILENO, allow ? "allowed once\n" : "rejected\n");
         return allow;
     }
+    writeAll(STDOUT_FILENO, box);
     // Cooked-mode fallback (lineRun): read a line.
     std::string line;
     if (!std::getline(std::cin, line)) return false;
@@ -824,12 +967,18 @@ struct StreamRenderer {
         dim = think;
         clearPart();
         carry.append(tok.data(), tok.size());
-        // Bound memory + quadratic re-render on newline-free floods: commit
-        // the head as its own visual line, keep the tail live.
-        while (carry.find('\n') == std::string::npos && carry.size() > 8192) {
-            size_t cut = 8192;
-            while (cut > 0 && ((unsigned char)carry[cut] & 0xC0) == 0x80) --cut;
-            if (cut == 0) cut = 8192;  // degenerate: terminal shows U+FFFD
+        // Keep the rewritable tail inside the transcript viewport. Otherwise
+        // a long line scrolls offscreen and clearPart erases older messages.
+        size_t maxCells = (size_t)std::max(1, termRows() - 8) * (size_t)termWidth();
+        while (carry.find('\n') == std::string::npos &&
+               (carry.size() > 8192 || visibleWidth(carry) > maxCells)) {
+            size_t cut = cutBytes(carry, std::min((size_t)8192, maxCells)).size();
+            if (!cut) cut = stepFwd(carry, 0);
+            while (cut > 1 && visibleWidth(carry.substr(0, cut)) > maxCells) {
+                size_t smaller = cutBytes(carry, cut / 2).size();
+                if (!smaller) break;
+                cut = smaller;
+            }
             writeAll(STDOUT_FILENO, shade(renderLine(carry.substr(0, cut), fence)) + "\n");
             carry.erase(0, cut);
         }
@@ -879,13 +1028,13 @@ long recentPct(const AgentStats& st) {  // steady-state rate, -1 until warm
 }
 
 std::string tpsText(const AgentStats& st) {
-    if (st.genMs <= 0 || st.outTokens <= 0) return "— tok/s";
+    if (st.genMs <= 0 || st.genTokens <= 0) return "— tok/s";
     char b[32];
-    snprintf(b, sizeof(b), "%.1f tok/s", st.outTokens * 1000.0 / (double)st.genMs);
+    snprintf(b, sizeof(b), "%.1f tok/s", st.genTokens * 1000.0 / (double)st.genMs);
     return b;
 }
 
-std::string kpiText(TuiOpts& opts, Agent& agent, int cols) {
+std::string kpiText(TuiOpts& opts, Agent& agent, int) {
     const AgentStats& st = agent.stats();
     long max = agent.contextMax();
     long used = agent.contextUsed();
@@ -899,17 +1048,15 @@ std::string kpiText(TuiOpts& opts, Agent& agent, int cols) {
     trio += cp < 0 ? " · cache —" : " · cache " + std::to_string(cp) + "%";
     if (st.costSeen) {
         char b[32];
-        snprintf(b, sizeof b, " · %s$%.3f", st.costEstimated ? "~" : "", st.cost);
+        snprintf(b, sizeof b, " · total %s$%.4f", st.costEstimated ? "~" : "", st.cost);
         trio += b;
+        if (st.costIncomplete) trio += " + unreported";
     }
     if (!agent.goal().empty()) trio = "◎ goal · " + trio;
-    std::string spec = sanitizeTerminal(shortModel(opts.model.spec));
-    std::string full = trio + " · " + spec + " · " + sanitizeTerminal(opts.thinking);
-    if (visibleWidth(full) <= (size_t)cols) return full;
-    std::string noThink = trio + " · " + spec;
-    if (visibleWidth(noThink) <= (size_t)cols) return noThink;
-    if (visibleWidth(trio) <= (size_t)cols) return trio;
-    return "ctx " + std::to_string(pct) + "%";  // ponytail: tiniest KPI; never slice UTF-8
+    if (!st.costSeen) trio += " · total unreported";
+    return trio + "\nprovider " + sanitizeTerminal(opts.model.provider.name) +
+           " · model " + sanitizeTerminal(opts.model.model) +
+           " · thinking " + sanitizeTerminal(opts.thinking);
 }
 
 std::string shortPrompt() { return std::string(col(C_BOLD)) + "> " + col(C_RESET); }
@@ -925,6 +1072,7 @@ struct BottomBar {
     int rows = 0, cols = 0, region = 0, inputTop = 0;
     bool firstDraw = true, inTranscript = false;
     int64_t lastKpi = 0;
+    int footerH = 1;
 
     void setup() {
         rows = termRows();
@@ -942,10 +1090,23 @@ struct BottomBar {
         writeAll(STDOUT_FILENO, gotoRc(region, 1) + "\n");
         inTranscript = true;
     }
+    std::vector<std::string> statusRows() const {
+        std::vector<std::string> result;
+        for (const auto& line : splitLines(kpi(cols))) {
+            auto wrapped = layoutTuiInput({line}, 0, line.size(), "", (size_t)cols).rows;
+            if (wrapped.size() > 1 && wrapped.back().empty()) wrapped.pop_back();
+            result.insert(result.end(), wrapped.begin(), wrapped.end());
+        }
+        return result;
+    }
     void drawKpi(bool save) {
+        auto lines = statusRows();
         std::string out;
         if (save) out += "\0337";
-        out += gotoRc(rows, 1) + "\033[K" + col(C_DIM) + kpi(cols) + col(C_RESET);
+        for (int i = 0; i < footerH; ++i) {
+            out += gotoRc(rows - footerH + i + 1) + "\033[K";
+            if ((size_t)i < lines.size()) out += col(C_DIM) + lines[(size_t)i] + col(C_RESET);
+        }
         if (save) out += "\0338";
         writeAll(STDOUT_FILENO, out);
     }
@@ -957,8 +1118,8 @@ struct BottomBar {
         drawKpi(true);  // save/restore: never disturbs the stream cursor
     }
     void draw() {
+        ed->pinned = active;
         if (!active) {
-            ed->winStart = 0;
             ed->redraw();
             return;
         }
@@ -968,51 +1129,40 @@ struct BottomBar {
             firstDraw = true;
         }
         int r = termRows(), c = termWidth();
+        if (r < 10) {
+            teardown();
+            ed->pinned = false;
+            ed->lastRows = 1;
+            ed->lastCursorRow = 0;
+            ed->redraw();
+            return;
+        }
         if (r != rows || c != cols) {
             rows = r;
             cols = c;
             firstDraw = true;
         }
-        int W = cols;
-        std::vector<int> phys = ed->physRows(W);
-        int maxH = rows - 6;
-        if (maxH < 1) maxH = 1;
-        int total = 0;
-        for (int p : phys) total += p;
-        ed->winStart = 0;
-        while (total > maxH && ed->winStart < ed->row) total -= phys[ed->winStart++];
-        if (total > maxH) {  // cursor line to the top, tail follows
-            ed->winStart = ed->row;
-            total = 0;
-            for (size_t i = ed->row; i < phys.size(); ++i) total += phys[i];
-        }
-        // ponytail: one logical line taller than maxH overflows into the
-        // transcript; upgrade: slice wrapped lines by column when it bites.
-        int inputH = total < 1 ? 1 : total;
-        int newTop = rows - inputH;
+        footerH = std::min((int)statusRows().size(), std::max(1, rows / 2));
+        auto view = ed->layout();
+        size_t maxH = (size_t)std::max(1, rows - footerH - 4);
+        size_t start = view.cursorRow >= maxH ? view.cursorRow - maxH + 1 : 0;
+        int inputH = (int)std::min(maxH, view.rows.size() - start);
+        int newTop = std::max(2, rows - footerH - inputH + 1);
         int newRegion = newTop - 1;
-        if (newRegion < 2) newRegion = 2;
-        if (firstDraw) {
-            std::string out;
-            for (int rr = newTop; rr <= rows; ++rr) out += gotoRc(rr, 1) + "\033[K";
-            writeAll(STDOUT_FILENO, out);
-            ed->lastRows = 1;
-            firstDraw = false;
-        } else if (newTop != inputTop) {
-            int a = inputTop < newTop ? inputTop : newTop;
-            int b = inputTop < newTop ? newTop : inputTop;
-            std::string out;
-            for (int rr = a; rr < b; ++rr) out += gotoRc(rr, 1) + "\033[K";
-            writeAll(STDOUT_FILENO, out);
-        }
-        if (newRegion != region) {
-            writeAll(STDOUT_FILENO, "\033[1;" + std::to_string(newRegion) + "r");
+        int clearFrom = firstDraw || !inputTop ? newTop : std::min(inputTop, newTop);
+        std::string out;
+        for (int rr = clearFrom; rr <= rows; ++rr) out += gotoRc(rr) + "\033[K";
+        if (newRegion != region || firstDraw) {
+            out += "\033[1;" + std::to_string(newRegion) + "r";
             region = newRegion;
         }
+        firstDraw = false;
         inputTop = newTop;
+        for (int i = 0; i < inputH; ++i)
+            out += gotoRc(inputTop + i) + view.rows[start + (size_t)i];
+        writeAll(STDOUT_FILENO, out);
         drawKpi(false);
-        writeAll(STDOUT_FILENO, gotoRc(inputTop + inputH - 1, 1));
-        ed->redraw();
+        writeAll(STDOUT_FILENO, gotoRc(inputTop + (int)(view.cursorRow - start), (int)view.cursorCol + 1));
         inTranscript = false;
     }
 };
@@ -1155,12 +1305,18 @@ std::string attachPastedImages(TuiOpts& opts, Agent& agent, const std::string& t
 
 int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, SharedInput& shared,
                        std::atomic<bool>& cancel, BottomBar* bar, bool goal = false) {
-    struct Gate {
-        SharedInput& s;
-        explicit Gate(SharedInput& v) : s(v) { s.enabled.store(true); }
-        ~Gate() { s.enabled.store(false); }
-    } gate(shared);
+    InputGate gate(&shared);
     StreamRenderer rend;
+    struct Callbacks {
+        Agent& agent;
+        ToolEnv& tools;
+        ~Callbacks() {
+            agent.setCallbacks({}, {});
+            tools.onEvent = {};
+            tools.onToolDone = {};
+            g_endPartial = nullptr;
+        }
+    } callbacks{agent, *opts.tools};
     g_endPartial = [&] { rend.endLine(); };
     bool thinkHead = false;
     agent.setCallbacks(
@@ -1198,7 +1354,6 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
         }
         rend.write(block);
     };
-    cancel.store(false);
     {
         std::lock_guard<std::mutex> lk(shared.mu);
         shared.q.clear();
@@ -1268,7 +1423,7 @@ PickResult pickRaw(const std::string& title, const std::vector<std::string>& lab
     std::string filter = initial, lastFilter = initial + "\n";  // force first refilter
     size_t sel = 0, start = 0;
     int lastRows = 0;
-    const int maxRows = 10;
+    const int maxRows = std::max(1, std::min(10, termRows() - 8));
     std::vector<size_t> vis;
     std::string esc;
     bool inEsc = false, paste = false;
@@ -1332,7 +1487,7 @@ PickResult pickRaw(const std::string& title, const std::vector<std::string>& lab
             writeAll(STDOUT_FILENO, end + "\n");
         };
         std::string chunk;
-        if (inEsc && esc.empty()) {
+        if (inEsc) {
             if (!readMore(chunk, 40)) {
                 finish();
                 return r;  // lone ESC: cancel
@@ -1357,16 +1512,18 @@ PickResult pickRaw(const std::string& title, const std::vector<std::string>& lab
                 if (esc == "[200~") {
                     paste = true;
                     endEsc();
-                } else if (esc == "[A") {
+                } else if (esc == "[A" || esc == "OA") {
+                    sync();
                     if (sel > 0) --sel;
                     endEsc();
-                } else if (esc == "[B") {
+                } else if (esc == "[B" || esc == "OB") {
+                    sync();
                     ++sel;
                     endEsc();
-                } else if (esc.size() >= 6) {
+                } else if (esc.size() >= 32 || (esc.size() == 1 && esc[0] != '[' && esc[0] != 'O')) {
                     endEsc();
-                } else if (esc.size() >= 2 && esc[0] == '[' &&
-                           (isalpha((unsigned char)esc.back()) || esc.back() == '~')) {
+                } else if (esc.size() >= 2 && (esc[0] == '[' || esc[0] == 'O') &&
+                           esc.back() >= 0x40 && esc.back() <= 0x7e) {
                     endEsc();
                 }
                 continue;
@@ -1404,9 +1561,11 @@ PickResult pickRaw(const std::string& title, const std::vector<std::string>& lab
                     filter.clear();
                     break;
                 case 0x10:
+                    sync();
                     if (sel > 0) --sel;
                     break;
                 case 0x0e:
+                    sync();
                     ++sel;
                     break;
                 default:
@@ -1428,7 +1587,7 @@ PickResult pickOne(const std::string& title, const std::vector<std::string>& lab
 // ---------------------------------------------------------------------------
 bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
     std::string rest = trim(input.substr(1));
-    size_t sp = rest.find(' ');
+    size_t sp = rest.find_first_of(" \t\r\n");
     std::string cmd = sp == std::string::npos ? rest : rest.substr(0, sp);
     std::string args = sp == std::string::npos ? "" : trim(rest.substr(sp + 1));
     cmd = toLower(cmd);
@@ -1436,9 +1595,15 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
     auto say = [&](const std::string& s) { writeAll(STDOUT_FILENO, sanitizeTerminal(s)); };
 
     if (cmd == "quit" || cmd == "exit" || cmd == "q") return false;
+    if (cmd == "goal" && (args.empty() || args == "clear")) {
+        if (args == "clear") agent.clearGoal();
+        say("goal: " + (agent.goal().empty() ? std::string("none") : agent.goal()) +
+            " · usage: /goal <what must be true when done>\n");
+        return true;
+    }
     if (cmd == "help") {
         say("commands:\n"
-            "  /models           assign models to roles: main · fast · fallback · review (fuzzy search)\n"
+            "  /models           assign models to roles: main · fast · fallback · review · subagent (fuzzy search)\n"
             "  /model [spec]     switch the main model directly\n"
             "  /goal [text]      work fully autonomously until the goal is audited as met\n"
             "  /undo             revert the newest file change made by the agent\n"
@@ -1462,25 +1627,36 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             return;
         }
         if (!hasExplicitContext(*opts.cfg, rm.value.provider.name, rm.value.model)) {
+            InputGate gate(g_approval ? g_approval->in : nullptr);
             long live = fetchModelContext(rm.value.provider, rm.value.model);
             if (live > 0) rm.value.context = live;
         }
+        if (!opts.sessionId.empty()) {
+            auto m = sessionLoadMeta(opts.sessionId);
+            if (!m.ok) { say("model not changed: " + m.error + "\n"); return; }
+            m.value.modelSpec = rm.value.spec;
+            auto saved = sessionSaveMeta(opts.sessionId, m.value);
+            if (!saved.ok) { say("model not changed: " + saved.error + "\n"); return; }
+        }
         opts.model = rm.value;
+        opts.cfg->defaultModel = rm.value.spec;
         agent.setModel(rm.value, opts.thinking);
-        SessionMeta m = sessionLoadMeta(opts.sessionId).value;
-        m.modelSpec = rm.value.spec;
-        sessionSaveMeta(opts.sessionId, m);
         say("model: " + rm.value.spec + "\n");
     };
     auto setLevel = [&](const std::string& t) {
+        if (!opts.sessionId.empty()) {
+            auto m = sessionLoadMeta(opts.sessionId);
+            if (!m.ok) { say("thinking not changed: " + m.error + "\n"); return; }
+            m.value.thinking = t;
+            auto saved = sessionSaveMeta(opts.sessionId, m.value);
+            if (!saved.ok) { say("thinking not changed: " + saved.error + "\n"); return; }
+        }
         opts.thinking = t;
+        opts.cfg->thinking = t;
         agent.setModel(opts.model, t);
-        SessionMeta m = sessionLoadMeta(opts.sessionId).value;
-        m.thinking = t;
-        sessionSaveMeta(opts.sessionId, m);
         say("thinking: " + t + "\n");
     };
-    auto pickModel = [&](const std::string& title, const std::string& initial, bool allowNone) -> std::string {
+    auto pickModel = [&](const std::string& title, const std::string& initial, bool allowNone, bool allowMany = false) -> std::string {
         auto all = catalogLoad(*opts.cfg);
         std::vector<std::string> labels, specs;
         for (const auto& m : opts.cfg->models) {
@@ -1495,6 +1671,8 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         if (allowNone) labels.push_back("(none) — clear this role"), specs.push_back("-");
         PickResult pr = pickOne(title, labels, initial);
         if (!pr.submitted) return "";
+        if (allowMany && pr.filter.find(',') != std::string::npos) return pr.filter;
+        if (allowNone && trim(pr.filter) == "-") return "-";
         if (!pr.filter.empty() && resolveModel(*opts.cfg, pr.filter).ok) return pr.filter;
         if (pr.index >= 0) return specs[(size_t)pr.index];
         return pr.filter;  // invalid text: the caller reports the precise error
@@ -1510,47 +1688,74 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         return true;
     }
     if (cmd == "models") {
-        static const char* kRoles[] = {"main", "fast", "fallback", "review"};
+        static const char* kRoles[] = {"main", "fast", "fallback", "review", "subagent"};
         static const char* kWhat[] = {"does the work", "briefs, summaries, audits", "takes over when main fails",
-                                      "the review council (comma-separate several)"};
+                                      "the review council (comma-separate several)", "default model for delegated tasks"};
         std::vector<std::string> labels;
-        for (size_t i = 0; i < 4; ++i) {
+        for (size_t i = 0; i < std::size(kRoles); ++i) {
             std::string now = i == 0 ? opts.model.spec : opts.cfg->roles.count(kRoles[i]) ? opts.cfg->roles[kRoles[i]] : "—";
             char b[256];
             snprintf(b, sizeof b, "%-9s %-44s %s", kRoles[i], now.c_str(), kWhat[i]);
             labels.push_back(b);
         }
-        PickResult r = pickOne("models — pick a role to assign", labels, "");
+        size_t sep = args.find_first_of(" \t\n");
+        std::string roleArg = toLower(args.substr(0, sep));
+        std::string specArg = sep == std::string::npos ? "" : trim(args.substr(sep));
+        PickResult r;
+        for (size_t i = 0; i < std::size(kRoles); ++i)
+            if (roleArg == kRoles[i]) { r.submitted = true; r.index = (int)i; }
+        if (!r.submitted) r = pickOne("models — pick a role to assign", labels, args);
         if (!r.submitted || r.index < 0) {
             say("(cancelled)\n");
             return true;
         }
         std::string roleName = kRoles[r.index];
-        std::string spec = pickModel(roleName + " model · type to search " + std::to_string(catalogLoad(*opts.cfg).size()) +
+        std::string spec = specArg.empty() ? pickModel(roleName + " model · type to search " + std::to_string(catalogLoad(*opts.cfg).size()) +
                                          " catalog models (provider:model works too)",
-                                     "", roleName != "main");
+                                     "", roleName != "main", roleName == "review") : specArg;
         if (spec.empty()) { say("(cancelled)\n"); return true; }
-        if (roleName == "main") {
-            useModel(spec);
-            if (resolveModel(*opts.cfg, spec).ok) (void)saveRole("main", spec), opts.cfg->roles["main"] = spec;
+        if (spec == "-" && roleName == "main") { say("main role cannot be cleared\n"); return true; }
+        if (roleName != "review" && spec.find(',') != std::string::npos) {
+            say("only the review council accepts multiple comma-separated models\n");
             return true;
         }
         std::vector<ResolvedModel> resolved;
-        if (spec != "-")
-            for (std::string one : splitLines([&] { std::string t = spec; std::replace(t.begin(), t.end(), ',', '\n'); return t; }())) {
+        if (spec != "-") {
+            std::string selections = spec;
+            std::replace(selections.begin(), selections.end(), ',', '\n');
+            for (const std::string& one : splitLines(selections)) {
+                if (trim(one).empty()) { say("empty model in selection\n"); return true; }
                 auto rm = resolveModel(*opts.cfg, trim(one));
-                if (!rm.ok) {
-                    say(col(C_RED) + std::string("error: ") + rm.error + col(C_RESET) + "\n");
-                    return true;
-                }
+                if (!rm.ok) { say("error: " + rm.error + "\n"); return true; }
                 catalogApply(*opts.cfg, rm.value);
                 resolved.push_back(rm.value);
             }
+        }
+        auto nextRoles = opts.cfg->roles;
+        if (spec == "-") nextRoles.erase(roleName);
+        else {
+            std::vector<std::string> specs;
+            for (const auto& model : resolved) specs.push_back(model.spec);
+            nextRoles[roleName] = join(specs, ",");
+        }
         auto saved = saveRole(roleName, spec == "-" ? "" : spec);
-        if (spec == "-") opts.cfg->roles.erase(roleName);
-        else opts.cfg->roles[roleName] = spec;
-        agent.setRole(roleName, resolved);
-        say(roleName + ": " + (spec == "-" ? "cleared" : spec) + (saved.ok ? " (saved)" : " (not saved: " + saved.error + ")") + "\n");
+        if (!saved.ok) { say("role not changed: " + saved.error + "\n"); return true; }
+        if (!opts.sessionId.empty()) {
+            auto meta = sessionLoadMeta(opts.sessionId);
+            if (!meta.ok) { say("default saved, but session role not changed: " + meta.error + "\n"); return true; }
+            meta.value.roles = nextRoles;
+            meta.value.rolesSet = true;
+            if (roleName == "main") meta.value.modelSpec = resolved[0].spec;
+            auto persisted = sessionSaveMeta(opts.sessionId, meta.value);
+            if (!persisted.ok) { say("default saved, but session role not changed: " + persisted.error + "\n"); return true; }
+        }
+        opts.cfg->roles = std::move(nextRoles);
+        if (roleName == "main") {
+            opts.model = resolved[0];
+            opts.cfg->defaultModel = opts.model.spec;
+            agent.setModel(opts.model, opts.thinking);
+        } else agent.setRole(roleName, resolved);
+        say(roleName + ": " + (spec == "-" ? "cleared" : spec) + " (saved)\n");
         return true;
     }
     if (cmd == "undo") {
@@ -1568,6 +1773,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         return true;
     }
     if (cmd == "catalog") {
+        InputGate gate(g_approval ? g_approval->in : nullptr);
         say("refreshing catalog from every keyed provider...\n");
         say(catalogRefresh(*opts.cfg) + "\n");
         return true;
@@ -1595,6 +1801,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         return true;
     }
     if (cmd == "compact") {
+        InputGate gate(g_approval ? g_approval->in : nullptr);
         std::string err = agent.compactNow();
         say(err.empty() ? "compacted.\n" : err + "\n");
         return true;
@@ -1622,7 +1829,12 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             std::to_string(agent.contextUsed()) + " / " + std::to_string(agent.contextMax()) +
             " tokens" + " · usage in/out: " + std::to_string(st.inTokens) + "/" +
             std::to_string(st.outTokens) + "\n");
-        say("gen: " + tpsText(st) + " avg\n");
+        say("provider: " + opts.model.provider.name + " · model: " + opts.model.model +
+            " · thinking: " + opts.thinking + "\n");
+        say("gen: " + tpsText(st) + " avg · child sessions: " + std::to_string(st.childSessions) + "\n");
+        for (const auto& peer : sessionList(30, opts.workspace))
+            if (peer.active && peer.id != opts.sessionId)
+                say("active workspace peer: " + peer.id + "\n");
         long cp = cachePct(st);
         if (cp >= 0) {
             say("cache: " + std::to_string(st.cacheHit) + " hit / " +
@@ -1640,6 +1852,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             snprintf(buf, sizeof(buf), "cost: %s$%.4f (%s) · overseer/judges $%.5f\n", st.costEstimated ? "~" : "",
                      st.cost, st.costEstimated ? "partly estimated from catalog prices" : "reported", st.sideCost);
             say(buf);
+            if (st.costIncomplete) say("additional model usage has unreported cost\n");
         }
         return true;
     }
@@ -1670,13 +1883,11 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
 
 int tuiRun(TuiOpts& opts) {
     TermGuard term;
+    SignalGuard signals;
     g_term = &term;
-    signal(SIGINT, onFatalSignal);
-    signal(SIGTERM, onFatalSignal);
-    signal(SIGHUP, onFatalSignal);
-    signal(SIGPIPE, SIG_IGN);
-    signal(SIGWINCH, onWinch);
-    signal(SIGTSTP, onTstp);
+    g_stdinPend.clear();
+    g_winch = 0;
+    g_tstp = 0;
     term.enter();
     if (!term.active) {
         g_term = nullptr;
@@ -1695,6 +1906,19 @@ int tuiRun(TuiOpts& opts) {
     std::atomic<bool> cancel{false};
     opts.tools->cancel = &cancel;
     agent.setCancel(&cancel);
+    struct ResetCallbacks {
+        Agent& agent;
+        ToolEnv& tools;
+        ~ResetCallbacks() {
+            agent.setCallbacks({}, {});
+            agent.setCancel(nullptr);
+            tools.cancel = nullptr;
+            tools.askApproval = {};
+            tools.onEvent = {};
+            tools.onToolDone = {};
+            g_endPartial = nullptr;
+        }
+    } resetCallbacks{agent, *opts.tools};
     SharedInput shared;
     shared.cancel = &cancel;
     std::thread watcher(watcherMain, &shared);
@@ -1712,6 +1936,8 @@ int tuiRun(TuiOpts& opts) {
         ed.reset();
         if (exitFlag || !input) break;
         std::string text = *input;
+        size_t nonspace = text.find_first_not_of(" \t\r\n");
+        if (nonspace != std::string::npos && text[nonspace] == '/') text.erase(0, nonspace);
         if (trim(text).empty()) continue;
         bar.draw();  // clear the submitted draft now; output follows below
         bar.toTranscript();
@@ -1719,15 +1945,11 @@ int tuiRun(TuiOpts& opts) {
         if (bar.active)  // pinned input isn't in the scrollback: echo it
             writeAll(STDOUT_FILENO,
                      col(C_BOLD) + "> " + col(C_RESET) + sanitizeTerminal(text) + "\n");
-        if (startsWith(text, "/goal")) {
-            std::string g = trim(text.substr(5));
-            if (g.empty() || g == "clear") {
-                if (g == "clear") agent.clearGoal();
-                writeAll(STDOUT_FILENO, "goal: " + (agent.goal().empty() ? std::string("none") : sanitizeTerminal(agent.goal())) +
-                                            " · usage: /goal <what must be true when done>\n");
-                continue;
-            }
-            runTurnInteractive(opts, agent, g, shared, cancel, &bar, true);
+        size_t end = text.find_first_of(" \t\r\n");
+        bool goal = toLower(text.substr(0, end)) == "/goal";
+        std::string goalText = goal && end != std::string::npos ? trim(text.substr(end)) : "";
+        if (goal && !goalText.empty() && goalText != "clear") {
+            runTurnInteractive(opts, agent, goalText, shared, cancel, &bar, true);
             continue;
         }
         if (text[0] == '/') {
@@ -1741,25 +1963,34 @@ int tuiRun(TuiOpts& opts) {
     shared.cv.notify_all();
     if (watcher.joinable()) watcher.join();
     g_approval = nullptr;
-    g_term = nullptr;
     bar.teardown();
     writeAll(STDOUT_FILENO, "\033[?2004l");
     term.leave();
+    g_term = nullptr;
     writeAll(STDOUT_FILENO, "\n");
     return rc;
 }
 
-namespace {
-bool g_plain = false;
-}  // namespace
-
 int lineRun(TuiOpts& opts) {
-    if (!isatty(STDOUT_FILENO)) g_plain = true;
+    bool g_plain = !isatty(STDOUT_FILENO);
     bool ttyIn = isatty(STDIN_FILENO);
     Agent& agent = *opts.agent;
     std::atomic<bool> cancel{false};
     opts.tools->cancel = &cancel;
     agent.setCancel(&cancel);
+    struct ResetCallbacks {
+        Agent& agent;
+        ToolEnv& tools;
+        ~ResetCallbacks() {
+            agent.setCallbacks({}, {});
+            agent.setCancel(nullptr);
+            tools.cancel = nullptr;
+            tools.askApproval = {};
+            tools.onEvent = {};
+            tools.onToolDone = {};
+            g_endPartial = nullptr;
+        }
+    } resetCallbacks{agent, *opts.tools};
     opts.tools->askApproval = [&](const std::string& cmd, const std::string& reason) {
         return askApprovalCli(cmd, reason);
     };
@@ -1804,15 +2035,20 @@ int lineRun(TuiOpts& opts) {
         if (ttyIn) writeAll(STDOUT_FILENO, promptFor(opts, agent));
         if (!std::getline(std::cin, line)) break;
         if (trim(line).empty()) continue;
-        if (line[0] == '/' && !startsWith(line, "/goal ")) {
+        size_t nonspace = line.find_first_not_of(" \t\r\n");
+        if (nonspace != std::string::npos && line[nonspace] == '/') line.erase(0, nonspace);
+        size_t end = line.find_first_of(" \t\r\n");
+        bool goal = toLower(line.substr(0, end)) == "/goal";
+        std::string goalText = goal && end != std::string::npos ? trim(line.substr(end)) : "";
+        if (line[0] == '/' && (!goal || goalText.empty() || goalText == "clear")) {
             if (!runCommand(opts, agent, line)) break;
             continue;
         }
-        line = attachPastedImages(opts, agent, line);
+        if (!goal) line = attachPastedImages(opts, agent, line);
         rend = StreamRenderer{};
         g_endPartial = [&] { rend.endLine(); };
         if (!g_plain) writeAll(STDOUT_FILENO, "assistant:\n");
-        std::string err = startsWith(line, "/goal ") ? agent.runGoal(trim(line.substr(6))) : agent.runTurn(line);
+        std::string err = goal ? agent.runGoal(goalText) : agent.runTurn(line);
         rend.flush();
         g_endPartial = nullptr;
         if (!err.empty() && err != "cancelled")

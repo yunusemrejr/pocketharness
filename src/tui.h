@@ -54,4 +54,13 @@ std::vector<size_t> pickFilter(const std::vector<std::string>& labels,
 // Byte-truncate without splitting a UTF-8 sequence. Exposed for tests.
 std::string cutBytes(const std::string& s, size_t maxB);
 
+// Physical input rows and cursor cell, shared by pinned and inline editors.
+// Tabs expand at terminal stops; wrapping never splits a UTF-8 character.
+struct TuiInputLayout {
+    std::vector<std::string> rows;
+    size_t cursorRow = 0, cursorCol = 0;
+};
+TuiInputLayout layoutTuiInput(const std::vector<std::string>& lines, size_t row,
+                             size_t col, const std::string& prompt, size_t width);
+
 }  // namespace pocket

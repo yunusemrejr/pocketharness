@@ -1,6 +1,10 @@
 // PocketHarness - native intelligence implementation.
 #include "brain.h"
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -221,6 +225,7 @@ StopGuess classifyStop(std::string_view finalText) {
     for (int k = 0; k < 3; ++k) {
         lp[k] = std::log(prior[k]);
         for (const auto& x : f) {
+            if (!m.vocab.count(x)) continue;  // unseen words carry no evidence for any class
             auto it = m.count[k].find(x);
             double c = it == m.count[k].end() ? 0 : it->second;
             lp[k] += std::log((c + 0.5) / (m.total[k] + 0.5 * v));
@@ -242,73 +247,100 @@ const char* stopKindName(StopKind k) {
 namespace {
 
 std::mutex g_brainMu;
-json::Value g_brain;
-bool g_brainLoaded = false;
+// Reload under an interprocess lock on every operation. Provider learning is
+// tiny and infrequent; this avoids stale per-process snapshots overwriting
+// another active session's observations or following it into another HOME.
+struct BrainLock {
+    int fd = -1;
+    BrainLock() {
+        if (!ensureDir(stateDir(), 0700).ok) return;
+        fd = open((stateDir() + "/brain.lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (fd < 0) return;
+        int rc;
+        do { rc = flock(fd, LOCK_EX); } while (rc < 0 && errno == EINTR);
+        if (rc < 0) { close(fd); fd = -1; }
+    }
+    ~BrainLock() { if (fd >= 0) close(fd); }
+};
 
 std::string brainPath() { return stateDir() + "/brain.json"; }
 
-json::Value& brainLocked() {
-    if (!g_brainLoaded) {
-        g_brainLoaded = true;
-        auto t = readFileBounded(brainPath(), 1 << 20);
-        auto v = t.ok ? json::parse(t.value) : Result<json::Value>::Err("");
-        g_brain = v.ok && v.value.isObj() ? v.value : json::Value(json::obj());
-        for (const char* k : {"quirks", "health"})
-            if (!g_brain.at(k).isObj()) g_brain.asObj()[k] = json::obj();
-    }
-    return g_brain;
+json::Value brainLocked() {
+    auto t = readFileBounded(brainPath(), 1 << 20);
+    auto v = t.ok ? json::parse(t.value) : Result<json::Value>::Err("");
+    json::Value brain = v.ok && v.value.isObj() ? std::move(v.value) : json::Value(json::obj());
+    for (const char* k : {"quirks", "health"})
+        if (!brain.at(k).isObj()) brain.asObj()[k] = json::obj();
+    return brain;
 }
 
-void brainSaveLocked() {
-    if (ensureDir(stateDir(), 0700).ok)
-        (void)atomicWriteFile(brainPath(), json::stringify(g_brain, true), 0600);
+void brainSaveLocked(const json::Value& brain) {
+    (void)atomicWriteFile(brainPath(), json::stringify(brain, true), 0600);
 }
 
 }  // namespace
 
 std::vector<std::string> brainQuirks(const std::string& modelKey) {
     std::lock_guard<std::mutex> lk(g_brainMu);
+    BrainLock disk;
+    auto brain = brainLocked();
     std::vector<std::string> out;
-    for (const auto& q : brainLocked().at("quirks").at(modelKey).asArr()) out.push_back(q.asStr());
+    for (const auto& q : brain.at("quirks").at(modelKey).asArr()) out.push_back(q.asStr());
     return out;
 }
 
 void brainNoteQuirk(const std::string& modelKey, const std::string& quirk) {
     std::lock_guard<std::mutex> lk(g_brainMu);
-    auto& qs = brainLocked().asObj()["quirks"].asObj()[modelKey];
+    BrainLock disk;
+    if (disk.fd < 0) return;
+    auto brain = brainLocked();
+    auto& qs = brain.asObj()["quirks"].asObj()[modelKey];
     if (!qs.isArr()) qs = json::Array{};
     for (const auto& q : qs.asArr())
         if (q.asStr() == quirk) return;
+    // Mutually exclusive token parameter corrections replace one another.
+    if (quirk == "max_tokens" || quirk == "max_completion_tokens") {
+        auto& a = qs.asArr();
+        a.erase(std::remove_if(a.begin(), a.end(), [](const json::Value& q) {
+            return q.asStr() == "max_tokens" || q.asStr() == "max_completion_tokens";
+        }), a.end());
+    }
     qs.asArr().push_back(quirk);
-    brainSaveLocked();
+    brainSaveLocked(brain);
 }
 
 void brainNoteHealth(const std::string& provider, bool ok, long ms) {
     std::lock_guard<std::mutex> lk(g_brainMu);
-    auto& h = brainLocked().asObj()["health"].asObj()[provider];
+    BrainLock disk;
+    if (disk.fd < 0) return;
+    auto brain = brainLocked();
+    auto& h = brain.asObj()["health"].asObj()[provider];
     if (!h.isObj()) h = json::Object{{"ok", 1.0}, {"ms", (double)ms}, {"n", 0L}};
     auto& o = h.asObj();
     o["ok"] = 0.8 * o["ok"].asNum(1) + 0.2 * (ok ? 1.0 : 0.0);
     if (ok) o["ms"] = std::round(0.8 * o["ms"].asNum((double)ms) + 0.2 * (double)ms);
     o["n"] = o["n"].asInt(0) + 1;
-    brainSaveLocked();
+    brainSaveLocked(brain);
 }
 
 double brainHealth(const std::string& provider) {
     std::lock_guard<std::mutex> lk(g_brainMu);
+    BrainLock disk;
     return brainLocked().at("health").at(provider).at("ok").asNum(1);
 }
 
 std::string brainStatus() {
     std::lock_guard<std::mutex> lk(g_brainMu);
+    BrainLock disk;
+    auto brain = brainLocked();
     std::string s;
-    for (const auto& [p, h] : brainLocked().at("health").asObj()) {
+    for (const auto& [p, h] : brain.at("health").asObj()) {
         char b[160];
         snprintf(b, sizeof b, "  %-24s health %3.0f%%  ~%ldms  n=%ld\n", p.c_str(),
                  h.at("ok").asNum(1) * 100, h.at("ms").asInt(0), h.at("n").asInt(0));
         s += b;
     }
-    for (const auto& [m, q] : brainLocked().at("quirks").asObj()) {
+    for (const auto& [m, q] : brain.at("quirks").asObj()) {
         std::vector<std::string> qs;
         for (const auto& x : q.asArr()) qs.push_back(x.asStr());
         s += "  quirk " + m + ": " + join(qs, ",") + "\n";

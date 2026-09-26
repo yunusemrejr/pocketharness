@@ -355,3 +355,20 @@ TEST(provider_Sse_Multiline_And_Key_Injection) {
     CHECK(!providerApiKey(p).ok);
     return "";
 }
+
+TEST(provider_Anthropic_Malformed_Block_Does_Not_Throw) {
+    AnthropicStreamAcc acc;
+    acc.feed(json::parse(R"({"type":"content_block_start","index":0,"content_block":"malformed"})").value);
+    acc.feed(json::parse(R"({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"x"}})").value);
+    acc.feed(json::parse(R"({"type":"message_stop"})").value);
+    CHECK(!acc.finish().error.empty());
+    return "";
+}
+
+TEST(provider_Stream_Error_Preserves_Reported_Usage) {
+    OpenAiStreamAcc acc;
+    acc.feed(json::parse(R"({"error":{"message":"failed"},"usage":{"prompt_tokens":24,"completion_tokens":12,"cost":0.125}})").value);
+    auto result = acc.finish();
+    CHECK(result.error == "failed" && result.inTokens == 24 && result.outTokens == 12 && result.cost == 0.125);
+    return "";
+}

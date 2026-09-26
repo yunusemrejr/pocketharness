@@ -2,6 +2,8 @@
 #include "mini.h"
 
 #include <signal.h>
+#include <poll.h>
+#include <sys/wait.h>
 
 #include "../src/process.h"
 
@@ -133,5 +135,94 @@ TEST(process_Path_Uses_Child_Environment_And_Workdir) {
     o.env = {"PATH=/nonexistent"};
     CHECK(!spawn(o).ok);  // no fallback to the workspace when PATH has no match
     rmRf(dir);
+    return "";
+}
+
+namespace {
+std::atomic<bool> nestedCancel{false};
+static_assert(std::atomic<bool>::is_always_lock_free);
+void cancelNestedFixture(int) { nestedCancel.store(true); }
+}
+
+TEST(process_Cancel_Allows_Recursive_Group_Cleanup) {
+    std::string dir = makeTempDir("pocket-nested-cancel");
+    CHECK(!dir.empty());
+    SpawnOpts inner;
+    inner.exe = "/bin/sh";
+    inner.argv = {"sh", "-c", "trap '' TERM; printf ready; sleep 5; printf changed > '" + dir + "/late'"};
+    inner.timeoutMs = 7000;
+    inner.cancel = &nestedCancel;
+    inner.onChunk = [](std::string_view text, bool err) {
+        (void)!write(err ? STDERR_FILENO : STDOUT_FILENO, text.data(), text.size());
+    };
+    SpawnOpts outer;
+    outer.exe = "/bin/false";
+    outer.timeoutMs = 4000;
+    outer.terminateGraceMs = 1500;  // parent permits the nested 750 ms escalation and receipt
+    std::atomic<bool> cancel{false};
+    outer.cancel = &cancel;
+    outer.onChunk = [&](std::string_view text, bool) {
+        if (text.find("ready") != std::string_view::npos) cancel = true;
+    };
+    // Run a small recursive-harness fixture in the forked process. Its TERM
+    // handler mirrors print mode, and its tool owns a separate process group.
+    outer.childSetup = [&] {
+        struct sigaction action{};
+        action.sa_handler = cancelNestedFixture;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGTERM, &action, nullptr);
+        auto result = spawn(inner);
+        if (result.cancelled) (void)!write(STDOUT_FILENO, "cleaned up\n", 11);
+        _exit(result.cancelled ? 0 : 1);
+    };
+    auto start = nowMs();
+    auto result = spawn(outer);
+    CHECK(result.cancelled && !result.ok && nowMs() - start < 3000);
+    CHECK(result.out.find("cleaned up") != std::string::npos);
+    CHECK(access((dir + "/late").c_str(), F_OK) != 0);
+    rmRf(dir);
+    return "";
+}
+
+TEST(process_Timeout_Escalates_After_Leader_Exits) {
+    SpawnOpts opts;
+    opts.exe = "/bin/sh";
+    opts.argv = {"sh", "-c", "(trap '' TERM; sleep 30) & exit 0"};
+    opts.timeoutMs = 100;
+    auto start = nowMs();
+    auto result = spawn(opts);
+    CHECK(result.timedOut && !result.ok && nowMs() - start < 3000);
+    return "";
+}
+
+TEST(process_Parent_Death_Terminates_Child) {
+    int ready[2];
+    CHECK(pipe(ready) == 0);
+    pid_t parent = fork();
+    CHECK(parent >= 0);
+    if (parent == 0) {
+        close(ready[0]);
+        SpawnOpts opts;
+        opts.exe = "/bin/sleep";
+        opts.argv = {"sleep", "30"};
+        opts.childSetup = [&] {
+            pid_t child = getpid();
+            (void)!write(ready[1], &child, sizeof(child));
+        };
+        (void)spawn(opts);
+        _exit(0);
+    }
+    close(ready[1]);
+    pollfd pfd{ready[0], POLLIN, 0};
+    pid_t child = -1;
+    bool started = poll(&pfd, 1, 2000) > 0 && read(ready[0], &child, sizeof(child)) == sizeof(child);
+    kill(parent, SIGKILL);
+    int status;
+    while (waitpid(parent, &status, 0) < 0 && errno == EINTR) {}
+    pfd.revents = 0;
+    bool closed = started && poll(&pfd, 1, 2000) > 0 && (pfd.revents & POLLHUP);
+    if (!closed && child > 0) kill(child, SIGKILL);
+    close(ready[0]);
+    CHECK(started && closed);
     return "";
 }

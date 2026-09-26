@@ -49,6 +49,7 @@
   "expose_env": [],
   "max_rounds": 100,
   "roles": {
+    "subagent": "deepseek",
     "fast": "deepseek",
     "fallback": "deepseek",
     "review": "deepseek,openrouter:z-ai/glm-5.3-flash"

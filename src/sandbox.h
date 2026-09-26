@@ -55,6 +55,8 @@ Result<std::string> boxRead(const Authority& a, const std::string& path, size_t 
 VoidResult boxWrite(const Authority& a, const std::string& path,
                     const std::string& data, mode_t mode = 0644);
 Result<bool> boxExists(const Authority& a, const std::string& path);
+// Remove a regular file using the same anchored, no-symlink write authority.
+VoidResult boxRemove(const Authority& a, const std::string& path);
 
 // Child process confinement (called in the child after fork, before exec).
 // Writes diagnostics to stderr and _exit()s on fatal failure.

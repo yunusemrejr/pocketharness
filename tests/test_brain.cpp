@@ -2,6 +2,7 @@
 #include "mini.h"
 
 #include <cmath>
+#include <sys/wait.h>
 
 #include "../src/agent.h"
 #include "../src/brain.h"
@@ -112,6 +113,8 @@ TEST(oversee_Verify_Command_Follows_Project_Type) {
     std::string d = makeTempDir("pocket-verify");
     CHECK(verifyCommand(d).empty());
     CHECK(atomicWriteFile(d + "/Makefile", "all:\n\ntest:\n\t./t\n").ok);
+    CHECK(verifyCommand(d) == "make test");
+    CHECK(atomicWriteFile(d + "/Makefile", "test :\n\t./t\n").ok);
     CHECK(verifyCommand(d) == "make test");
     rmRf(d);
     return "";
@@ -286,5 +289,67 @@ TEST(agent_Read_Image_Attaches_Pixels_To_Next_Message) {
     CHECK(validateHistory(a.messages()).empty());
     authorityClose(auth.value);
     rmRf(ws);
+    return "";
+}
+
+TEST(brain_Unseen_Vocabulary_Does_Not_Bias_Stop_Class) {
+    std::string text;
+    for (int i = 0; i < 30; ++i) text += "unseenwordxyz ";
+    auto result = classifyStop(text);
+    CHECK(result.kind == StopKind::Done);
+    CHECK(std::fabs(result.p - 0.6) < 1e-9);
+    return "";
+}
+
+TEST(brain_State_Isolated_Across_Homes_And_Merged_Across_Processes) {
+    std::string dir = makeTempDir("pocket-brain-isolation");
+    {
+        HomeGuard hg(dir);
+        brainNoteQuirk("first:model", "no_reasoning");
+        // The parent has already read state. Children must reload under their
+        // write lock instead of writing forked copies of that stale snapshot.
+        std::vector<pid_t> children;
+        for (int i = 0; i < 4; ++i) {
+            pid_t pid = fork();
+            CHECK(pid >= 0);
+            if (!pid) {
+                brainNoteQuirk("child:" + std::to_string(i), "no_stream_usage");
+                for (int j = 0; j < 4; ++j) brainNoteHealth("shared", true, 10);
+                _exit(0);
+            }
+            children.push_back(pid);
+        }
+        for (pid_t pid : children) {
+            int status = 0;
+            CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        }
+        for (int i = 0; i < 4; ++i) CHECK(brainQuirks("child:" + std::to_string(i)).size() == 1);
+        auto saved = readFileBounded(stateDir() + "/brain.json", 1 << 20);
+        CHECK(saved.ok);
+        auto parsed = json::parse(saved.value);
+        CHECK(parsed.ok && parsed.value.at("health").at("shared").at("n").asInt() == 16);
+        {
+            HomeGuard other(dir + "/second");
+            CHECK(brainQuirks("first:model").empty());
+            brainNoteQuirk("second:model", "no_reasoning");
+        }
+        CHECK(brainQuirks("first:model").size() == 1);
+        CHECK(brainQuirks("second:model").empty());
+        brainNoteQuirk("tokens:model", "max_tokens");
+        brainNoteQuirk("tokens:model", "max_completion_tokens");
+        CHECK(brainQuirks("tokens:model") == std::vector<std::string>{"max_completion_tokens"});
+    }
+    rmRf(dir);
+    return "";
+}
+
+TEST(oversee_Parses_Whitespace_Prefix_And_Rejects_Invalid_Probabilities) {
+    CHECK(parseYesProbability(R"({"completion_probabilities":[
+        {"token":"\n","top_probs":[{"token":"\n","prob":1}]},
+        {"token":"yes","probs":[{"tok_str":"yes","prob":0.7},{"tok_str":"no","prob":0.3}]}]})") == 0.7);
+    CHECK(parseYesProbability(R"({"completion_probabilities":[{"top_probs":[
+        {"token":"yes","prob":-1},{"token":"no","prob":2}]}]})") < 0);
+    CHECK(parseYesProbability(R"({"completion_probabilities":[{"token":"<think>"},
+        {"token":"yes","probs":[{"tok_str":"yes","prob":1}]}]})") < 0);
     return "";
 }

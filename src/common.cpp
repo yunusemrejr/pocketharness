@@ -69,12 +69,11 @@ std::string sanitizeTerminal(std::string_view in) {
     for (size_t i = 0; i < in.size();) {
         unsigned char c = (unsigned char)in[i];
         if (c == 0x1b) {
-            // ESC: skip CSI (...letter), OSC (...BEL or ST), or single-char seq.
+            // ECMA-48 final bytes include punctuation (e.g. CSI 2~).
             ++i;
             if (i < in.size() && in[i] == '[') {
                 ++i;
-                while (i < in.size() &&
-                       !((in[i] >= 'A' && in[i] <= 'Z') || (in[i] >= 'a' && in[i] <= 'z')))
+                while (i < in.size() && !(in[i] >= 0x40 && in[i] <= 0x7e))
                     ++i;
                 if (i < in.size()) ++i;
             } else if (i < in.size() && in[i] == ']') {
@@ -89,6 +88,8 @@ std::string sanitizeTerminal(std::string_view in) {
                 if (i < in.size() && in[i] == '\x07') ++i;
             } else if (i < in.size() && (in[i] == '(' || in[i] == ')' || in[i] == '#')) {
                 i += 2;  // charset selection etc.
+            } else if (i < in.size()) {
+                ++i;
             }
             continue;
         }
@@ -116,14 +117,20 @@ std::string expandHome(std::string_view path) {
 }
 
 Result<std::string> readFileBounded(const std::string& path, size_t maxBytes) {
-    int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return Result<std::string>::Err("cannot open " + path);
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return Result<std::string>::Err("not a regular file: " + path);
+    }
     std::string out;
     char buf[65536];
     size_t total = 0;
     for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf));
         if (n < 0) {
+            if (errno == EINTR) continue;
             close(fd);
             return Result<std::string>::Err("cannot read " + path);
         }

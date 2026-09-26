@@ -1,6 +1,7 @@
 // PocketHarness - subprocess implementation.
 #include "process.h"
 
+#include <algorithm>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -9,6 +10,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <sys/syscall.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 namespace pocket {
@@ -61,6 +63,7 @@ SpawnResult spawn(const SpawnOpts& opts) {
     fcntl(pout[0], F_SETFL, O_NONBLOCK);
     fcntl(perr[0], F_SETFL, O_NONBLOCK);
 
+    pid_t spawningPid = getpid();
     pid_t pid = fork();
     if (pid < 0) {
         r.error = "fork failed";
@@ -74,6 +77,22 @@ SpawnResult spawn(const SpawnOpts& opts) {
     }
     if (pid == 0) {
         // ---- child ----
+        // A recursive harness must see termination before exec, too. Do not
+        // inherit the parent's handler (which only sets its private flag), or
+        // a blocked/ignored signal. Parent death closes the fork/prctl race.
+        struct sigaction action{};
+        action.sa_handler = SIG_DFL;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGTERM, &action, nullptr);
+        sigaction(SIGINT, &action, nullptr);
+        sigaction(SIGPIPE, &action, nullptr);
+        sigset_t unblocked;
+        sigemptyset(&unblocked);
+        sigaddset(&unblocked, SIGTERM);
+        sigaddset(&unblocked, SIGINT);
+        sigaddset(&unblocked, SIGPIPE);
+        sigprocmask(SIG_UNBLOCK, &unblocked, nullptr);
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != spawningPid) _exit(125);
         dup2(pin[0], STDIN_FILENO);
         dup2(pout[1], STDOUT_FILENO);
         dup2(perr[1], STDERR_FILENO);
@@ -117,24 +136,36 @@ SpawnResult spawn(const SpawnOpts& opts) {
     size_t inOff = 0;
     bool inOpen = true;
     int64_t start = nowMs();
+    int64_t terminateAt = -1;
     bool killed = false;
     char buf[65536];
     int status = 0;
     bool reaped = false;
 
     auto elapsed = [&]() { return nowMs() - start; };
-    while (!reaped || pout[0] >= 0 || perr[0] >= 0) {
+    auto terminate = [&] {
+        if (terminateAt >= 0) return;
+        terminateAt = nowMs();
+        // Recursive Pocket handles TERM and cancels its separately grouped
+        // tools, then writes final usage. KILL first would orphan those tools.
+        kill(-pid, SIGTERM);
+        if (!reaped) kill(pid, SIGTERM);
+    };
+    while (!reaped || pout[0] >= 0 || perr[0] >= 0 || (terminateAt >= 0 && !killed)) {
         if ((opts.timeoutMs > 0 && elapsed() >= opts.timeoutMs) ||
             (opts.cancel && opts.cancel->load())) {
-            if (!killed) {
-                killed = true;
+            if (terminateAt < 0) {
                 if (opts.timeoutMs > 0 && elapsed() >= opts.timeoutMs)
                     r.timedOut = true;
                 else
                     r.cancelled = true;
-                kill(-pid, SIGKILL);  // whole process group
-                if (!reaped) kill(pid, SIGKILL);
+                terminate();
             }
+        }
+        if (terminateAt >= 0 && !killed && nowMs() - terminateAt >= std::clamp(opts.terminateGraceMs, 0L, 5000L)) {
+            killed = true;
+            kill(-pid, SIGKILL);  // bounded grace, including a reaped leader's descendants
+            if (!reaped) kill(pid, SIGKILL);
         }
         struct pollfd fds[4];
         fds[0].fd = pout[0];
@@ -177,10 +208,7 @@ SpawnResult spawn(const SpawnOpts& opts) {
                     dst.append(buf, take);
                     if (take < (size_t)n) {
                         r.truncated = true;
-                        if (opts.stopOnLimit) {
-                            kill(-pid, SIGKILL);
-                            if (!reaped) kill(pid, SIGKILL);
-                        }
+                        if (opts.stopOnLimit) terminate();
                     }
                 } else if (n == 0) {
                     close(fd); fd = -1;
@@ -192,16 +220,18 @@ SpawnResult spawn(const SpawnOpts& opts) {
         };
         if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) drain(pout[0], r.out, false);
         if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) drain(perr[0], r.err, true);
-        if (killed && reaped) break;  // escaped descendants cannot hold pipes open forever
-        if (reaped) continue;
-        pid_t w = waitpid(pid, &status, WNOHANG);
-        if (w == pid) {
-            reaped = true;
-        } else if (w < 0 && errno == EINTR) {
-            continue;
-        } else if (w < 0) {
-            r.error = "waitpid failed";
-            break;
+        if (!reaped) {
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if (w == pid) {
+                reaped = true;
+            } else if (w < 0 && errno != EINTR) {
+                r.error = "waitpid failed";
+                break;
+            }
+        }
+        if (reaped && terminateAt >= 0) {
+            if (killed) break;  // escaped descendants cannot hold pipes open forever
+            if (pout[0] < 0 && perr[0] < 0 && kill(-pid, 0) != 0 && errno == ESRCH) break;
         }
     }
     if (pin[1] >= 0) close(pin[1]);
@@ -216,7 +246,7 @@ SpawnResult spawn(const SpawnOpts& opts) {
     if (!reaped) return r;
     if (WIFEXITED(status)) {
         r.exitCode = WEXITSTATUS(status);
-        r.ok = !r.timedOut && !r.cancelled;
+        r.ok = !r.timedOut && !r.cancelled && !(opts.stopOnLimit && r.truncated);
     } else if (WIFSIGNALED(status)) {
         r.termSig = WTERMSIG(status);
         r.ok = false;

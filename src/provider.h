@@ -74,6 +74,10 @@ struct ChatCallbacks {
     std::function<void(std::string_view chunk)> onReasoning;  // thinking preview
     std::function<void(const std::string& note)> onNotice;    // retry cooldowns
     std::atomic<bool>* cancel = nullptr;
+    // Exactly once per HTTP attempt, before validation/retry, including failed
+    // or cancelled attempts. Only usage fields are populated; -1 is unknown.
+    // This includes billed responses rejected for length/invalid tool calls.
+    std::function<void(const ChatResponse& usage)> onUsage;
 };
 
 // Retry policy (pure, unit-tested). A failed request is retried only while
@@ -178,9 +182,11 @@ long parseModelsContext(const std::string& body, const std::string& modelId);
 // config, never argv. Returns the 2xx body, else "HTTP n: ..." / transport.
 Result<std::string> httpRequest(const std::string& url, const std::string& secretHeader,
                                 const std::string& body, long timeoutMs,
-                                const std::vector<std::string>& headers = {});
+                                const std::vector<std::string>& headers = {},
+                                std::atomic<bool>* cancel = nullptr);
 std::string providerAuthHeader(const ProviderCfg& prov, const std::string& key);
-// Raw GET {base}/models body, cached per endpoint per process ("" on failure).
+// Raw GET {base}/models body, cached per endpoint/auth ("" on failure).
+// Successes expire after 10 minutes; transient failures after 5 seconds.
 std::string fetchModelsBody(const ProviderCfg& prov, long timeoutMs);
 // Apply one learned quirk (see brain.h) to model options.
 void applyQuirk(ModelOptions& o, const std::string& quirk);

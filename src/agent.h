@@ -69,6 +69,7 @@ struct AgentOpts {
     int maxRounds = 100;       // model<->tool rounds per turn before stopping
     ToolEnv* tools = nullptr;  // not owned
     std::string sessionId;
+    std::string parentUsageDir;  // recursive process reports cumulative spend to its parent scratch
     std::atomic<bool>* cancel = nullptr;
     std::function<void(std::string_view token)> onToken;
     std::function<void(std::string_view chunk)> onReasoning;  // live thinking preview
@@ -88,7 +89,7 @@ struct AgentOpts {
     std::function<std::map<std::string, double>(const json::Value& state, const std::vector<Question>& qs,
                                                  bool transcript, double* cost)> decide;
     // Skill hint for a new user message ("" = none).
-    std::function<std::string(const std::string& userText)> hint;
+    std::function<std::string(const std::string& userText, double* cost)> hint;
     bool brief = false;              // expert brief before substantial requests
 };
 
@@ -101,6 +102,7 @@ struct AgentStats {
     long outTokens = 0;
     long lastPrompt = -1;  // exact prompt tokens of the latest request (-1 unknown)
     long genMs = 0;  // provider wall-time of successful requests (no tool time)
+    long genTokens = 0;  // main model only, matching genMs
     int turns = 0;
     int toolCalls = 0;
     int compactions = 0;
@@ -119,7 +121,9 @@ struct AgentStats {
     // Overseer accounting: side cost = judges, reviews, audits, summaries.
     double sideCost = 0;
     bool costEstimated = false;  // part of `cost` came from catalog prices
+    bool costIncomplete = false; // some metered attempts could not be priced
     int nudges = 0, reviews = 0, fallbacks = 0, deduped = 0;
+    long childSessions = 0;
 };
 
 inline constexpr size_t kCacheWindow = 20;
@@ -200,6 +204,7 @@ class Agent {
                         bool side = false);
     void appendSession(const SessionEvent& ev);
     void saveStats();
+    void readWorkspaceUpdates();
     // Load the frozen prefix from the session sidecar, or freeze it now.
     // Empty sessionId (unit tests) skips persistence but still builds once.
     void ensureMeta();
@@ -215,6 +220,7 @@ class Agent {
     std::string persistenceError_;
     std::string goal_;
     long outputBoost_ = 1;  // doubled when replies hit the output cap (session-wide)
+    long workspaceSequence_ = 0;
     // Per-turn overseer state.
     size_t turnStart_ = 0;
     int turnNudges_ = 0, turnGates_ = 0;

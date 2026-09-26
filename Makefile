@@ -17,7 +17,7 @@ TEST_SRC := tests/test_main.cpp tests/test_json.cpp tests/test_common.cpp tests/
             tests/test_session.cpp tests/test_skills.cpp tests/test_sandbox.cpp \
             tests/test_provider.cpp tests/test_tools.cpp tests/test_agent.cpp \
             tests/test_tui.cpp tests/test_process.cpp tests/test_transport.cpp \
-            tests/test_brain.cpp tests/test_kit.cpp
+            tests/test_brain.cpp tests/test_kit.cpp tests/test_cli.cpp
 TEST_OBJ := $(TEST_SRC:.cpp=.o)
 TEST_LIB := $(filter-out src/main.o,$(OBJ))
 TEST_BIN := tests/run_tests
@@ -43,12 +43,14 @@ test: $(BIN) $(TEST_BIN)
 # Allocator/UB/race debugging (not part of default build).
 sanitize:
 	$(MAKE) clean >/dev/null
-	$(MAKE) $(TEST_BIN) CXXFLAGS="-std=c++20 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -Isrc -Wall -Wextra" LDFLAGS="-fsanitize=address,undefined"
+	$(MAKE) $(BIN) $(TEST_BIN) CXXFLAGS="-std=c++20 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -Isrc -Wall -Wextra" LDFLAGS="-fsanitize=address,undefined"
 	./$(TEST_BIN)
 
 install: $(BIN)
 	mkdir -p $(BINDIR)
-	install -m 0755 $(BIN) $(BINDIR)/pocket
+	@set -eu; staged=$$(mktemp "$(BINDIR)/.pocket-install.XXXXXX"); \
+	  trap 'rm -f "$$staged"' EXIT; \
+	  install -m 0755 $(BIN) "$$staged"; mv -f "$$staged" "$(BINDIR)/pocket"
 	@# Bundled skills are program data: replaced wholesale on every install.
 	@# Your own skills live in ~/.config/pocketharness/skills and win on name.
 	rm -rf $(SKILLDIR) && mkdir -p $(SKILLDIR) && cp -r skills/. $(SKILLDIR)/

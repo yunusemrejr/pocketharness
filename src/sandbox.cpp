@@ -438,7 +438,13 @@ Result<std::string> boxRead(const Authority& a, const std::string& path, size_t 
 
 VoidResult boxWrite(const Authority& a, const std::string& path, const std::string& data,
                     mode_t mode) {
-    if (a.unsafe) return atomicWriteFile(expandHome(path), data, mode);
+    if (a.unsafe) {
+        std::string p = expandHome(path);
+        if (p.empty() || p[0] != '/') p = a.workspace + "/" + p;
+        struct stat st{};
+        if (stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode)) mode = st.st_mode & 0777;
+        return atomicWriteFile(p, data, mode);
+    }
     Resolved rs;
     std::string err;
     if (!resolveModelPath(a.writeRoots, path, rs, err))
@@ -459,8 +465,8 @@ VoidResult boxWrite(const Authority& a, const std::string& path, const std::stri
         close(dirfd);
         return VoidResult::Err("write denied: '" + leaf + "' is a symlink");
     }
-    // Overwriting a script must not strip its executable bit.
-    if (haveSt && S_ISREG(leafSt.st_mode) && (leafSt.st_mode & S_IXUSR)) mode |= 0111;
+    // Preserve access permissions; never broaden a private file to 0644/0755.
+    if (haveSt && S_ISREG(leafSt.st_mode)) mode = leafSt.st_mode & 0777;
     // Tmp file + rename inside the same directory (atomic for readers).
     std::string tmp = ".pocket-tmp-" + randHex(4);
     int fd;
@@ -509,7 +515,9 @@ VoidResult boxWrite(const Authority& a, const std::string& path, const std::stri
 Result<bool> boxExists(const Authority& a, const std::string& path) {
     if (a.unsafe) {
         struct stat st;
-        return Result<bool>::Ok(lstat(expandHome(path).c_str(), &st) == 0);
+        std::string p = expandHome(path);
+        if (p.empty() || p[0] != '/') p = a.workspace + "/" + p;
+        return Result<bool>::Ok(lstat(p.c_str(), &st) == 0);
     }
     Resolved rs;
     std::string err;
@@ -532,6 +540,26 @@ Result<bool> boxExists(const Authority& a, const std::string& path) {
         close(dirfd);
     }
     return Result<bool>::Ok(exists);
+}
+
+VoidResult boxRemove(const Authority& a, const std::string& path) {
+    if (a.unsafe) {
+        std::string p = expandHome(path);
+        if (p.empty() || p[0] != '/') p = a.workspace + "/" + p;
+        return unlink(p.c_str()) == 0 ? VoidResult::Ok() : VoidResult::Err("cannot remove " + path);
+    }
+    Resolved rs;
+    std::string err;
+    if (!resolveModelPath(a.writeRoots, path, rs, err)) return VoidResult::Err("remove denied: " + err);
+    const auto& leaf = rs.comps.back();
+    if (leaf == "." || leaf == ".." || leaf.empty()) return VoidResult::Err("remove denied: invalid name");
+    int fd = openParentChain(a.writeFds[(size_t)rs.rootIdx], rs.comps, false, true, err);
+    if (fd < 0) return VoidResult::Err("remove denied: " + err);
+    struct stat st{};
+    bool ok = fstatat(fd, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode) &&
+              unlinkat(fd, leaf.c_str(), 0) == 0;
+    close(fd);
+    return ok ? VoidResult::Ok() : VoidResult::Err("remove denied: cannot remove regular file " + path);
 }
 
 // ---------------------------------------------------------------------------

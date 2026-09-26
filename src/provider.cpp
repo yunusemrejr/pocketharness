@@ -53,6 +53,9 @@ void readUsage(const json::Value& u, long& in, long& out, long& hit, long& miss,
     const auto& det = u.at("prompt_tokens_details");
     if (det.isObj() && det.has("cached_tokens"))
         hit = count(det.at("cached_tokens"), hit);
+    const auto& inputDetails = u.at("input_tokens_details");
+    if (inputDetails.isObj() && inputDetails.has("cached_tokens"))
+        hit = count(inputDetails.at("cached_tokens"), hit);
     if (u.has("input_tokens")) {
         long fresh = count(u.at("input_tokens"), -1);
         long created = count(u.at("cache_creation_input_tokens"), u.has("cache_creation_input_tokens") ? -1 : 0);
@@ -62,7 +65,10 @@ void readUsage(const json::Value& u, long& in, long& out, long& hit, long& miss,
     }
     if (u.has("output_tokens")) out = count(u.at("output_tokens"), out);
     if (hit >= 0 && in >= hit && !u.has("prompt_cache_miss_tokens")) miss = in - hit;
-    if (u.has("cost") && u.at("cost").isNum()) cost = u.at("cost").asNum(cost);
+    if (u.has("cost") && u.at("cost").isNum()) {
+        double reported = u.at("cost").asNum(-1);
+        if (std::isfinite(reported) && reported >= 0) cost = reported;
+    }
 }
 
 bool replayMatches(const ChatMessage& m, const ResolvedModel& model) {
@@ -363,7 +369,8 @@ Result<CodexAuth> codexAuth() {
         size_t a = jwt.find('.'), b = jwt.find('.', a + 1);
         if (a == std::string::npos || b == std::string::npos) return 0;
         std::string p = jwt.substr(a + 1, b - a - 1), raw;
-        int val = 0, bits = -8;
+        uint32_t val = 0;
+        int bits = -8;
         for (char c : p) {
             int d = isupper((unsigned char)c) ? c - 'A' : islower((unsigned char)c) ? c - 'a' + 26
                   : isdigit((unsigned char)c) ? c - '0' + 52 : c == '-' ? 62 : c == '_' ? 63 : -1;
@@ -417,6 +424,7 @@ std::vector<std::string> sseSplit(std::string_view chunk, std::string& carry) {
 }
 
 void OpenAiStreamAcc::feed(const json::Value& p) {
+    readUsage(p.at("usage"), inTokens, outTokens, cacheHit, cacheMiss, cost);
     if (p.has("error")) {
         error = p.at("error").at("message").asStr();
         if (error.empty()) error = "provider stream error";
@@ -469,7 +477,6 @@ void OpenAiStreamAcc::feed(const json::Value& p) {
             }
         }
     }
-    readUsage(p.at("usage"), inTokens, outTokens, cacheHit, cacheMiss, cost);
 }
 
 ChatResponse OpenAiStreamAcc::finish() {
@@ -510,6 +517,7 @@ void AnthropicStreamAcc::feed(const json::Value& p) {
         if (idx < 0 || idx >= 64) { error = "invalid content block index"; return; }
         if ((size_t)idx >= blocks.size()) blocks.resize((size_t)idx + 1);
         const auto& cb = p.at("content_block");
+        if (!cb.isObj()) { error = "invalid content block"; return; }
         blocks[idx].value = cb;
         if (cb.at("type").asStr() == "text") text += cb.at("text").asStr();
         if (cb.at("type").asStr() == "thinking") reasoning += cb.at("thinking").asStr();
@@ -533,10 +541,12 @@ void AnthropicStreamAcc::feed(const json::Value& p) {
                 reasoning += d.at("thinking").asStr();
             auto& value = blocks[idx].value;
             if (value.isNull()) value = json::Object{{"type", "thinking"}};
+            if (!value.isObj()) { error = "invalid thinking block"; return; }
             value.asObj()["thinking"] = value.at("thinking").asStr() + d.at("thinking").asStr();
         } else if (dt == "signature_delta") {
             auto& value = blocks[idx].value;
             if (value.isNull()) value = json::Object{{"type", "thinking"}};
+            if (!value.isObj()) { error = "invalid thinking block"; return; }
             value.asObj()["signature"] = value.at("signature").asStr() + d.at("signature").asStr();
         }
     } else if (type == "message_start" || type == "message_delta") {
@@ -702,6 +712,7 @@ std::string joinUrl(const std::string& base, const std::string& path) {
 // child (whose profile grants exactly this dir) can read the header file;
 // tool children can never reach it. Unlinked + rmdir'd after each request.
 std::string provStaging(const std::string& tag) {
+    if (!ensureDir(stateDir(), 0700).ok) return "";
     std::string d = stateDir() + "/curl-" + std::to_string((long)getpid()) + "-" + tag;
     if (mkdir(d.c_str(), 0700) != 0) return "";
     return d;
@@ -791,7 +802,19 @@ long parseModelsContext(const std::string& body, const std::string& modelId) {
 
 Result<std::string> httpRequest(const std::string& url, const std::string& secretHeader,
                                 const std::string& body, long timeoutMs,
-                                const std::vector<std::string>& headers) {
+                                const std::vector<std::string>& headers, std::atomic<bool>* cancel) {
+    if (cancel && cancel->load()) return Result<std::string>::Err("cancelled");
+    // curl's config is its own language: never interpolate raw header text.
+    std::string escaped;
+    for (unsigned char c : secretHeader) {
+        if (c < 32 || c == 127) return Result<std::string>::Err("invalid header characters");
+        if (c == '\\' || c == '"') escaped.push_back('\\');
+        escaped.push_back((char)c);
+    }
+    for (const auto& h : headers)
+        for (unsigned char c : h)
+            if (c < 32 || c == 127) return Result<std::string>::Err("invalid header characters");
+    timeoutMs = std::clamp(timeoutMs, 1L, 600000L);
     std::string stage = provStaging(randHex(4));
     if (stage.empty()) return Result<std::string>::Err("cannot stage request");
     std::string cfgPath = stage + "/curl.conf", bodyPath = stage + "/req.json";
@@ -803,11 +826,11 @@ Result<std::string> httpRequest(const std::string& url, const std::string& secre
     o.exe = "curl";
     o.env = providerEnv(stage);
     o.argv = {"curl", "--disable", "-sS", "--no-progress-meter", "--connect-timeout", "5",
-              "--max-time", std::to_string(std::max(1L, timeoutMs / 1000)), "-w",
+              "--max-time", std::to_string((double)timeoutMs / 1000), "-w",
               "\n%{http_code}", url};
     // The secret header travels in a 0600 -K config, never in argv.
     if (!secretHeader.empty()) {
-        if (!atomicWriteFile(cfgPath, "header = \"" + secretHeader + "\"\n", 0600).ok)
+        if (!atomicWriteFile(cfgPath, "header = \"" + escaped + "\"\n", 0600).ok)
             return Result<std::string>::Err("cannot stage request");
         o.argv.insert(o.argv.end() - 1, {"-K", cfgPath});
     }
@@ -820,12 +843,15 @@ Result<std::string> httpRequest(const std::string& url, const std::string& secre
     }
     lockTransport(o.argv, url);
     o.timeoutMs = timeoutMs + 1000;
+    o.cancel = cancel;
     o.outLimit = 16 << 20;
+    o.stopOnLimit = true;
     ChildSpec cs;
     cs.providerCurl = true;
     cs.providerTmp = stage;
     o.childSetup = [cs]() { childEnterSandbox(cs); };
     SpawnResult r = spawn(o);
+    if (r.cancelled) return Result<std::string>::Err("cancelled");
     if (!r.ok || r.exitCode != 0 || r.truncated)
         return Result<std::string>::Err(r.timedOut || r.exitCode == 28 ? "timeout"
                                         : r.truncated ? "response too large"
@@ -845,16 +871,18 @@ std::string providerAuthHeader(const ProviderCfg& prov, const std::string& key) 
 }
 
 std::string fetchModelsBody(const ProviderCfg& prov, long timeoutMs) {
-    static std::map<std::string, std::string> cache;  // one catalog per endpoint, process-lifetime
+    struct Entry { std::string body; int64_t expires; };
+    static std::map<std::string, Entry> cache;
     static std::mutex mu;
-    std::string key = prov.baseUrl + "\n" + prov.protocol + "\n" + prov.keyEnv;
+    auto k = providerApiKey(prov);
+    if (!k.ok) return "";  // an unset key must not poison later authenticated discovery
+    std::string key = json::stringify(json::Array{stateDir(), prov.baseUrl, prov.protocol, prov.keyEnv, k.value});
     {
         std::lock_guard<std::mutex> lk(mu);
         auto it = cache.find(key);
-        if (it != cache.end()) return it->second;
+        if (it != cache.end() && nowMs() < it->second.expires) return it->second.body;
     }
     std::string catalog;
-    auto k = providerApiKey(prov);
     if (k.ok) {
         std::vector<std::string> hdrs;
         if (prov.protocol == "anthropic") hdrs.push_back("anthropic-version: 2023-06-01");
@@ -863,7 +891,15 @@ std::string fetchModelsBody(const ProviderCfg& prov, long timeoutMs) {
         if (r.ok) catalog = std::move(r.value);
     }
     std::lock_guard<std::mutex> lk(mu);
-    return cache[key] = std::move(catalog);
+    size_t bytes = catalog.size();
+    for (const auto& [id, entry] : cache) if (id != key) bytes += entry.body.size();
+    while (!cache.empty() && (bytes > (16U << 20) || (cache.size() >= 64 && !cache.count(key)))) {
+        auto oldest = cache.begin();
+        if (oldest->first != key) bytes -= oldest->second.body.size();
+        cache.erase(oldest);
+    }
+    cache[key] = {catalog, nowMs() + (catalog.empty() ? 5000 : 600000)};
+    return catalog;
 }
 
 long fetchModelContext(const ProviderCfg& prov, const std::string& modelId) {
@@ -1047,6 +1083,35 @@ Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks
         };
 
         SpawnResult r = spawn(o);
+        // Capture a final event even if the gateway omitted the blank line.
+        // Metering must happen before every early return and internal retry.
+        if (stream && !sseCarry.empty()) o.onChunk("\n\n", false);
+        if (cb.onUsage) {
+            ChatResponse usage;
+            if (stream) {
+                auto copy = [&](const auto& acc) {
+                    usage.inTokens = acc.inTokens;
+                    usage.outTokens = acc.outTokens;
+                    usage.cacheHit = acc.cacheHit;
+                    usage.cacheMiss = acc.cacheMiss;
+                    usage.cost = acc.cost;
+                };
+                if (isOpenAi) copy(oacc);
+                else if (isCodex) copy(cacc);
+                else copy(aacc);
+            }
+            // Covers nonstreaming requests, plain JSON gateways ignoring
+            // stream:true, and error responses which still report a bill.
+            auto plain = json::parse(r.out);
+            if (plain.ok) {
+                readUsage(plain.value.at("usage"), usage.inTokens, usage.outTokens,
+                          usage.cacheHit, usage.cacheMiss, usage.cost);
+                if (isCodex)
+                    readUsage(plain.value.at("response").at("usage"), usage.inTokens, usage.outTokens,
+                              usage.cacheHit, usage.cacheMiss, usage.cost);
+            }
+            cb.onUsage(usage);
+        }
         unlink(bodyPath.c_str());
         unlink(cfgPath.c_str());
         int http = readHttpStatus(hdrPath);
@@ -1106,9 +1171,6 @@ Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks
         }
 
         if (stream) {
-            // Some local gateways omit the final blank line. Use the same
-            // dispatch path so the final delta also reaches the UI.
-            if (!sseCarry.empty()) o.onChunk("\n\n", false);
             ChatResponse resp = isOpenAi ? oacc.finish() : isCodex ? cacc.finish() : aacc.finish();
             if (!resp.error.empty()) return Result<ChatResponse>::Err(resp.error);
             if (resp.text.empty() && resp.calls.empty() && !r.out.empty()) {

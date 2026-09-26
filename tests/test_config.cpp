@@ -230,3 +230,67 @@ TEST(config_Model_Compatibility_Options) {
     rmRf(dir);
     return "";
 }
+
+TEST(config_Child_Default_And_Explicit_Empty_Role) {
+    std::string dir = makeTempDir("pocket-childconfig");
+    Config cfg = defaultConfig();
+    cfg.defaultModel = "glm";
+    cfg.roles["subagent"] = "deepseek:deepseek-chat";
+    cfg.roles["review"] = "glm";
+    cfg.bashTimeoutSec = 17;
+    cfg.outputLimitBytes = 8192;
+    CHECK(stageChildConfig(cfg, dir).ok);
+    HomeGuard hg(dir);
+    auto child = loadConfig(dir);
+    CHECK(child.ok);
+    CHECK_EQ(child.value.defaultModel, std::string("deepseek:deepseek-chat"));
+    CHECK_EQ(child.value.bashTimeoutSec, 17);
+    CHECK_EQ(child.value.outputLimitBytes, 8192L);
+    CHECK(saveRole("review", "").ok);
+    CHECK(loadConfig(dir).value.roles["review"].empty());
+    CHECK(!saveRole("typo", "glm").ok);
+    CHECK(atomicWriteFile(userRolesPath(), "bad json").ok);
+    CHECK(!saveRole("fast", "glm").ok);
+    CHECK_EQ(readFileBounded(userRolesPath(), 100).value, std::string("bad json"));
+    rmRf(dir);
+    return "";
+}
+
+TEST(config_Child_Staging_Rejects_Symlink_Parents) {
+    std::string dir = makeTempDir("pocket-childlink");
+    CHECK(ensureDir(dir + "/child", 0700).ok);
+    CHECK(ensureDir(dir + "/outside", 0700).ok);
+    CHECK(symlink((dir + "/outside").c_str(), (dir + "/child/.config").c_str()) == 0);
+    CHECK(!stageChildConfig(defaultConfig(), dir + "/child").ok);
+    CHECK(access((dir + "/outside/pocketharness/config.json").c_str(), F_OK) != 0);
+    rmRf(dir);
+    return "";
+}
+
+TEST(config_Resolved_Model_Identity_Survives_Alias_Reassignment) {
+    Config cfg = defaultConfig();
+    auto before = resolveModel(cfg, "glm");
+    CHECK(before.ok);
+    for (auto& model : cfg.models) if (model.alias == "glm") model.model = "different-model";
+    auto restored = resolveModel(cfg, before.value.spec);
+    CHECK(restored.ok);
+    CHECK_EQ(restored.value.model, before.value.model);
+    CHECK_EQ(restored.value.provider.name, before.value.provider.name);
+    CHECK_EQ(resolveModel(cfg, "glm").value.model, std::string("different-model"));
+    return "";
+}
+
+TEST(config_Project_Cannot_Install_Shell_Hooks) {
+    std::string dir = makeTempDir("pocket-project-hooks");
+    HomeGuard home(dir);
+    CHECK(ensureDir(userConfigDir(), 0700).ok);
+    CHECK(ensureDir(projectDir(dir), 0700).ok);
+    CHECK(atomicWriteFile(userConfigPath(), R"({"hooks":{"stop":["echo trusted"]}})").ok);
+    CHECK(atomicWriteFile(projectConfigPath(dir), R"({"hooks":{"stop":["echo untrusted"],"pre_bash":["rm file"]}})").ok);
+    auto cfg = loadConfig(dir);
+    CHECK(cfg.ok);
+    CHECK_EQ(cfg.value.hooks["stop"], std::vector<std::string>{"echo trusted"});
+    CHECK(!cfg.value.hooks.count("pre_bash"));
+    rmRf(dir);
+    return "";
+}

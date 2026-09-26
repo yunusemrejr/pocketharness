@@ -3,18 +3,36 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdint>
 
 #include "config.h"
 
 namespace pocket {
 
 namespace {
+
+constexpr size_t kMaxSessionBytes = 64u << 20;
+constexpr size_t kMaxMetaBytes = 1u << 20;
+constexpr size_t kMaxWorkspaceEvents = 128;
+constexpr size_t kMaxWorkspaceText = 2048;
+constexpr size_t kMaxWorkspaceBytes = 2u << 20;
+std::string coordinationDirOverride;
+
+struct Fd {
+    int value;
+    explicit Fd(int fd) : value(fd) {}
+    ~Fd() { if (value >= 0) close(value); }
+    Fd(const Fd&) = delete;
+    Fd& operator=(const Fd&) = delete;
+};
 
 std::string sessionPath(const std::string& id) { return sessionDir() + "/" + id + ".jsonl"; }
 
@@ -27,7 +45,200 @@ bool validId(const std::string& id) {
     return true;
 }
 
+bool regularFd(int fd) {
+    struct stat st{};
+    return fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+int openRegular(const std::string& path, int flags, mode_t mode = 0600) {
+    int fd = open(path.c_str(), flags | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, mode);
+    if (fd >= 0 && !regularFd(fd)) { close(fd); fd = -1; errno = EINVAL; }
+    return fd;
+}
+
+bool lockFd(int fd, int operation) {
+    int rc;
+    do { rc = flock(fd, operation); } while (rc != 0 && errno == EINTR);
+    return rc == 0;
+}
+
+bool writeAll(int fd, const std::string& text) {
+    size_t offset = 0;
+    while (offset < text.size()) {
+        ssize_t n = write(fd, text.data() + offset, text.size() - offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        offset += (size_t)n;
+    }
+    int rc;
+    do { rc = fsync(fd); } while (rc != 0 && errno == EINTR);
+    return rc == 0;
+}
+
+bool syncDir(const std::string& path) {
+    Fd fd(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (fd.value < 0) return false;
+    int rc;
+    do { rc = fsync(fd.value); } while (rc != 0 && errno == EINTR);
+    return rc == 0;
+}
+
+Result<std::string> readRegular(const std::string& path, size_t limit, bool missingOk = false,
+                                bool sharedLock = false, bool* missing = nullptr) {
+    if (missing) *missing = false;
+    Fd fd(openRegular(path, O_RDONLY));
+    if (fd.value < 0) {
+        if (missingOk && errno == ENOENT) {
+            if (missing) *missing = true;
+            return Result<std::string>::Ok("");
+        }
+        return Result<std::string>::Err("cannot open regular file " + path);
+    }
+    if (sharedLock && !lockFd(fd.value, LOCK_SH))
+        return Result<std::string>::Err("cannot lock " + path);
+    std::string out;
+    char buf[65536];
+    for (;;) {
+        ssize_t n = read(fd.value, buf, sizeof(buf));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return Result<std::string>::Err("cannot read " + path);
+        if (n == 0) return Result<std::string>::Ok(std::move(out));
+        if ((size_t)n > limit - out.size())
+            return Result<std::string>::Err("file too large: " + path);
+        out.append(buf, (size_t)n);
+    }
+}
+
+// Hold an exclusive log lock while finding and removing a torn final record.
+bool repairTail(int fd) {
+    off_t end = lseek(fd, 0, SEEK_END);
+    if (end < 0) return false;
+    if (end == 0) return true;
+    char c;
+    ssize_t n;
+    do { n = pread(fd, &c, 1, end - 1); } while (n < 0 && errno == EINTR);
+    if (n != 1) return false;
+    if (c == '\n') return true;
+    char buf[4096];
+    while (end > 0) {
+        size_t count = std::min((off_t)sizeof(buf), end);
+        end -= count;
+        do { n = pread(fd, buf, count, end); } while (n < 0 && errno == EINTR);
+        if (n != (ssize_t)count) return false;
+        size_t nl = std::string_view(buf, count).rfind('\n');
+        if (nl != std::string_view::npos) { end += nl + 1; break; }
+    }
+    return ftruncate(fd, end) == 0 && lseek(fd, end, SEEK_SET) == end;
+}
+
+struct SessionEntry { std::string id; struct timespec modified; };
+
+std::vector<SessionEntry> sessionEntries() {
+    std::vector<SessionEntry> entries;
+    DIR* dir = opendir(sessionDir().c_str());
+    if (!dir) return entries;
+    while (dirent* entry = readdir(dir)) {
+        std::string name = entry->d_name;
+        if (!endsWith(name, ".jsonl")) continue;
+        std::string id = name.substr(0, name.size() - 6);
+        struct stat st{};
+        if (!validId(id) || fstatat(dirfd(dir), name.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(st.st_mode)) continue;
+        entries.push_back({std::move(id), st.st_mtim});
+    }
+    closedir(dir);
+    std::sort(entries.begin(), entries.end(), [](const SessionEntry& a, const SessionEntry& b) {
+        if (a.modified.tv_sec != b.modified.tv_sec) return a.modified.tv_sec > b.modified.tv_sec;
+        if (a.modified.tv_nsec != b.modified.tv_nsec) return a.modified.tv_nsec > b.modified.tv_nsec;
+        return a.id > b.id;
+    });
+    return entries;
+}
+
+struct WorkspacePath { std::string workspace, directory, base; };
+
+Result<WorkspacePath> workspacePath(const std::string& workspace, bool create) {
+    char canonical[PATH_MAX];
+    if (workspace.empty() || workspace.find('\0') != std::string::npos ||
+        !realpath(workspace.c_str(), canonical))
+        return Result<WorkspacePath>::Err("workspace does not exist");
+    struct stat st{};
+    if (stat(canonical, &st) != 0 || !S_ISDIR(st.st_mode))
+        return Result<WorkspacePath>::Err("workspace is not a directory");
+    // Stable compact key. The full path is also checked in each document, so
+    // a hash collision fails closed instead of crossing workspace boundaries.
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (unsigned char c : std::string(canonical)) { hash ^= c; hash *= UINT64_C(1099511628211); }
+    char key[17];
+    snprintf(key, sizeof(key), "%016llx", (unsigned long long)hash);
+    std::string dir = sessionWorkspaceCoordinationDir();
+    // Default roots contain unrelated workspaces. Grant only this workspace's
+    // subdirectory. An inherited override is already the parent's narrow scope.
+    if (coordinationDirOverride.empty()) dir += "/" + std::string(key);
+    if (create) {
+        auto made = ensureDir(dir, 0700);
+        if (!made.ok) return Result<WorkspacePath>::Err(made.error);
+    }
+    return Result<WorkspacePath>::Ok({canonical, dir, dir + "/" + key});
+}
+
+Result<json::Value> readWorkspace(const WorkspacePath& path) {
+    bool missing = false;
+    auto data = readRegular(path.base + ".json", kMaxWorkspaceBytes, true, false, &missing);
+    if (!data.ok) return Result<json::Value>::Err(data.error);
+    if (missing) {
+        json::Object initial;
+        initial["workspace"] = path.workspace;
+        initial["sequence"] = 0;
+        initial["events"] = json::Array{};
+        return Result<json::Value>::Ok(json::Value(std::move(initial)));
+    }
+    auto doc = json::parse(data.value);
+    if (!doc.ok || !doc.value.isObj() || doc.value.at("workspace").asStr() != path.workspace ||
+        !doc.value.at("events").isArr() || doc.value.at("events").size() > kMaxWorkspaceEvents ||
+        !doc.value.at("sequence").isNum() || doc.value.at("sequence").asInt(-1) < 0 ||
+        doc.value.at("sequence").asNum() > 9007199254740991.0 ||
+        doc.value.at("sequence").asNum() != doc.value.at("sequence").asInt(-1))
+        return Result<json::Value>::Err("invalid workspace coordination data");
+    long prior = 0;
+    for (const auto& event : doc.value.at("events").asArr()) {
+        long sequence = event.at("sequence").asInt(-1);
+        if (sequence <= prior || (prior && sequence != prior + 1) ||
+            event.at("sequence").asNum(-1) != sequence ||
+            sequence > doc.value.at("sequence").asInt() ||
+            !validId(event.at("session").asStr()) || !validId(event.at("type").asStr()) ||
+            !event.at("text").isStr() || event.at("text").asStr().size() > kMaxWorkspaceText)
+            return Result<json::Value>::Err("invalid workspace event");
+        prior = sequence;
+    }
+    if (prior != doc.value.at("sequence").asInt())
+        return Result<json::Value>::Err("invalid workspace event sequence");
+    return doc;
+}
+
 }  // namespace
+
+std::string sessionWorkspaceCoordinationDir() {
+    return coordinationDirOverride.empty() ? sessionDir() + "/workspaces" : coordinationDirOverride;
+}
+
+VoidResult sessionSetWorkspaceCoordinationDir(const std::string& path) {
+    if (path.empty()) { coordinationDirOverride.clear(); return VoidResult::Ok(); }
+    char canonical[PATH_MAX];
+    struct stat st{};
+    if (path.find('\0') != std::string::npos || lstat(path.c_str(), &st) != 0 ||
+        !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0077) ||
+        !realpath(path.c_str(), canonical))
+        return VoidResult::Err("coordination directory must be an existing private owned directory");
+    coordinationDirOverride = canonical;
+    return VoidResult::Ok();
+}
+
+Result<std::string> sessionWorkspaceDirectory(const std::string& workspace) {
+    auto path = workspacePath(workspace, true);
+    if (!path.ok) return Result<std::string>::Err(path.error);
+    return Result<std::string>::Ok(path.value.directory);
+}
 
 json::Value sessionEventToJson(const SessionEvent& ev) {
     json::Object o;
@@ -67,53 +278,132 @@ Result<std::string> sessionCreate() {
     localtime_r(&now, &tmv);
     char buf[64];
     strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S", &tmv);
-    std::string id = std::string(buf) + "-" + randHex(3);
-    // Create the file so resume can find it even if no events yet.
-    auto w = appendLine(sessionPath(id), json::stringify(sessionEventToJson(
-                                               SessionEvent{"system", "session " + id, "", "", "", true})));
-    if (!w.ok) return Result<std::string>::Err(w.error);
-    return Result<std::string>::Ok(id);
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        std::string id = std::string(buf) + "-" + randHex(6);
+        // O_EXCL prevents the rare random collision from merging histories.
+        Fd fd(openRegular(sessionPath(id), O_WRONLY | O_CREAT | O_EXCL));
+        if (fd.value < 0) {
+            if (errno == EEXIST) continue;
+            return Result<std::string>::Err("cannot create session file");
+        }
+        std::string line = json::stringify(sessionEventToJson(
+            SessionEvent{"system", "session " + id, "", "", "", true})) + "\n";
+        if (!writeAll(fd.value, line) || !syncDir(sessionDir())) {
+            unlink(sessionPath(id).c_str());
+            return Result<std::string>::Err("cannot persist new session");
+        }
+        return Result<std::string>::Ok(id);
+    }
+    return Result<std::string>::Err("cannot allocate a unique session id");
 }
 
 VoidResult sessionAppend(const std::string& id, const SessionEvent& ev) {
     if (!validId(id)) return VoidResult::Err("bad session id");
-    // Remove an uncommitted tail before appending the next durable event.
-    int fd = open(sessionPath(id).c_str(), O_RDWR | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) return VoidResult::Err("cannot open session " + id);
-    off_t end = lseek(fd, 0, SEEK_END);
-    char c = '\n';
-    bool ok = end >= 0 && (end == 0 || pread(fd, &c, 1, end - 1) == 1);
-    if (ok && c != '\n') {
-        char buf[4096];
-        while (ok && end > 0) {
-            size_t n = std::min((off_t)sizeof(buf), end);
-            end -= n;
-            ok = pread(fd, buf, n, end) == (ssize_t)n;
-            if (!ok) break;
-            std::string_view chunk(buf, n);
-            size_t nl = chunk.rfind('\n');
-            if (nl != std::string_view::npos) { end += nl + 1; break; }
-        }
-        if (ok) ok = ftruncate(fd, end) == 0;
-    }
-    close(fd);
-    if (!ok) return VoidResult::Err("cannot repair session tail");
-    return appendLine(sessionPath(id), json::stringify(sessionEventToJson(ev)));
+    if (ev.type.empty()) return VoidResult::Err("empty session event type");
+    std::string line = json::stringify(sessionEventToJson(ev)) + "\n";
+    if (line.size() > kMaxSessionBytes) return VoidResult::Err("session event too large");
+    Fd fd(openRegular(sessionPath(id), O_RDWR));
+    if (fd.value < 0) return VoidResult::Err("cannot open session " + id);
+    // Repair and append use one fd and one lock. Even concurrent readers never
+    // see an in-progress record, and concurrent appenders cannot truncate it.
+    if (!lockFd(fd.value, LOCK_EX) || !repairTail(fd.value))
+        return VoidResult::Err("cannot repair session tail");
+    off_t end = lseek(fd.value, 0, SEEK_END);
+    if (end < 0 || (uint64_t)end > kMaxSessionBytes - line.size())
+        return VoidResult::Err("session reached 64 MiB; start a new session");
+    if (!writeAll(fd.value, line)) return VoidResult::Err("cannot persist session event");
+    return VoidResult::Ok();
 }
 
 Result<int> sessionLock(const std::string& id) {
     if (!validId(id)) return Result<int>::Err("bad session id");
-    int fd = open((sessionDir() + "/" + id + ".lock").c_str(),
-                  O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    Fd session(openRegular(sessionPath(id), O_RDONLY));
+    if (session.value < 0) return Result<int>::Err("session not found: " + id);
+    int fd = openRegular(sessionDir() + "/" + id + ".lock", O_RDWR | O_CREAT);
     if (fd < 0) return Result<int>::Err("cannot lock session " + id);
-    if (flock(fd, LOCK_EX | LOCK_NB) == 0) return Result<int>::Ok(fd);
+    if (lockFd(fd, LOCK_EX | LOCK_NB)) return Result<int>::Ok(fd);
     close(fd);
     return Result<int>::Err("session " + id + " is active in another process");
 }
 
+Result<int> sessionWorkspaceLock(const std::string& workspace, std::atomic<bool>* cancel) {
+    auto path = workspacePath(workspace, true);
+    if (!path.ok) return Result<int>::Err(path.error);
+    int fd = openRegular(path.value.base + ".write.lock", O_RDWR | O_CREAT);
+    if (fd < 0) return Result<int>::Err("cannot open workspace mutation lock");
+    for (;;) {
+        if (cancel && cancel->load()) { close(fd); return Result<int>::Err("cancelled"); }
+        if (lockFd(fd, LOCK_EX | LOCK_NB)) return Result<int>::Ok(fd);
+        if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            close(fd);
+            return Result<int>::Err("cannot acquire workspace mutation lock");
+        }
+        struct timespec pause{0, 20 * 1000 * 1000};
+        nanosleep(&pause, nullptr);
+    }
+}
+
+VoidResult sessionWorkspacePublish(const std::string& workspace, const std::string& sessionId,
+                                    const std::string& type, const std::string& text) {
+    if (!validId(sessionId) || !validId(type)) return VoidResult::Err("invalid workspace event id/type");
+    auto path = workspacePath(workspace, true);
+    if (!path.ok) return VoidResult::Err(path.error);
+    Fd fd(openRegular(path.value.base + ".events.lock", O_RDWR | O_CREAT));
+    if (fd.value < 0 || !lockFd(fd.value, LOCK_EX))
+        return VoidResult::Err("cannot lock workspace events");
+    auto doc = readWorkspace(path.value);
+    if (!doc.ok) return VoidResult::Err(doc.error);
+    long sequence = doc.value.at("sequence").asInt();
+    if (sequence >= 9007199254740991L) return VoidResult::Err("workspace event sequence exhausted");
+    // Normalize malformed UTF-8 through JSON before limiting the encoded text.
+    std::string bounded = json::parse(json::stringify(json::Value(text.substr(0, kMaxWorkspaceText)))).value.asStr();
+    if (bounded.size() > kMaxWorkspaceText) {
+        size_t cut = kMaxWorkspaceText;
+        while (cut > 0 && ((unsigned char)bounded[cut] & 0xc0) == 0x80) --cut;
+        bounded.resize(cut);
+    }
+    json::Object event;
+    event["sequence"] = ++sequence;
+    event["session"] = sessionId;
+    event["type"] = type;
+    event["text"] = std::move(bounded);
+    auto& events = doc.value.asObj()["events"].asArr();
+    if (events.size() >= kMaxWorkspaceEvents) events.erase(events.begin());
+    events.push_back(json::Value(std::move(event)));
+    doc.value.asObj()["sequence"] = sequence;
+    auto saved = atomicWriteFile(path.value.base + ".json", json::stringify(doc.value) + "\n", 0600);
+    if (!saved.ok) return saved;
+    if (!syncDir(path.value.directory))
+        return VoidResult::Err("cannot persist workspace events directory");
+    return VoidResult::Ok();
+}
+
+Result<WorkspaceUpdates> sessionWorkspaceRead(const std::string& workspace, long after,
+                                              const std::string& ownSession) {
+    if (after < 0 || (!ownSession.empty() && !validId(ownSession)))
+        return Result<WorkspaceUpdates>::Err("invalid workspace event cursor/session");
+    auto path = workspacePath(workspace, false);
+    if (!path.ok) return Result<WorkspaceUpdates>::Err(path.error);
+    // Atomic replacement provides a coherent snapshot without blocking a writer.
+    auto doc = readWorkspace(path.value);
+    if (!doc.ok) return Result<WorkspaceUpdates>::Err(doc.error);
+    WorkspaceUpdates out;
+    out.lastSequence = doc.value.at("sequence").asInt();
+    const auto& events = doc.value.at("events").asArr();
+    out.missed = after > out.lastSequence ||
+                 (!events.empty() && after < events.front().at("sequence").asInt() - 1);
+    for (const auto& event : events) {
+        long sequence = event.at("sequence").asInt();
+        if ((sequence > after || after > out.lastSequence) && event.at("session").asStr() != ownSession)
+            out.events.push_back({sequence, event.at("session").asStr(), event.at("type").asStr(),
+                                  event.at("text").asStr()});
+    }
+    return Result<WorkspaceUpdates>::Ok(std::move(out));
+}
+
 Result<SessionLoad> sessionLoad(const std::string& id) {
     if (!validId(id)) return Result<SessionLoad>::Err("bad session id");
-    auto t = readFileBounded(sessionPath(id), 64 << 20);
+    auto t = readRegular(sessionPath(id), kMaxSessionBytes, false, true);
     if (!t.ok) return Result<SessionLoad>::Err(t.error);
     SessionLoad out;
     // Even valid JSON without a newline is an uncommitted/torn event.
@@ -125,7 +415,7 @@ Result<SessionLoad> sessionLoad(const std::string& id) {
     for (const std::string& line : splitLines(t.value)) {
         if (trim(line).empty()) continue;
         auto v = json::parse(line);
-        if (!v.ok || !v.value.isObj() || !v.value.at("t").isStr()) {
+        if (!v.ok || !v.value.isObj() || v.value.at("t").asStr().empty()) {
             // Partial final line from a crash, or corruption: skip, keep going.
             out.skipped++;
             continue;
@@ -137,20 +427,10 @@ Result<SessionLoad> sessionLoad(const std::string& id) {
 
 std::vector<SessionInfo> sessionList(size_t max, const std::string& workspace) {
     std::vector<SessionInfo> out;
-    DIR* d = opendir(sessionDir().c_str());
-    if (!d) return out;
-    struct DirCloser {
-        DIR* d;
-        ~DirCloser() { closedir(d); }
-    } closer{d};
-    std::vector<std::string> names;
-    while (dirent* e = readdir(d)) {
-        std::string n = e->d_name;
-        if (endsWith(n, ".jsonl")) names.push_back(n.substr(0, n.size() - 6));
-    }
-    std::sort(names.begin(), names.end(), std::greater<std::string>());
-    for (const auto& id : names) {
+    if (max == 0) return out;
+    for (const auto& entry : sessionEntries()) {
         if (out.size() >= max) break;
+        const auto& id = entry.id;
         auto meta = sessionLoadMeta(id);
         if (!meta.ok || (!workspace.empty() && meta.value.workspace != workspace)) continue;
         SessionInfo si;
@@ -162,7 +442,7 @@ std::vector<SessionInfo> sessionList(size_t max, const std::string& workspace) {
         if (lock.ok) close(lock.value);
         // Listing never parses a whole multi-megabyte conversation. The first
         // 64 KiB is enough for a preview; resume still reads the complete log.
-        int fd = open(si.path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        int fd = openRegular(si.path, O_RDONLY);
         if (fd < 0) continue;
         char prefix[65536];
         ssize_t n = read(fd, prefix, sizeof(prefix));
@@ -188,9 +468,10 @@ Result<SessionMeta> sessionLoadMeta(const std::string& id) {
     SessionMeta m;
     if (!validId(id)) return Result<SessionMeta>::Err("bad session id");
     std::string p = sessionDir() + "/" + id + ".meta.json";
-    if (access(p.c_str(), F_OK) != 0 && errno == ENOENT) return Result<SessionMeta>::Ok(m);
-    auto t = readFileBounded(p, 1 << 20);
+    bool missing = false;
+    auto t = readRegular(p, kMaxMetaBytes, true, false, &missing);
     if (!t.ok) return Result<SessionMeta>::Err(t.error);
+    if (missing) return Result<SessionMeta>::Ok(m);
     auto v = json::parse(t.value);
     if (!v.ok || !v.value.isObj()) return Result<SessionMeta>::Err("invalid session metadata: " + id);
     m.systemPrompt = v.value.at("system_prompt").asStr();
@@ -211,6 +492,14 @@ Result<SessionMeta> sessionLoadMeta(const std::string& id) {
     m.cost = v.value.at("cost").asNum(0);
     m.cacheSeen = v.value.at("cache_seen").asBool(false);
     m.costSeen = v.value.at("cost_seen").asBool(false);
+    m.sideCost = v.value.at("side_cost").asNum(0);
+    m.costEstimated = v.value.at("cost_estimated").asBool(false);
+    m.costIncomplete = v.value.at("cost_incomplete").asBool(false);
+    m.genTokens = v.value.at("gen_tokens").asInt(m.outTokens);
+    m.childSessions = v.value.at("child_sessions").asInt(0);
+    m.rolesSet = v.value.at("roles_set").asBool(false);
+    for (const auto& [role, model] : v.value.at("roles").asObj())
+        if (model.isStr()) m.roles[role] = model.asStr();
     return Result<SessionMeta>::Ok(m);
 }
 
@@ -237,21 +526,43 @@ VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m) {
     o["cost"] = json::Value(m.cost);
     o["cache_seen"] = json::Value(m.cacheSeen);
     o["cost_seen"] = json::Value(m.costSeen);
-    return atomicWriteFile(sessionDir() + "/" + id + ".meta.json",
-                           json::stringify(json::Value(o), true) + "\n", 0600);
+    o["side_cost"] = json::Value(m.sideCost);
+    o["cost_estimated"] = json::Value(m.costEstimated);
+    o["cost_incomplete"] = json::Value(m.costIncomplete);
+    o["gen_tokens"] = json::Value(m.genTokens);
+    o["child_sessions"] = json::Value(m.childSessions);
+    o["roles_set"] = json::Value(m.rolesSet);
+    json::Object roles;
+    for (const auto& [role, model] : m.roles) roles[role] = model;
+    o["roles"] = json::Value(std::move(roles));
+    std::string data = json::stringify(json::Value(o), true) + "\n";
+    if (data.size() > kMaxMetaBytes) return VoidResult::Err("session metadata exceeds 1 MiB");
+    auto saved = atomicWriteFile(sessionDir() + "/" + id + ".meta.json", data, 0600);
+    if (!saved.ok) return saved;
+    if (!syncDir(sessionDir())) return VoidResult::Err("cannot persist session metadata directory");
+    return VoidResult::Ok();
 }
 
 Result<std::string> sessionResolve(const std::string& idOrEmpty, const std::string& workspace) {
     if (idOrEmpty.empty() || idOrEmpty == "last") {
-        auto list = sessionList(30, workspace);
-        if (list.empty()) return Result<std::string>::Err("no sessions yet");
-        for (const auto& si : list)
-            if (!si.active) return Result<std::string>::Ok(si.id);
-        return Result<std::string>::Err("all recent sessions are active");
+        bool found = false;
+        for (const auto& entry : sessionEntries()) {
+            auto meta = sessionLoadMeta(entry.id);
+            if (!meta.ok || (!workspace.empty() && meta.value.workspace != workspace)) continue;
+            found = true;
+            auto lock = sessionLock(entry.id);
+            if (lock.ok) { close(lock.value); return Result<std::string>::Ok(entry.id); }
+        }
+        return Result<std::string>::Err(found ? "all sessions are active" : "no sessions yet");
     }
     if (!validId(idOrEmpty)) return Result<std::string>::Err("bad session id");
-    if (access(sessionPath(idOrEmpty).c_str(), R_OK) != 0)
+    Fd fd(openRegular(sessionPath(idOrEmpty), O_RDONLY));
+    if (fd.value < 0)
         return Result<std::string>::Err("session not found: " + idOrEmpty);
+    auto meta = sessionLoadMeta(idOrEmpty);
+    if (!meta.ok) return Result<std::string>::Err(meta.error);
+    if (!workspace.empty() && !meta.value.workspace.empty() && meta.value.workspace != workspace)
+        return Result<std::string>::Err("session belongs to workspace " + meta.value.workspace);
     return Result<std::string>::Ok(idOrEmpty);
 }
 

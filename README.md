@@ -45,7 +45,7 @@ terminal → agent loop → model provider → optional tool call → Linux/file
 ```
 
 One competent engineer should be able to understand essentially the entire
-architecture in an afternoon. (About 11k lines of C++ including headers, 17 translation units.)
+architecture in an afternoon. The core stays native C++ with 17 translation units.
 
 ## Install
 
@@ -94,12 +94,14 @@ export DEEPSEEK_API_KEY=...
 export OPENROUTER_API_KEY=...     # also enables the Span/Jev judges
 ```
 
-Slash commands: `/models` (assign main · fast · fallback · review, fuzzy
+Slash commands: `/models` (assign main · fast · fallback · review · subagent, fuzzy
 search over the catalog) `/model` `/goal` `/thinking` `/compact` `/undo`
 `/skills` `/session` `/brain` `/catalog` `/security` `/help` `/quit`. Keys: Enter submits, Ctrl-J/Alt-Enter newline,
 Up/Down history, Ctrl-C cancels (empty prompt quits), Ctrl-D quits.
 Paste is bracketed (multi-line paste never submits early); the pinned bottom
-bar always shows the input box plus context/tok-s/cache KPIs.
+bar shows the input box, full provider/model/thinking, combined metered cost,
+and context/tok-s/cache KPIs. Text typed during generation is kept for the next
+prompt; Enter submits it after the current turn finishes.
 Paste or drop an image file (PNG/JPEG/GIF/WebP, max 5 MiB) to attach it to
 the next message — vision models read it inline (`--image PATH` does the
 same for `-p`).
@@ -166,13 +168,23 @@ side cost; `review: false` / `autonomy: false` switch the overseer off.
 
 ## Roles, fallback, cost
 
-`/models` assigns four roles, saved in `~/.config/pocketharness/roles.json`:
+`/models` assigns five roles, saved in `~/.config/pocketharness/roles.json`
+as defaults and frozen in each session for resume:
 `main` does the work; `fast` writes briefs, summaries and goal audits;
 `fallback` takes a request when `main` stays down after its own retries
 (5xx/429/transport — never on 4xx); `review` is the council (comma-separate
-several models for a majority vote). Total cost in the status bar includes
-judges, reviews, briefs and summaries; unreported cost is estimated from
-catalog prices and marked `~`.
+several models for a majority vote); `subagent` supplies the default model for
+recursive `pocket -p` processes. An explicit child `-m` overrides that default.
+Use the picker, or `/models subagent provider:model`, `/models review model1,model2`,
+and `/models fallback -` to clear an optional role.
+
+Total cost includes main/fallback attempts (including billed failures), judges,
+skill selection, reviews, briefs, summaries and recursive children without
+double counting. Codex subscription usage is excluded; local calls are free.
+Catalog estimates are marked `~`; unavailable billing data is marked
+`+ unreported` rather than silently presented as an exact total. Provider billing
+statements remain authoritative. Child receipts are informational data in scratch,
+not an accounting or security boundary.
 
 ## The five tools
 
@@ -280,10 +292,14 @@ Hooks run in exactly the bash-tool sandbox (`{file}`/`{cmd}` expand
 shell-quoted): `post_edit` failures return to the model, a failing
 `pre_bash` blocks the command, failing `stop` hooks keep the turn going.
 `local_lm` is optional: the harness starts `llama-server` on loopback only
-when a judgement needs it (niced, thread-capped) and stops it on exit.
+when a judgement needs it (niced, thread-capped). Sessions serialize access to
+its slot, cache repeated questions, and reuse prompt prefixes. Missing remote
+decisions fall back locally within a bounded time budget. Local transcript
+judgments assist the worker but cannot independently certify goal completion or
+skip the review council. An existing externally started server is left running.
 
 Security-sensitive keys (`providers`, `tool_network`, `allow_read`,
-`allow_write`, `expose_env`, `local_lm`, timeouts, `max_rounds`) from **project**
+`allow_write`, `expose_env`, `local_lm`, hooks, timeouts, `max_rounds`) from **project**
 config are ignored
 with a warning — a repository must never silently escalate its own authority,
 and especially never redirect provider endpoints (which decide where API
@@ -538,6 +554,15 @@ an idle session in the current workspace; an explicit id from another workspace
 fails with its location. Legacy sessions without workspace metadata can be
 resumed by explicit id. Session listing reads only a small preview of each log.
 
+Same-workdir sessions exchange bounded status and file-change notices through a
+separate directory scoped to that workspace. Conversations, role choices and
+model history stay separate. Native write/edit/undo operations share an
+interruptible advisory lock; undo refuses to replace a file changed by another
+writer. Arbitrary bash commands and external editors still require coordination.
+Recursive children inherit model settings without implicitly receiving keys,
+share only their workspace's coordination directory, and report cumulative
+metered costs to the parent. Use explicit `expose_env` for child provider keys.
+
 Tool batches are persisted before execution. Cancellation closes all outstanding
 calls; after a crash, unanswered calls get an “outcome unknown” result and are
 never automatically rerun. Persistence errors stop further side effects. No
@@ -565,7 +590,7 @@ Default posture:
 ```
 Workspace read/write        YES (that is the agent's job)
 Session tmp                 YES (narrow; never holds secrets)
-State dir / sessions        PARENT ONLY (no child profile grants it)
+State dir / sessions        PARENT ONLY (except scoped workspace notices)
 System binaries/libraries   read/execute
 $HOME, ~/.ssh, other repos  NO by default
 Provider network (harness)  YES (confined curl, brokered key)
@@ -631,8 +656,9 @@ and provider keys stay out of the model environment.
   always show what is actually enforced.
 - The workspace itself is writable by design — the guard catches only
   obviously catastrophic classes, not all bad edits. Git is your undo.
-- Different sessions may edit the same workspace. Session locks prevent log
-  corruption; they are not workspace-wide transaction locks.
+- Different sessions may edit the same workspace. Native file tools serialize
+  mutations and exchange notices; arbitrary bash commands and external editors
+  do not participate in that lock. Read current contents before changing files.
 - This is a mistake-tolerant harness, not a hostile-code sandbox.
 
 ## Layout

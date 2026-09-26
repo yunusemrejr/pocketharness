@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.5.0
+
+- Preserve follow-up input while a response streams; fix input-reader handoff,
+  dangling callbacks after turns, multiline paste, slash-command boundaries,
+  approval/picker input, Unicode cursor movement, and narrow/resized terminals.
+- Show full provider, model and thinking level in the footer. Aggregate metered
+  model, retry, judge, skill-selection, review, summary and recursive-child costs.
+  Exclude Codex subscription usage; mark estimates and missing billing data.
+- `/models` selects main, fast, fallback, review council and subagent defaults.
+  Validate selections before applying them and preserve session-specific roles
+  across resume. Recursive children inherit the selected model and settings
+  without implicitly receiving credentials.
+- Serialize session append/repair, reject nonregular state files, restore the
+  actual latest idle session, and keep workspace notices separate from private
+  transcripts. Same-workdir sessions exchange bounded status/change notices;
+  native writes/edits/undo use cancellable workspace locks.
+- Refuse stale undo after another writer changes a file; contain deletion,
+  preserve private file permissions, bound undo memory, handle empty reads and
+  quote hook substitutions without recursive expansion.
+  Project configuration cannot install shell hooks that bypass command approval.
+- Bound and cancel local/Jev/Span calls, reuse local prompt/cache results,
+  serialize access to the local model slot, and fill missing decisions locally.
+  Tiny local transcript guesses cannot certify a goal or skip council review.
+  Merge provider learning safely across processes.
+- Keep main context accounting separate from side calls, repair compaction turn
+  boundaries, meter failed attempts, and validate tool IDs before side effects.
+  Harden provider header parsing, malformed responses, and Codex token decoding.
+- Add real PTY, localhost transport, recursive CLI, and multiprocess regressions.
+  Installation replaces the executable atomically so existing sessions survive.
+- Give recursive processes a bounded termination grace period to cancel their
+  own tool groups and report usage; deeper children receive shorter deadlines.
+
 ## 0.4.0
 
 - Overseer: expert brief before substantial work, Span-read stop gate

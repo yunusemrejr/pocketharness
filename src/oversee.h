@@ -6,6 +6,7 @@
 // their native heuristic.
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <string>
 #include <vector>
@@ -18,7 +19,7 @@ namespace pocket {
 // P(yes) that `question` holds for `text`; -1 when no judge answered.
 // cost (if non-null) receives the USD spent (0 local, reported for Jev).
 double judgeYes(const Config& cfg, const std::string& question, const std::string& text,
-                double* cost = nullptr);
+                double* cost = nullptr, std::atomic<bool>* cancel = nullptr);
 
 // Batched structured judgment on OpenRouter's decisions API: one call
 // answers many yes/no questions with calibrated probabilities.
@@ -26,13 +27,17 @@ double judgeYes(const Config& cfg, const std::string& question, const std::strin
 //     must be {"input":[{role,content}...],"output":{role:assistant,...}}.
 //   transcript=false: Jev (typesafe) judges any content object.
 // Each route falls back to the other. Returns id -> P(yes); missing ids
-// mean "unknown". Cached per process; cost += USD reported.
+// mean "unknown". Local yes/no inference fills unavailable answers, with a
+// bounded total budget. Local transcript probabilities stay in [0.2,0.8]
+// (triage signals, not completion/review certification).
+// Cached per process; cost += USD reported even when
+// a response only answers part of the batch. Cancellation stops every route.
 struct Question {
     std::string id, text;
 };
 std::map<std::string, double> decide(const Config& cfg, const json::Value& state,
                                      const std::vector<Question>& qs, bool transcript,
-                                     double* cost = nullptr);
+                                     double* cost = nullptr, std::atomic<bool>* cancel = nullptr);
 bool decideAvailable(const Config& cfg);
 std::string judgeStatus(const Config& cfg);  // which judges are live
 void judgeShutdown();                        // stop a llama-server this process started

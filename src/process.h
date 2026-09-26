@@ -24,6 +24,7 @@ struct SpawnOpts {
     std::function<void()> childSetup;      // runs in child before exec (async-safe only)
     std::function<void(std::string_view, bool isErr)> onChunk;  // capped at outLimit per stream
     std::atomic<bool>* cancel = nullptr;   // set true to kill child
+    long terminateGraceMs = 750;           // TERM cleanup before KILL; bounded to 0..5000
 };
 
 struct SpawnResult {

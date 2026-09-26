@@ -2,7 +2,10 @@
 #include "config.h"
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <cmath>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -188,7 +191,7 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
                     if (!isLoopbackHttp(pc.baseUrl))
                         return VoidResult::Err("provider \"" + kv.first +
                                                "\" needs \"key_env\"");
-                } else if (!validEnvName(pc.keyEnv))
+                } else if (!pc.keyEnv.empty() && !validEnvName(pc.keyEnv))
                     return VoidResult::Err("provider \"" + kv.first +
                                            "\": key_env must be a shell variable name");
                 bool replaced = false;
@@ -265,11 +268,14 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
     if (v.has("roles")) {
         if (!o.at("roles").isObj()) return typeErr("roles", "an object of role -> model spec");
         for (const auto& [role, spec] : o.at("roles").asObj()) {
+            if (role != "main" && role != "fast" && role != "fallback" && role != "review" && role != "subagent")
+                return VoidResult::Err("unknown model role: " + role);
             if (!spec.isStr()) return typeErr("roles", "an object of role -> model spec");
             cfg.roles[role] = spec.asStr();
         }
     }
-    if (v.has("hooks")) {
+    if (v.has("hooks") && isProject) projWarn += "project config ignored security key: hooks\n";
+    if (v.has("hooks") && !isProject) {
         if (!o.at("hooks").isObj()) return typeErr("hooks", "an object of event -> [commands]");
         for (const auto& [ev, cmds] : o.at("hooks").asObj()) {
             if (ev != "post_edit" && ev != "pre_bash" && ev != "stop")
@@ -384,23 +390,93 @@ Result<Config> loadConfig(const std::string& workspace) {
         auto v = json::parse(t.value);
         if (v.ok)
             for (const auto& [role, spec] : v.value.isObj() ? v.value.asObj() : json::Object{})
-                if (spec.isStr() && !spec.asStr().empty()) cfg.roles[role] = spec.asStr();
+                if (spec.isStr()) cfg.roles[role] = spec.asStr();
     }
-    if (cfg.roles.count("main")) cfg.defaultModel = cfg.roles["main"];
+    if (cfg.roles.count("main") && !cfg.roles["main"].empty()) cfg.defaultModel = cfg.roles["main"];
     return Result<Config>::Ok(std::move(cfg));
 }
 
 VoidResult saveRole(const std::string& role, const std::string& spec) {
+    if (role != "main" && role != "fast" && role != "fallback" && role != "review" && role != "subagent")
+        return VoidResult::Err("unknown model role: " + role);
+    auto d = ensureDir(userConfigDir(), 0700);
+    if (!d.ok) return d;
+    int fd = open((userRolesPath() + ".lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    if (fd < 0) return VoidResult::Err("cannot open model roles lock");
+    struct Lease { int fd; ~Lease() { close(fd); } } lease{fd};
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return VoidResult::Err("invalid model roles lock");
+    while (flock(fd, LOCK_EX) != 0) if (errno != EINTR) return VoidResult::Err("cannot lock model roles");
     json::Object roles;
     if (auto t = readFileBounded(userRolesPath(), 65536); t.ok) {
         auto v = json::parse(t.value);
-        if (v.ok && v.value.isObj()) roles = v.value.asObj();
+        if (!v.ok || !v.value.isObj()) return VoidResult::Err("invalid roles.json; refusing to overwrite");
+        roles = v.value.asObj();
     }
-    if (spec.empty()) roles.erase(role);
-    else roles[role] = spec;
-    auto d = ensureDir(userConfigDir(), 0700);
-    if (!d.ok) return d;
+    roles[role] = spec;  // explicit empty clears a role inherited from config.json
     return atomicWriteFile(userRolesPath(), json::stringify(json::Value(roles), true) + "\n", 0600);
+}
+
+VoidResult stageChildConfig(const Config& cfg, const std::string& childHome) {
+    json::Object providers, models, roles;
+    for (const auto& p : cfg.providers)
+        providers[p.name] = json::Object{{"protocol", p.protocol}, {"base_url", p.baseUrl}, {"key_env", p.keyEnv}};
+    for (const auto& m : cfg.models) {
+        json::Object model{{"provider", m.provider}, {"model", m.model}, {"routing", m.routing},
+                           {"max_tokens", m.options.maxTokens}, {"reasoning", m.options.reasoning},
+                           {"token_parameter", m.options.tokenParameter}, {"stream_usage", m.options.streamUsage},
+                           {"prompt_cache", m.options.promptCache}};
+        if (m.contextSet) model["context"] = m.context;
+        models[m.alias] = model;
+    }
+    auto canonical = [&](std::string spec) {
+        std::replace(spec.begin(), spec.end(), ',', '\n');
+        std::vector<std::string> resolved;
+        for (const auto& one : splitLines(spec)) {
+            if (trim(one).empty()) continue;
+            auto m = resolveModel(cfg, trim(one));
+            if (!m.ok) { resolved.push_back(trim(one)); continue; }
+            resolved.push_back(m.value.provider.name + ":" + m.value.model +
+                               (m.value.routing.empty() ? "" : "@" + m.value.routing));
+        }
+        return join(resolved, ",");
+    };
+    for (const char* role : {"main", "fast", "fallback", "review", "subagent"}) {
+        auto entry = cfg.roles.find(role);
+        roles[role] = entry == cfg.roles.end() ? "" : canonical(entry->second);
+    }
+    auto sub = cfg.roles.find("subagent");
+    std::string model = canonical(sub != cfg.roles.end() && !sub->second.empty() ? sub->second : cfg.defaultModel);
+    roles["main"] = model;
+    json::Array exposed;
+    for (const auto& name : cfg.exposeEnv) exposed.push_back(name);
+    json::Value settings = json::Object{{"providers", providers}, {"models", models}, {"roles", roles},
+        {"default_model", model}, {"thinking", cfg.thinking}, {"review", cfg.review}, {"autonomy", cfg.autonomy},
+        {"jev", cfg.jev}, {"max_rounds", cfg.maxRounds}, {"bash_timeout", cfg.bashTimeoutSec},
+        {"tool_network", cfg.toolNetwork}, {"output_limit", cfg.outputLimitBytes}, {"expose_env", exposed}};
+    // The fake HOME is tool-writable. Anchor every parent directory so a model
+    // cannot redirect the trusted harness into a symlink outside scratch.
+    int fd = open(childHome.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return VoidResult::Err("cannot open child HOME directory");
+    struct Lease { int fd; ~Lease() { close(fd); } } lease{fd};
+    for (const char* part : {".config", "pocketharness"}) {
+        if (mkdirat(lease.fd, part, 0700) != 0 && errno != EEXIST)
+            return VoidResult::Err("cannot create child config directory");
+        int next = openat(lease.fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0) return VoidResult::Err("child config directory must not be a symlink");
+        close(lease.fd); lease.fd = next;
+    }
+    std::string path = "/proc/self/fd/" + std::to_string(lease.fd);
+    auto writeSettings = [&](const char* name, const json::Value& value) {
+        std::string body = json::stringify(value) + "\n", file = path + "/" + name;
+        auto old = readFileBounded(file, 1 << 20);
+        if (old.ok && old.value == body) return VoidResult::Ok();
+        return atomicWriteFile(file, body, 0600);
+    };
+    auto written = writeSettings("config.json", settings);
+    if (!written.ok) return written;
+    // Roles override project defaults and replace stale child UI selections.
+    return writeSettings("roles.json", roles);
 }
 
 int loadEnvFile(const std::string& path) {
@@ -474,7 +550,7 @@ Result<ResolvedModel> resolveModel(const Config& cfg, const std::string& spec) {
             rm.context = m.context;
             if (!m.contextSet && isLoopbackHttp(p->baseUrl)) rm.context = 32768;
             rm.options = m.options;
-            rm.spec = s;
+            rm.spec = m.provider + ":" + m.model + (m.routing.empty() ? "" : "@" + m.routing);
             return Result<ResolvedModel>::Ok(std::move(rm));
         }
     return Result<ResolvedModel>::Err("unknown model \"" + s +

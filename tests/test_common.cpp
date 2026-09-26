@@ -23,3 +23,9 @@ TEST(common_Base64_Vectors) {
               c == '+' || c == '/' || c == '=');
     return "";
 }
+
+TEST(common_Terminal_CSI_Punctuation_Does_Not_Eat_Text) {
+    CHECK_EQ(pocket::sanitizeTerminal("a\033[2~hello\033[?25lb"), std::string("ahellob"));
+    CHECK_EQ(pocket::sanitizeTerminal("a\0337b"), std::string("ab"));
+    return "";
+}

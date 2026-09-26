@@ -521,3 +521,172 @@ TEST(agent_Image_Detection_Reads_Only_The_Header) {
     rmRf(dir);
     return "";
 }
+
+TEST(agent_Side_Costs_Do_Not_Replace_Main_Context_And_Persist) {
+    std::string dir = makeTempDir("pocket-costs");
+    HomeGuard home(dir);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    AgentOpts opts;
+    opts.sessionId = id.value;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.hint = [](const std::string&, double* cost) { *cost += .01; return ""; };
+    opts.request = [](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        r.text = req.stream ? "finished" : "DONE";
+        r.inTokens = req.stream ? 10000 : 10;
+        r.cost = req.stream ? .2 : .03;
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runGoal("answer question").empty());
+    CHECK(a.contextUsed() >= 10000);
+    CHECK(a.stats().cost > .269 && a.stats().cost < .271);
+    CHECK(a.stats().sideCost > .069 && a.stats().sideCost < .071);
+    // runGoal's final auditor also needs to reach the persisted total.
+    Agent b(opts);
+    CHECK(b.restore(id.value).ok);
+    CHECK_EQ(b.stats().cost, a.stats().cost);
+    CHECK_EQ(b.stats().sideCost, a.stats().sideCost);
+    rmRf(dir);
+    return "";
+}
+
+TEST(agent_Subscriptions_Are_Excluded_From_Metered_Cost) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.model.provider.protocol = "codex";
+    opts.model.inPrice = opts.model.outPrice = 100;
+    opts.request = [](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        r.text = "done";
+        r.inTokens = 500;
+        r.cost = 123;
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runTurn("hello").empty());
+    CHECK_EQ(a.stats().cost, 0.0);
+    CHECK(!a.stats().costIncomplete);
+    CHECK_EQ(a.stats().inTokens, 500L);
+    return "";
+}
+
+TEST(agent_Duplicate_Tool_IDs_Stop_Before_Side_Effects) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.request = [](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        r.calls = {{"same", "write", "{}"}, {"same", "bash", "{}"}};
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runTurn("go").find("invalid tool call batch") != std::string::npos);
+    CHECK_EQ(a.stats().toolCalls, 0);
+    CHECK(validateHistory(a.messages()).empty());
+    return "";
+}
+
+TEST(agent_Workspace_Notices_Stay_Out_Of_Frozen_Prefix) {
+    std::string dir = makeTempDir("pocket-coordination");
+    HomeGuard home(dir);
+    auto own = sessionCreate(), peer = sessionCreate();
+    CHECK(own.ok && peer.ok);
+    CHECK(sessionWorkspacePublish(dir, peer.value, "changed", "src/shared.cpp").ok);
+    ToolEnv env;
+    env.workspace = dir;
+    AgentOpts opts;
+    opts.sessionId = own.value;
+    opts.tools = &env;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    bool notice = false;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        for (const auto& m : req.messages)
+            notice |= m.content.find("src/shared.cpp") != std::string::npos;
+        ChatResponse r;
+        r.text = "done";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    auto prefix = a.systemPrompt();
+    CHECK(a.runTurn("go").empty());
+    CHECK(notice);
+    CHECK_EQ(a.systemPrompt(), prefix);
+    CHECK(a.systemPrompt().find("src/shared.cpp") == std::string::npos);
+    rmRf(dir);
+    return "";
+}
+
+TEST(agent_Compaction_Preserves_Current_Turn_For_Judges) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.model.context = 50000;
+    opts.autonomy = true;
+    bool currentTurn = false;
+    int mainCalls = 0;
+    opts.decide = [&](const json::Value& state, const std::vector<Question>&, bool, double*) {
+        for (const auto& m : state.at("input").asArr())
+            currentTurn |= m.at("content").asStr().find("CURRENT_REQUEST") != std::string::npos;
+        return std::map<std::string, double>{{"ask", 0}, {"announce", 0}, {"premature", 0}, {"ignored", 0}};
+    };
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (!req.stream) { r.text = "summary"; return Result<ChatResponse>::Ok(r); }
+        ++mainCalls;
+        r.text = mainCalls == 8 ? "I will now inspect the code and make the change." : "Done. All tests passed.";
+        r.inTokens = mainCalls == 7 ? 49000 : 100;
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    for (int i = 0; i < 7; ++i) CHECK(a.runTurn("old question").empty());
+    CHECK(a.runTurn("CURRENT_REQUEST").empty());
+    CHECK_EQ(a.stats().compactions, 1);
+    CHECK(currentTurn);
+    return "";
+}
+
+TEST(agent_Failed_Attempt_Usage_Is_Countable_Without_Double_Count) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    int calls = 0;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks& cb) {
+        ChatResponse r;
+        r.cost = .1;
+        r.inTokens = 10;
+        r.outTokens = 2;
+        cb.onUsage(r);
+        if (++calls == 1) return Result<ChatResponse>::Err("output limit reached");
+        r.text = "done";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    CHECK(a.runTurn("go").empty());
+    CHECK_EQ(a.stats().cost, .2);
+    CHECK_EQ(a.stats().inTokens, 20L);
+    CHECK_EQ(a.stats().genTokens, 4L);
+    return "";
+}
+
+TEST(agent_Local_Gateway_Uses_Known_Prices_Or_Marks_Unknown) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.model.provider.baseUrl = "http://127.0.0.1:9999/v1";
+    opts.model.inPrice = 2;
+    opts.model.outPrice = 4;
+    opts.request = [](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        r.text = "done";
+        r.inTokens = 1000000;
+        r.outTokens = 1000000;
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent priced(opts);
+    CHECK(priced.runTurn("hello").empty());
+    CHECK_EQ(priced.stats().cost, 6.0);
+    CHECK(priced.stats().costEstimated);
+    opts.model.inPrice = opts.model.outPrice = -1;
+    Agent unknown(opts);
+    CHECK(unknown.runTurn("hello").empty());
+    CHECK(unknown.stats().costIncomplete);
+    return "";
+}

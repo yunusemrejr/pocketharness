@@ -20,6 +20,13 @@ struct UndoEntry {
     std::string path;
     bool existed = false;
     std::string content;
+    std::string written;  // refuse undo after another writer changes the file
+};
+
+struct ChildUsage {
+    double cost = 0, sideCost = 0;
+    long count = 0;
+    bool estimated = false, seen = false, incomplete = false;
 };
 
 struct ToolEnv {
@@ -28,6 +35,8 @@ struct ToolEnv {
     std::string workspace;
     std::string sessionTmp;
     std::string sandboxHome;
+    std::string sessionId;
+    int depth = 0;
     bool allowNet = false;
     bool unsafe = false;
     bool interactive = false;
@@ -42,6 +51,7 @@ struct ToolEnv {
     long bashRuns = 0;                        // successful+failed bash calls (verification signal)
     double sideCost = 0;                      // USD spent by tool-side judges (agent collects)
     std::vector<ChatImage> viewImages;        // images `read` this batch (agent attaches them)
+    std::map<std::string, ChildUsage> childUsage;
 };
 
 inline constexpr size_t kMaxUndo = 64;
@@ -66,5 +76,7 @@ std::string shellQuote(const std::string& s);
 
 // Restore the newest undo entry. Returns a human summary or error text.
 std::string undoLast(ToolEnv& env);
+// Cumulative child receipts in this session's scratch; returns new usage only.
+ChildUsage collectChildUsage(ToolEnv& env);
 
 }  // namespace pocket

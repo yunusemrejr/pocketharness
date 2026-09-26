@@ -2,6 +2,7 @@
 #include "tools.h"
 
 #include <unistd.h>
+#include <dirent.h>
 
 #include <cstdio>
 #include <algorithm>
@@ -76,12 +77,16 @@ std::string replaceAll(const std::string& hay, const std::string& needle,
     return out;
 }
 
-void rememberUndo(ToolEnv& env, const std::string& path) {
-    auto old = boxRead(*env.auth, path, 4 << 20);
-    auto exists = boxExists(*env.auth, path);
-    if (!old.ok && exists.ok && exists.value) return;  // too large/unreadable: no journal
-    env.undo.push_back({path, old.ok, old.ok ? old.value : ""});
-    if (env.undo.size() > kMaxUndo) env.undo.erase(env.undo.begin());
+void rememberUndo(ToolEnv& env, const std::string& path, const Result<std::string>& old,
+                  bool existed, const std::string& written) {
+    if ((!old.ok && existed) || written.size() > (4u << 20)) return;
+    env.undo.push_back({path, old.ok, old.ok ? old.value : "", written});
+    size_t bytes = 0;
+    for (const auto& entry : env.undo) bytes += entry.content.size() + entry.written.size();
+    while (env.undo.size() > kMaxUndo || bytes > (16u << 20)) {
+        bytes -= env.undo.front().content.size() + env.undo.front().written.size();
+        env.undo.erase(env.undo.begin());
+    }
 }
 
 // Guardian pass after every successful change: built-in anti-slop checks
@@ -89,6 +94,8 @@ void rememberUndo(ToolEnv& env, const std::string& path) {
 std::string afterChange(ToolEnv& env, const std::string& path, const std::string& content) {
     if (std::find(env.changedFiles.begin(), env.changedFiles.end(), path) == env.changedFiles.end())
         env.changedFiles.push_back(path);
+    if (!env.sessionId.empty())
+        (void)sessionWorkspacePublish(env.workspace, env.sessionId, "changed", path);
     std::string out;
     auto findings = slopScan(path, content);
     if (!findings.empty()) {
@@ -105,7 +112,7 @@ std::string afterChange(ToolEnv& env, const std::string& path, const std::string
                         {{"generic", "Is this generic AI-template work (stock purple/blue gradients, emoji decoration, "
                                      "pulsing dots, buzzword hero copy, glassmorphism everywhere, lorem-style filler)?"},
                          {"fake", "Does it contain placeholder, fake or made-up content presented as real?"}},
-                        false, &env.sideCost);
+                        false, &env.sideCost, env.cancel);
         if (v.count("generic") && v["generic"] >= 0.8)
             out += "\n[quality:jev] reads as generic AI-template design/copy (p=" + std::to_string(v["generic"]).substr(0, 4) +
                    "): give it a deliberate identity.";
@@ -165,7 +172,8 @@ ToolResult toolRead(ToolEnv& env, const json::Value& args) {
             if (start) ++line;
         }
     }
-    if (!emitted) return {false, "read: offset beyond EOF (or empty file)"};
+    if (!emitted && scanned == 0 && offset == 1) return {true, out + "[empty file]\n"};
+    if (!emitted) return {false, "read: offset beyond EOF"};
     emit(env, "read " + path + " (" + std::to_string(emitted) + " lines)");
     return {true, out};
 }
@@ -182,7 +190,11 @@ ToolResult toolWrite(ToolEnv& env, const json::Value& args) {
         r.output = "write: missing content";
         return r;
     }
-    rememberUndo(env, path);
+    auto lock = sessionWorkspaceLock(env.workspace, env.cancel);
+    if (!lock.ok) return {false, lock.error};
+    struct Lease { int fd; ~Lease() { close(fd); } } lease{lock.value};
+    auto old = boxRead(*env.auth, path, 4 << 20);
+    bool existed = boxExists(*env.auth, path).value;
     auto w = boxWrite(*env.auth, path, content, 0644);
     if (!w.ok) {
         r.output = w.error;
@@ -190,6 +202,8 @@ ToolResult toolWrite(ToolEnv& env, const json::Value& args) {
     }
     emit(env, "write " + path + " (" + std::to_string(content.size()) + " bytes)");
     r.ok = true;
+    rememberUndo(env, path, old, existed, content);
+    close(lease.fd); lease.fd = -1;  // hooks may launch a recursive Pocket
     r.output = "wrote " + path + " (" + std::to_string(content.size()) + " bytes)" +
                afterChange(env, path, content);
     return r;
@@ -201,6 +215,9 @@ ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
     if (edits.empty() || edits.size() > 64) return {false, "edit: need 1..64 replacements"};
     if (args.has("edits") && (args.has("old_text") || args.has("new_text")))
         return {false, "edit: use edits OR old_text/new_text"};
+    auto lock = sessionWorkspaceLock(env.workspace, env.cancel);
+    if (!lock.ok) return {false, lock.error};
+    struct Lease { int fd; ~Lease() { close(fd); } } lease{lock.value};
     auto data = boxRead(*env.auth, path, 4 << 20);
     if (!data.ok) return {false, data.error};
     std::string updated = data.value;
@@ -220,9 +237,10 @@ ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
             return {false, "edit: result exceeds 4 MiB; file untouched"};
         updated = replaceAll(updated, oldText, newText);
     }
-    rememberUndo(env, path);
     auto w = boxWrite(*env.auth, path, updated, 0644);
     if (!w.ok) return {false, w.error};
+    rememberUndo(env, path, data, true, updated);
+    close(lease.fd); lease.fd = -1;
     emit(env, "edit " + path);
     return {true, "edited " + path + " (" + std::to_string(edits.size()) + " replacement step(s))" +
                       afterChange(env, path, updated)};
@@ -230,6 +248,10 @@ ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
 
 ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
     ToolResult r;
+    if (env.cfg && !env.sandboxHome.empty()) {
+        auto staged = stageChildConfig(*env.cfg, env.sandboxHome);
+        if (!staged.ok) return {false, "cannot stage child settings: " + staged.error};
+    }
     ChildSpec cs;
     cs.auth = env.auth;  // read-only paths; the lambda below copies the pointer
     cs.workspace = env.workspace;
@@ -247,6 +269,8 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
     o.timeoutMs = timeoutSec * 1000L;
     o.outLimit = env.cfg ? (size_t)env.cfg->outputLimitBytes : 262144;
     o.cancel = env.cancel;
+    // Deeper Pocket instances finish teardown before their parent's deadline.
+    o.terminateGraceMs = std::max(500, 1500 - 200 * env.depth);
     o.childSetup = [cs]() { childEnterSandbox(cs); };
 
     SpawnResult sr = spawn(o);
@@ -434,9 +458,11 @@ std::string shellQuote(const std::string& s) {
 }
 
 ToolResult runHook(ToolEnv& env, std::string cmd, const std::string& var, const std::string& value) {
-    if (!var.empty())
-        for (size_t p; (p = cmd.find("{" + var + "}")) != std::string::npos;)
-            cmd.replace(p, var.size() + 2, shellQuote(value));
+    if (!var.empty()) {
+        std::string replacement = shellQuote(value);
+        for (size_t p = 0; (p = cmd.find("{" + var + "}", p)) != std::string::npos; p += replacement.size())
+            cmd.replace(p, var.size() + 2, replacement);
+    }
     if (!env.auth) return {false, "hook: tool authority unavailable"};
     return spawnBash(env, cmd, env.cfg ? env.cfg->bashTimeoutSec : 120);
 }
@@ -444,16 +470,59 @@ ToolResult runHook(ToolEnv& env, std::string cmd, const std::string& var, const 
 std::string undoLast(ToolEnv& env) {
     if (env.undo.empty()) return "nothing to undo";
     if (!env.auth) return "undo: tool authority unavailable";
-    UndoEntry e = std::move(env.undo.back());
-    env.undo.pop_back();
+    auto lock = sessionWorkspaceLock(env.workspace, env.cancel);
+    if (!lock.ok) return "undo: " + lock.error;
+    struct Lease { int fd; ~Lease() { close(fd); } } lease{lock.value};
+    const UndoEntry& e = env.undo.back();
+    auto current = boxRead(*env.auth, e.path, 4 << 20);
+    if (!current.ok || current.value != e.written)
+        return "undo: file changed since this session wrote it; inspect it before undoing";
+    std::string path = e.path;
     if (!e.existed) {
-        // The file was created by the agent: remove it again.
-        std::string p = e.path[0] == '/' ? e.path : env.workspace + "/" + e.path;
-        return unlink(p.c_str()) == 0 ? "removed " + e.path + " (was created by the agent)"
-                                      : "undo: cannot remove " + e.path;
+        auto removed = boxRemove(*env.auth, e.path);
+        if (!removed.ok) return "undo: " + removed.error;
+        env.undo.pop_back();
+        if (!env.sessionId.empty()) (void)sessionWorkspacePublish(env.workspace, env.sessionId, "undo", path);
+        return "removed " + path + " (was created by the agent)";
     }
     auto w = boxWrite(*env.auth, e.path, e.content, 0644);
-    return w.ok ? "restored " + e.path + " (" + std::to_string(e.content.size()) + " bytes)" : "undo: " + w.error;
+    if (!w.ok) return "undo: " + w.error;
+    env.undo.pop_back();
+    if (!env.sessionId.empty()) (void)sessionWorkspacePublish(env.workspace, env.sessionId, "undo", path);
+    return "restored " + path;
+}
+
+ChildUsage collectChildUsage(ToolEnv& env) {
+    ChildUsage delta;
+    if (env.sessionTmp.empty()) return delta;
+    DIR* d = opendir(env.sessionTmp.c_str());
+    if (!d) return delta;
+    size_t scanned = 0;
+    while (auto* e = readdir(d)) {
+        std::string name = e->d_name;
+        if (!startsWith(name, "pocket-child-") || !endsWith(name, ".json")) continue;
+        if (++scanned > 1024) break;
+        auto data = readFileBounded(env.sessionTmp + "/" + name, 4096);
+        if (!data.ok) continue;
+        auto parsed = json::parse(data.value);
+        if (!parsed.ok || !parsed.value.isObj()) continue;
+        const auto& v = parsed.value;
+        double cost = v.at("cost").asNum(-1), side = v.at("side_cost").asNum(-1);
+        long count = v.at("children").asInt(-1);
+        if (!std::isfinite(cost) || !std::isfinite(side) || cost < 0 || side < 0 || side > cost ||
+            count < 0 || count > 1000000) continue;
+        auto& prior = env.childUsage[name];
+        if (cost < prior.cost || side < prior.sideCost || count + 1 < prior.count) continue;
+        delta.cost += cost - prior.cost;
+        delta.sideCost += side - prior.sideCost;
+        delta.count += count + 1 - prior.count;
+        delta.estimated |= v.at("estimated").asBool();
+        delta.seen |= v.at("seen").asBool();
+        delta.incomplete |= v.at("incomplete").asBool();
+        prior = {cost, side, count + 1, v.at("estimated").asBool(), v.at("seen").asBool(), v.at("incomplete").asBool()};
+    }
+    closedir(d);
+    return delta;
 }
 
 }  // namespace pocket
