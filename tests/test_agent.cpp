@@ -1498,3 +1498,123 @@ TEST(agent_Goal_Completion_Notice_Follows_Durable_State) {
     rmRf(home);
     return "";
 }
+
+TEST(agent_Unknown_Quality_Evidence_Uses_Normal_Council) {
+    ToolEnv tools;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &tools;
+    opts.review = true;
+    int councilRequests = 0, decisionRequests = 0;
+    opts.decide = [&](const json::Value&, const std::vector<Question>& questions, bool transcript, double*) {
+        if (transcript && questions.size() == 1 && questions[0].id == "bad") ++decisionRequests;
+        std::map<std::string, double> lowRisk{{"bad", .01}};
+        (void)retainSupportedQualityAnswers(lowRisk, .5); // insufficient companion evidence
+        return lowRisk;
+    };
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse response;
+        if (req.system.find("strict senior reviewer") != std::string::npos) {
+            ++councilRequests;
+            response.text = "LGTM";
+        } else {
+            // Simulate a completed changed-file batch; the contract under test
+            // is whether unknown decision evidence can suppress its reviewer.
+            tools.changedFiles.push_back("checked.cpp");
+            response.text = "The requested change is implemented and checked.";
+        }
+        return Result<ChatResponse>::Ok(response);
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Implement and verify the requested change").empty());
+    CHECK(decisionRequests == 1 && councilRequests == 1);
+    CHECK(agent.stats().reviews == 1);
+    return "";
+}
+
+TEST(agent_Decision_Transcript_Preserves_Request_And_Final_Tool_Evidence) {
+    std::string home = makeTempDir("pocket-judge-evidence");
+    HomeGuard hg(home);
+    auto authority = authorityInit(home, {}, {}, false);
+    CHECK(authority.ok);
+    const std::string output = "START_OF_EVIDENCE " + std::string(1600, 'x') + " FINAL_VERIFICATION_ERROR";
+    CHECK(atomicWriteFile(home + "/one", output).ok);
+    CHECK(atomicWriteFile(home + "/two", output).ok);
+    ToolEnv env;
+    env.auth = &authority.value;
+    env.workspace = home;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &env;
+    opts.autonomy = true;
+    opts.maxRounds = 70;
+    int calls = 0;
+    bool amended = false;
+    bool originalSeen = false, latestSeen = false, failureSeen = false, omissionsSeen = false, bounded = false;
+    opts.progress = [](const std::string&, double*) {
+        return "Synthetic progress nudge: inspect the next observation.";
+    };
+    opts.decide = [&](const json::Value& state, const std::vector<Question>&, bool, double*) {
+        std::string text = json::stringify(state);
+        originalSeen = text.find("ORIGINAL_ACCEPTANCE_CRITERION") != std::string::npos;
+        latestSeen = text.find("AMENDED_REQUIREMENT") != std::string::npos &&
+                     text.find("LATEST_USER_DIRECTION") != std::string::npos;
+        failureSeen = text.find("FINAL_VERIFICATION_ERROR") != std::string::npos;
+        omissionsSeen = text.find("bytes omitted") != std::string::npos &&
+                        text.find("older evidence events omitted") != std::string::npos;
+        bounded = state.at("input").size() <= 60 && json::stringify(state.at("input")).size() <= 24000;
+        return std::map<std::string, double>{{"ask", 0}, {"announce", 0}, {"premature", 0}, {"ignored", 0}};
+    };
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse response;
+        if (!amended) {
+            response.text = "Original criterion recorded.";
+            return Result<ChatResponse>::Ok(response);
+        }
+        if (++calls <= 65)
+            response.calls = {{"read" + std::to_string(calls), "read", json::stringify(json::Object{
+                {"path", home + (calls % 2 ? "/one" : "/two")}})}};
+        else response.text = "Verification still reports the observed error.";
+        return Result<ChatResponse>::Ok(response);
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("ORIGINAL_ACCEPTANCE_CRITERION").empty());
+    amended = true;
+    CHECK(agent.runTurn("AMENDED_REQUIREMENT " + std::string(6000, 'y') + " LATEST_USER_DIRECTION").empty());
+    CHECK(calls == 66 && originalSeen && latestSeen && failureSeen && omissionsSeen && bounded);
+    authorityClose(authority.value);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Decision_Transcript_Bounds_Json_Escaped_Anchors_And_Answer) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.autonomy = true;
+    int calls = 0, decisions = 0;
+    bool bounded = true, finalEndsSeen = true, anchorsSeen = false;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse response;
+        if (++calls % 2) response.calls = {{"read" + std::to_string(calls), "read", "{}"}};
+        else response.text = "FINAL_HEAD " + std::string(6000, '\1') + " FINAL_TAIL Would you like me to continue?";
+        return Result<ChatResponse>::Ok(response);
+    };
+    opts.decide = [&](const json::Value& state, const std::vector<Question>& questions, bool, double*) {
+        ++decisions;
+        auto wire = json::stringify(decisionRequest("fixture", state, questions));
+        bounded &= json::stringify(state.at("input")).size() <= 24000 && wire.size() <= 60000;
+        std::string answer = state.at("output").at("content").asStr();
+        finalEndsSeen &= answer.find("FINAL_HEAD") != std::string::npos && answer.find("FINAL_TAIL") != std::string::npos;
+        if (decisions == 2) {
+            auto input = json::stringify(state.at("input"));
+            anchorsSeen = input.find("ORIGINAL_HEAD") != std::string::npos && input.find("ORIGINAL_TAIL") != std::string::npos &&
+                          input.find("LATEST_HEAD") != std::string::npos && input.find("LATEST_TAIL") != std::string::npos;
+        }
+        return std::map<std::string, double>{{"ask", 0}, {"announce", 0}, {"premature", 0}, {"ignored", 0}};
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("ORIGINAL_HEAD " + std::string(6000, '\2') + " ORIGINAL_TAIL").empty());
+    CHECK(agent.runTurn("LATEST_HEAD " + std::string(6000, '\"') + " LATEST_TAIL").empty());
+    CHECK(decisions == 2 && bounded && finalEndsSeen && anchorsSeen);
+    return "";
+}

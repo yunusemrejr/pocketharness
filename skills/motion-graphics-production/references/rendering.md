@@ -1,21 +1,20 @@
 # Rendering and delivery
 
-The local exporter accepts an HTML file exposing `window.renderFrame(seconds)`:
+PocketHarness exports a local HTML scene through one Chromium process and FFmpeg. It needs those installed host executables; no Node, Playwright or npm project is required. Check `pocket kit probe` and current `pocket kit` usage before choosing this route.
 
 ```bash
-node scripts/render.mjs ./title.html ./renders 6 30 1280 720
+pocket kit frame scene.html settled.png --time 3 --size 1280x720
+pocket kit video scene.html output.mp4 --size 1280x720 --fps 30 --duration 6
 ```
 
-Run from this skill's installed directory (`~/.config/muse/skills/motion-graphics-production` for a user install).
+Frame export needs only Chromium. Optional `--audio soundtrack.wav` attaches a prepared local soundtrack to a video. Keep asset files with the source. A render can only use resources available under the current tool filesystem/network permissions; bundle required assets locally for reproducibility.
 
-Arguments are input, existing output parent, duration seconds, FPS, width and height. It creates a new folder with numbered PNG frames, H.264 MP4 and a render manifest. It requires an installed Playwright, a Playwright Chromium browser and FFmpeg with libx264. Check these locally; missing dependencies produce an explicit error. It does not install browsers automatically.
+The page must expose `window.renderFrame(seconds)`, which may return a Promise. If assets need asynchronous setup, assign `window.renderReady` a Promise. The renderer waits for readiness and invokes the frame function at explicit times. Each call must clear and reconstruct Canvas pixels or set every animated SVG/DOM property: do not accumulate frame deltas. Use seeded randomness and a fixed seed, not wall-clock time. Pause autonomous CSS, WAAPI and media playback during export.
 
-The page must fit the requested viewport. The starter uses an SVG viewBox for scalable composition. Each frame is rendered at `index / fps`; frame count is `round(duration * fps)` and the manifest reports the resulting duration. The last frame is before the endpoint; do not add an extra endpoint frame. A single clock should own animated state. Pause autonomous CSS/WAAPI/video animation and replace timer/random-dependent behavior before exporting.
+Copy [the six-second starter](../assets/timeline.html) into the project and change its visual content. `renderFrame()` sets an export class that hides preview controls. `?preview=1` enables its interactive replay button. The starter is a rendering contract, not a finished visual design. It uses local system fonts; bundle a licensed font when identical typography across hosts matters.
 
-The exporter blocks remote page requests; keep assets local and package them with the source. Use existing background execution for longer or heavier renders. The bundled script caps exports at sixty seconds, sixty FPS and a 1920-pixel dimension. For alpha, HDR or large 3D renders, use an appropriate renderer and codec rather than assuming the MP4 preset preserves them.
+Render a small preview first. Inspect first/last frames, settled beats, and times on both sides of transitions. Check metadata and decode with `ffprobe`/`ffmpeg`, then review continuous playback. For looped output, the final sampled frame is before the endpoint; do not append a duplicate endpoint frame to hide a timing error.
 
-After encoding, use `ffprobe` and extracted still frames to verify metadata and inspect representative frames. Review continuous playback for smoothness, typography hold time and audio sync. Add supplied music with explicit FFmpeg stream mappings; retain original duration unless a deliberate trim, loop or fade is part of the edit.
+Use an existing Blender/Remotion pipeline for genuine 3D, alpha/HDR or a project already using that renderer. Do not force those requirements into an ordinary H.264 export. Audio-reactive motion should use a measured, smoothed envelope indexed by absolute time; a beat grid is an estimate until checked against the track.
 
-For audio-reactive work, compute an envelope from RMS or band energy, smooth attack/release and derive it from absolute time. Beat grids are estimates until checked against music. Keep text readable through peaks and inspect quiet passages as well as loud ones.
-
-References: [Playwright screenshots](https://playwright.dev/docs/screenshots), [FFmpeg documentation](https://ffmpeg.org/ffmpeg.html).
+Primary references: [FFmpeg](https://ffmpeg.org/ffmpeg.html), [ffprobe](https://ffmpeg.org/ffprobe.html).

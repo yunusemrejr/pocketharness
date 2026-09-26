@@ -155,6 +155,9 @@ int pocketMain(int argc, char** argv);
 
 int main(int argc, char** argv) {
     setlocale(LC_ALL, "");
+    // Keep terminal Unicode behavior, but JSON/CSS and tool numeric arguments
+    // always use a decimal point, regardless of the desktop's locale.
+    setlocale(LC_NUMERIC, "C");
     if (argc > 1 && std::string(argv[1]) == "kit") return pocket::kitMain(argc - 1, argv + 1);
     return pocket::pocketMain(argc, argv);
 }

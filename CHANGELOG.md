@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.3
+
+- Add deterministic local HTML frame and MP4 export through `kit frame/video`.
+  Reuse installed Chrome/Chromium and FFmpeg over private pipes, with bounded
+  frames/deadlines, unique profiles, cancellation, JavaScript error reporting,
+  output validation and atomic publication. No browser SDK or linked media
+  dependencies. Optional audio is padded/trimmed to the video duration.
+- Add seeded native `kit sfx` presets with oscillator sweeps, noise, envelopes
+  and filtering. Validate all audio options and bound synthesis memory/work.
+  Repair malformed WAV handling, low-rate loops, truncated chunks, pitch
+  bounds and incorrect antiphase stereo measurements; support common PCM/float.
+- Keep JSON, CSS and numeric tool arguments independent of desktop decimal
+  separators while preserving Unicode terminal behavior.
+- Repair false-success image/screenshot/scan commands, concurrent browser profile
+  collisions, and unstable spring integration. Missing inputs, bad numeric
+  options, absent output and malformed image headers now fail explicitly.
+- Replace imaginary tools and missing scripts in media guides with runnable
+  native workflows. Ship deterministic motion/audio examples and standalone
+  C++ coding/ML examples with differential and held-out acceptance checks.
+- Apply Jev paper guidance to batched judgments: separate untrusted evidence
+  from criteria, preserve structured context on fallback, and abstain on quality
+  judgments lacking sufficient evidence. Unknown results retain normal review;
+  local classifiers cannot certify evidence or completion. Include an offline
+  calibration recipe; fixed policy cutoffs are not claimed to be calibrated.
+
 ## 0.5.2
 
 - Deliver queued follow-ups after the current tool batch, including during long

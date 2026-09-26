@@ -1,30 +1,39 @@
 ---
 name: procedural-audio
-description: Generate music beds and sound effects procedurally in Python (numpy) for videos, apps and games; seeded chord-progression ambience with drums and intensity automation, and designed whooshes, risers, downlifters, impacts, ticks, pops and chimes, plus mixing and loudness discipline. Use when a project needs original music or sound without samples, stock audio or generative AI audio.
+description: Generate original UI sounds, transitions, impacts, chimes and short note sequences with native pocket kit commands. Seeded noise, pitch sweeps, envelopes and filters need no libraries or assets. Use for sound cues in apps, games and videos.
 ---
 
 # Procedural audio
 
-For video projects, call `audio_synth` (discover it with `tool_search`). It runs [the synthesizer](scripts/synth.py) against the project and writes `public/audio/<name>.wav`:
+Use `pocket kit sfx` for designed cues and `pocket kit wav` for a melody. Both write mono PCM16 WAV files atomically and reject invalid arguments before replacing an output. Create the output directory first.
 
-```js
-audio_synth({ dir: "my-video", kind: "music", key: "D", mode: "dorian", bpm: 80,
-  progression: ["i", "VII", "VI", "VII"], intensity: [[0, 0.3], [40, 0.8], [70, 0.4]] })
-audio_synth({ dir: "my-video", kind: "sfx", type: "impact", name: "reveal-hit" })
+```bash
+mkdir -p public/audio
+pocket kit sfx public/audio/reveal.wav chime --freq 660 --gain .28
+pocket kit sfx public/audio/transition.wav whoosh --duration .6 --seed 17 --gain .22
+pocket kit sfx public/audio/hit.wav impact --duration .4 --gain .3
+pocket kit sfx public/audio/laser.wav laser --freq 1800 --end-freq 120 --duration .35
+pocket kit wav public/audio/motif.wav "C5:.5 E5:.5 G5:1 R:.25 G5:.5 C6:1" --bpm 100 --wave sine --gain .22
+pocket kit audio public/audio/reveal.wav
 ```
 
-Outside a video project, run the script directly: `python3 scripts/synth.py spec.json out.wav`, using the spec format in its header.
+`sfx OUT.wav PRESET` accepts `click`, `chime`, `laser`, `whoosh`, `impact`, `tone`, or `noise`. Start with a preset, then adjust only the controls the design needs:
 
-Direct sound like picture:
+- `--duration SEC`: .001–60 seconds. Default depends on the preset.
+- `--freq HZ`, `--end-freq HZ`: start/end frequency of an exponential pitch sweep. Setting only `--freq` makes a steady tone. Set both for a sweep.
+- `--gain 0..1`: amplitude, default .3. Leave headroom when combining cues.
+- `--noise 0..1`: mix between the tone and seeded white noise.
+- `--attack SEC`, `--release SEC`: fade lengths, 0–60 seconds. Overlapping fades reduce the peak; shorten them when shortening a preset. Endpoints remain zero.
+- `--lowpass HZ`: one-pole low-pass filter; 0 bypasses it.
+- `--seed UINT32`: repeatable noise, default 1; zero is valid.
+- `--rate N`: integer sample rate 8000–96000 Hz, default 44100. Frequencies/filter cutoff must be below .49 times the sample rate.
 
-- Decide the emotional arc first (curious → tense → resolved), then express it as `intensity` automation and chord motion. Constant intensity sounds like a loop.
-- Under narration, keep tempo 70–90 bpm, low `pulse`/`bell` layers, `drums` at 0, and a dark bed (little energy above 2 kHz). Speech intelligibility lives around 1–4 kHz.
-- For momentum without narration, add `drums` (kick on beats 1 and 3, eighth hats) and match the video's beat-synced motion to the same bpm (`pulse(frame, fps, bpm)` in the Remotion template).
-- Use sound effects as punctuation for specific visual events, one per idea, 6–12 dB under the voice: whoosh, riser and downlifter for transitions, impact for reveals, tick and pop for counting and UI, chime for conclusions.
-- Every render is seeded. Change `seed` for a different arrangement with the same character.
+`wav OUT.wav "NOTE:DURATION ..."` accepts note names (`A4`, `C#5`, `Eb3`), frequencies (`440`), and rests (`R`). Separate events with spaces, tabs, commas or newlines. Durations are seconds unless `--bpm 1..1000` is present, then they are beats. An omitted duration is .25. Supported waves: `sine`, `square`, `saw`, `tri`. A render is limited to 60 seconds and 4096 events. This command produces a sequential melody; it does not interpret chords or MIDI.
 
-Verify what you cannot hear directly. `audio_analyze` measures loudness, peaks and silence and can render a spectrum image; check that low-frequency energy does not dominate and that nothing clips. For finished videos, `video_qa` measures the full mix. Numbers support judgement; listen when a listener is available.
+Match the cue to the action. Use a brief click for direct input, a chime for a confirmed result, a whoosh for motion and an impact for a reveal. Under speech, keep cue levels low and use the low-pass filter to reduce competition with the voice. Avoid adding an identical cue to every event.
 
-For MIDI scores and note-level composition, use `music_compose` and the music-composition skill. For analysis of existing recordings, use sound-analysis.
+Verify each output with `pocket kit audio FILE.wav`. It reports duration, format, sample peak, RMS, clipping, approximate periodic pitch and time in blocks quieter than −50 dBFS. It checks the original channels without averaging away opposite-phase signals. Pitch is a rough estimate for periodic sounds; it is not a music transcription or perceptual quality score. RMS is not LUFS. Listen when playback is available.
 
-> PocketHarness note: this skill's bundled code assets were removed (the harness ships only native C/C++ and bash). Write the equivalent in the project's own language when needed, and prefer `pocket kit` (wav, audio, spring, svg, shot, web) where it covers the job.
+Analysis accepts WAV PCM8/16/24/32 and float32, 1–32 channels, 8000–192000 Hz, up to 64 MiB. Other encodings can be converted with an installed FFmpeg. Use FFmpeg's `adelay`/`amix` when the project needs layered cues or a video soundtrack; check the final mix too. Native generation and analysis require no FFmpeg installation.
+
+The runnable example is `examples/capabilities/audio/render.sh`. It generates four cues with fixed settings and analyzes them using only Pocket.

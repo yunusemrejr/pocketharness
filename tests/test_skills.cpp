@@ -4,6 +4,8 @@
 #include "../src/config.h"
 #include "../src/skills.h"
 
+#include <filesystem>
+
 using namespace pocket;
 using namespace pocket::test;
 
@@ -59,5 +61,29 @@ TEST(skills_Search_Ranks_Name_Heading_Preview) {
     CHECK_EQ(hits[1].name, std::string("webby"));
     CHECK(skillSearch(all, "").size() == 3);  // empty query returns all
     CHECK(skillSearch(all, "zzz-no-match").empty());
+    return "";
+}
+
+TEST(skills_Bundled_Local_Markdown_Links_Resolve) {
+    // The installed skill tree keeps relative assets/references. A missing
+    // target otherwise sends a model to a script or example it cannot use.
+    namespace fs = std::filesystem;
+    CHECK(fs::is_directory("skills"));
+    for (const auto& entry : fs::recursive_directory_iterator("skills")) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".md") continue;
+        auto data = readFileBounded(entry.path().string(), 1 << 20);
+        CHECK(data.ok);
+        for (size_t at = 0; (at = data.value.find("](", at)) != std::string::npos;) {
+            size_t end = data.value.find(')', at + 2);
+            if (end == std::string::npos) break;
+            std::string target = data.value.substr(at + 2, end - at - 2);
+            at = end + 1;
+            if (target.empty() || target[0] == '#' || target.find(":") != std::string::npos) continue;
+            target = target.substr(0, target.find_first_of("# \t\n"));
+            if (target.empty()) continue;
+            if (!fs::exists(entry.path().parent_path() / target))
+                return entry.path().string() + ": missing linked file " + target;
+        }
+    }
     return "";
 }

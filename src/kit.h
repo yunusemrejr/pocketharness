@@ -17,7 +17,8 @@ int kitMain(int argc, char** argv);  // argv[0] = "kit"
 std::string htmlToText(std::string_view html, std::vector<std::string>* links = nullptr);
 std::string urlDecode(std::string_view s);
 double noteFreq(const std::string& note);  // "A4" -> 440, "C#5", "Eb3"; -1 invalid
-// Critically damped/underdamped spring sampled to a CSS linear() easing.
+// Damped spring sampled to CSS linear(); empty if invalid or outside bounded
+// settling/sampling limits. durationMs is zero on failure.
 std::string springEasing(double stiffness, double damping, double mass, double* durationMs);
 // Anti-slop findings for one file's content: "line N: reason" entries.
 std::vector<std::string> slopScan(const std::string& path, const std::string& content);

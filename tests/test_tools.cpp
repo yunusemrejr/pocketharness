@@ -2,7 +2,10 @@
 #include "mini.h"
 #include <sys/stat.h>
 
+#include <filesystem>
+
 #include "../src/config.h"
+#include "../src/kit_audio.h"
 #include "../src/sandbox.h"
 #include "../src/tools.h"
 
@@ -111,6 +114,25 @@ TEST(tools_Bash_Capture_And_Guard) {
     // Guard: Ask fails closed in non-interactive mode.
     r = runTool(f.env, "bash", R"({"command":"rm -rf ."})");
     CHECK(!r.ok && r.output.find("approval") != std::string::npos);
+    return "";
+}
+
+TEST(tools_Staged_Native_Audio_Runs_Without_Network) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(!f.env.allowNet && !f.env.unsafe);
+    f.cfg.toolNetwork = false;
+    CHECK(ensureDir(f.tmp + "/bin", 0700).ok);
+    std::error_code error;
+    CHECK(std::filesystem::copy_file("./pocket", f.tmp + "/bin/pocket", error));
+    CHECK(!error && chmod((f.tmp + "/bin/pocket").c_str(), 0700) == 0);
+    const auto result = runTool(f.env, "bash", R"({"command":"pocket kit sfx cue.wav chime --freq 660 --duration .1 --gain .2 && pocket kit audio cue.wav","timeout":30})");
+    CHECK(result.ok && result.output.find("PCM16") != std::string::npos);
+    const auto file = readFileBounded(f.ws + "/cue.wav", 1 << 20);
+    CHECK(file.ok);
+    const auto audio = analyzeWav(file.value);
+    CHECK(audio.ok && audio.value.frames == 4410 && audio.value.rate == 44100 && audio.value.channels == 1);
+    CHECK(audio.value.peak > .001 && audio.value.clippedSamples == 0);
     return "";
 }
 

@@ -7,6 +7,8 @@
 #include <thread>
 #include <cmath>
 #include <filesystem>
+#include <locale.h>
+#include <langinfo.h>
 #include "../src/config.h"
 #include "../src/process.h"
 #include "../src/session.h"
@@ -14,6 +16,33 @@
 
 using namespace pocket;
 using namespace pocket::test;
+
+TEST(cli_Decimal_Arguments_And_Css_Are_Independent_Of_Desktop_Locale) {
+    std::string commaLocale;
+    for (const char* name : {"en_DK.utf8", "de_DE.UTF-8", "fr_FR.UTF-8", "tr_TR.UTF-8"}) {
+        locale_t locale = newlocale(LC_NUMERIC_MASK, name, nullptr);
+        if (!locale) continue;
+        bool comma = std::string(nl_langinfo_l(RADIXCHAR, locale)) == ",";
+        freelocale(locale);
+        if (comma) { commaLocale = name; break; }
+    }
+    // Minimal CI images may only ship C/en_US. The actual desktop probe uses
+    // en_DK; this remains a real subprocess regression wherever available.
+    if (commaLocale.empty()) return "";
+    EnvGuard locale("LC_ALL", commaLocale);
+    SpawnOpts opts;
+    opts.exe = "./pocket";
+    opts.argv = {"./pocket", "kit", "spring", "170", "26.5", "1"};
+    opts.timeoutMs = 5000;
+    auto spring = spawn(opts);
+    CHECK(spring.ok && spring.exitCode == 0);
+    CHECK(spring.out.find("linear(0, 0.") != std::string::npos);
+    opts.argv = {"./pocket", "kit", "frame", "/nonexistent-pocket-scene.html", "out.png", "--time", "1.5"};
+    auto frame = spawn(opts);
+    CHECK(frame.ok && frame.exitCode != 0);
+    CHECK(frame.err.find("existing local HTML") != std::string::npos);
+    return "";
+}
 
 namespace {
 enum class CliFixture { Recursive, Judge, Goal };

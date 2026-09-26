@@ -22,7 +22,10 @@ const ease=x=>1-(1-x)**3;
 const progress=(t,start,length)=>ease(clamp((t-start)/length));
 const title=document.querySelector('#title'),subtitle=document.querySelector('#subtitle'),rule=document.querySelector('#rule');
 let playing=0;
+const preview=new URLSearchParams(location.search).has('preview');
+window.renderReady=document.fonts.ready;
 window.renderFrame = function(seconds){
+  document.body.classList.toggle('exporting',!preview);
   const t=Math.max(0,Math.min(6,seconds)),end=1-progress(t,5.2,0.7);
   const a=progress(t,.3,.75),b=progress(t,1.1,.7);
   rule.setAttribute('width',String(96*progress(t,.1,.6)*end));

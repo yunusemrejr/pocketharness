@@ -11,7 +11,18 @@ Read only the relevant reference:
 
 - [Connections and identity](references/connections.md): hosted browser, official Colab CLI, MCP, local Docker/Jupyter, Enterprise, secrets and storage authentication.
 - [Training operations](references/training-operations.md): repeatable environments, dataset staging, interruption-safe checkpoints, GPU/OOM diagnosis, time and cost estimates.
-- [Preflight notebook](assets/colab-preflight.ipynb): copy as a runnable hardware/environment diagnostic. It installs nothing, reads no secrets, downloads no model and starts no training. Extend a copy with the chosen training recipe.
+
+No preflight notebook is bundled. In an already-connected notebook, this standard-library cell identifies the Python runtime and whether a GPU diagnostic executable is available without installing packages or starting training:
+
+```python
+import platform, shutil, subprocess
+print(platform.python_version())
+gpu = shutil.which("nvidia-smi")
+if gpu:
+    subprocess.run([gpu, "--query-gpu=name,memory.total", "--format=csv,noheader"], check=True, timeout=10)
+else:
+    print("nvidia-smi unavailable; GPU capability has not been verified")
+```
 
 For a training notebook, keep configuration, environment setup, data validation, short training smoke test, full training, evaluation and export as independently rerunnable cells. Keep the executable training logic in a versioned Python module where practical. Verify the selected model's license/access and actual GPU memory before selecting full tuning versus adapters. LoRA/QLoRA reduce trainable state; long sequences and activations can still exceed memory.
 
@@ -19,4 +30,4 @@ Prepare and validate local artifacts before cloud execution. Existing user autho
 
 Check current official documentation and installed command help when executing: Colab limits, available accelerators, CLI authentication defaults and training APIs change. Never replace missing capabilities with invented endpoints, session cookies or fabricated successful connections.
 
-> PocketHarness note: this skill's bundled code assets were removed (the harness ships only native C/C++ and bash). Write the equivalent in the project's own language when needed, and prefer `pocket kit` (wav, audio, spring, svg, shot, web) where it covers the job.
+Python is part of the selected notebook workflow, not a required PocketHarness runtime. A local notebook file alone does not prove that a Colab runtime was reached.

@@ -808,19 +808,62 @@ std::map<std::string, double> Agent::ask(const json::Value& state, const std::ve
 
 // This turn as Span expects it: the conversation so far, then the answer.
 json::Value Agent::turnTranscript(const std::string& finalText) const {
+    // Preserve both requirements and terminal command outcomes. A prefix-only
+    // excerpt can hide the failing test at the end of a long tool response.
+    auto excerpt = [](const std::string& text, size_t limit) {
+        // Bound escaped wire bytes, not just input bytes. Control-heavy logs
+        // must not push the decision request beyond its transport limit.
+        auto width = [](unsigned char c) -> size_t { return c < 32 ? 6 : c == '"' || c == '\\' ? 2 : 1; };
+        size_t size = 2;
+        for (unsigned char c : text) { size += width(c); if (size > limit) break; }
+        if (size <= limit) return text;
+        size_t head = 0, tail = 0, used = 0, half = (limit - 100) / 2;
+        while (head < text.size() && used + width(text[head]) <= half) used += width(text[head++]);
+        used = 0;
+        while (tail < text.size() - head && used + width(text[text.size() - tail - 1]) <= half)
+            used += width(text[text.size() - ++tail]);
+        while (head && head < text.size() && ((unsigned char)text[head] & 0xc0) == 0x80) --head;
+        while (tail && ((unsigned char)text[text.size() - tail] & 0xc0) == 0x80) --tail;
+        return text.substr(0, head) + "\n[" + std::to_string(text.size() - head - tail) +
+            " bytes omitted]\n" + text.substr(text.size() - tail);
+    };
     json::Array input;
+    std::vector<size_t> sizes;
+    size_t bytes = 0, omitted = 0, pinned = 0;
+    auto append = [&](const std::string& role, std::string content, bool pin = false) {
+        input.push_back(json::Object{{"role", role}, {"content", std::move(content)}});
+        sizes.push_back(json::stringify(input.back()).size());
+        bytes += sizes.back();
+        if (pin) ++pinned;
+        // Keep the initial criterion and latest user direction, then the most
+        // recent observations, under both event and wire-size budgets.
+        while ((input.size() > 59 || bytes > 24000) && input.size() > pinned + 1) {
+            size_t drop = pinned;
+            bytes -= sizes[drop];
+            input.erase(input.begin() + drop);
+            sizes.erase(sizes.begin() + drop);
+            ++omitted;
+        }
+    };
+    const bool activeGoal = goalStatus_ == GoalStatus::Active && !goal_.empty();
+    const std::string& initial = activeGoal ? goal_ : originalRequest_;
+    if (!initial.empty())
+        append("user", std::string(activeGoal ? "[Active goal]\n" :
+            "[Original request; later user directions may amend this]\n") + excerpt(initial, 4000), true);
+    // Synthetic overseer/checkpoint messages also use role=user. Pin the
+    // separately retained real direction so those nudges cannot displace it.
+    if (!latestRequest_.empty() && latestRequest_ != initial)
+        append("user", "[Latest user direction]\n" + excerpt(latestRequest_, 4000), true);
     for (size_t i = turnStart_; i < messages_.size(); ++i) {
         const auto& m = messages_[i];
-        if (m.role == "user") input.push_back(json::Object{{"role", "user"}, {"content", m.content.substr(0, 2000)}});
+        if (m.role == "user") append("user", excerpt(m.content, 4000));
         for (const auto& tc : m.toolCalls)
-            input.push_back(json::Object{{"role", "assistant"}, {"content", "[" + tc.name + "] " + tc.argsJson.substr(0, 300)}});
-        if (m.role == "tool") input.push_back(json::Object{{"role", "tool"}, {"content", m.content.substr(0, 300)}});
+            append("assistant", "[" + tc.name + "] " + excerpt(tc.argsJson, 400));
+        if (m.role == "tool") append("tool", excerpt(m.content, 600));
     }
-    while (input.size() > 60) input.erase(input.begin() + 1);  // keep the request, drop the middle
-    if (!input.empty() && input.back().at("role").asStr() == "assistant" &&
-        input.back().at("content").asStr() == finalText.substr(0, 2000))
-        input.pop_back();
-    return json::Object{{"input", input}, {"output", json::Object{{"role", "assistant"}, {"content", finalText.substr(0, 4000)}}}};
+    if (omitted) input.insert(input.begin() + std::min<size_t>(1, input.size()),
+        json::Object{{"role", "tool"}, {"content", "[" + std::to_string(omitted) + " older evidence events omitted]"}});
+    return json::Object{{"input", input}, {"output", json::Object{{"role", "assistant"}, {"content", excerpt(finalText, 4000)}}}};
 }
 
 // Oversized tool output: Jev keeps the chunks that matter for the task

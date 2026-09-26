@@ -1,7 +1,11 @@
 // PocketHarness tests - runner.
 #include "mini.h"
 
-int main() {
+int videoTestFixture(int argc, char** argv);
+
+int main(int argc, char** argv) {
+    int fixture = videoTestFixture(argc, argv);
+    if (fixture >= 0) return fixture;
     const std::string scratch = pocket::test::makeTempDir("pocket-tests-home");
     if (scratch.empty()) return 1;
     struct Cleanup { std::string path; ~Cleanup() { pocket::test::rmRf(path); } } cleanup{scratch};

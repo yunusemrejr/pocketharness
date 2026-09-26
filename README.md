@@ -14,15 +14,16 @@ few small native functions in the core:
   stacks: expert brief before work, autonomy nudges, verification demands,
   a review council, stop hooks, and `/goal` audits. It can never trap a turn.
 - **Judges** — cheap structured decisions: `respan/span-01` reads transcripts,
-  typesafe **Jev** reads content (both via OpenRouter's decisions API, about
-  $0.000001–$0.00002 a call), a local **Qwen3.5-0.8B** (llama.cpp, started on
+  typesafe **Jev** reads content (both via OpenRouter's decisions API with
+  reported metered cost), a local **Qwen3.5-0.8B** (llama.cpp, started on
   demand, niced) answers single questions for free, and a native naive-Bayes
   classifier covers offline sessions.
 - **Native intelligence** — fuzzy search, BM25 ranking, learned provider
   quirks and EWMA health, a code index (`kit find/sym/refs`) instead of
   vector DBs, embeddings or LSP servers.
 - **`pocket kit`** — web, search, headless-Chrome DOM/screenshots, image/SVG
-  lint, spring easings, WAV synthesis/analysis, anti-slop scans, host probe.
+  lint, spring easings, deterministic HTML-to-PNG/MP4, native sound effects,
+  WAV synthesis/analysis, anti-slop scans, host probe.
 - **Wisdom** — a compact doctrine in every prompt plus a retrieved book of
   domain practice (UI, brand, backend, security, data, motion, research...).
 - **30+ providers, one catalog** — every keyed provider's live model list,
@@ -45,13 +46,15 @@ terminal → agent loop → model provider → optional tool call → Linux/file
 ```
 
 One competent engineer should be able to understand essentially the entire
-architecture in an afternoon. The core stays native C++ with 17 translation units.
+architecture in an afternoon. The core stays native C++; optional host tools handle rendering and encoding.
 
 ## Install
 
 Requirements: `g++` (C++20), `make`, `curl`. No bundled third-party code.
-Optional: Chrome/Chromium for `kit shot/dom`, a llama.cpp `llama-server` + GGUF
-for the free local judge.
+Optional: Chrome/Chromium for `kit shot/dom/frame/video`, FFmpeg with H.264
+encoding for `kit video`, and a llama.cpp `llama-server` + GGUF for the free local
+judge. Native audio/SFX need none of these. Video export needs no Node/npm,
+browser SDK or linked codec library.
 
 ```bash
 git clone https://github.com/yunusemrejr/pocketharness
@@ -253,6 +256,9 @@ pocket kit web URL          readable page text + numbered links
 pocket kit search QUERY     keyless web search (DuckDuckGo html → lite)
 pocket kit dom URL          JS-rendered text via headless Chrome
 pocket kit shot URL OUT.png screenshot for visual QA (desktop/mobile sizes)
+pocket kit frame SCENE.html OUT.png --time 1.5   seek a deterministic frame
+pocket kit video SCENE.html OUT.mp4 --duration 6 --fps 24 [--audio sound.wav]
+pocket kit sfx OUT.wav whoosh [--duration .6]   seeded native sound effects
 pocket kit img FILE...      png/jpeg/gif/webp/svg type + dimensions
 pocket kit svg FILE         structure, viewBox, ids, animation count
 pocket kit spring K C M     physical spring → CSS linear() easing + duration
@@ -267,6 +273,31 @@ pocket kit probe            OS, CPU, memory, disk, GPU, toolchain
 
 A tool costs a schema in every request; a kit subcommand costs one line in
 the system prompt.
+
+Scenes define `window.renderFrame(timeSeconds)` and may provide a `renderReady`
+promise. The native renderer drives the existing browser over private pipes,
+seeks every frame, streams PNG directly into FFmpeg and publishes the output
+only after successful completion. Each render gets its own browser profile.
+Cancellation, JavaScript/encoder errors and timeouts preserve existing output.
+Limits are 120 seconds, 3,600 frames and a configurable wall-clock deadline;
+render longer work as scenes. `kit frame` needs only Chrome. TypeScript must be
+compiled by the project's own build step first; offline scenes use local assets.
+
+Run [the motion + audio example](examples/capabilities/motion/render.sh), or start
+from [the editable scene](skills/motion-graphics-production/assets/capability-demo.html).
+[Capability examples](examples/capabilities/README.md) also include a standalone
+C++ shortest-path implementation with a separate oracle, and a numeric classifier
+with train-only preprocessing and held-out evaluation. These are tested starting
+points; model quality and task-specific verification still matter.
+
+
+The [Jev paper](https://arxiv.org/pdf/2609.29429v1) motivates keeping probability
+scores, checking evidence quality and evaluating thresholds per task domain.
+Pocket batches the questions, treats supplied state as untrusted evidence,
+preserves structured context on fallback and retains requirement/outcome excerpts
+with explicit omission markers. Uncertain evidence makes quality judgments
+unknown, so normal review still runs. Fixed cutoffs are routing policy, not
+measured error guarantees; a tiny local LM cannot approve completion.
 
 ## Configuration
 

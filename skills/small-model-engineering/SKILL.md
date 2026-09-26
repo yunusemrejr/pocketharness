@@ -22,3 +22,5 @@ Use a small representative case and the relevant failure case to check the resul
 
 ## Harness integration
 Use deterministic compaction first, then validated extractive selection with original retrieval. Cache exact-source selections, bound CPU and retries, and retain protected evidence. See `references/patterns.md` for cache, telemetry and ML component-review contracts; client presence is not model eligibility.
+
+For batched Jev decisions, evidence sufficiency, unknown results and an optional standalone C++ threshold evaluation, read [decision routing and held-out checks](references/jev-decisions.md). The included synthetic fixture is not a model-quality benchmark or a calibrated deployment policy.

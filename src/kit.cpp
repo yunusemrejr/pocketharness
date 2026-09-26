@@ -1,5 +1,7 @@
 // PocketHarness - `pocket kit` native superpowers.
 #include "kit.h"
+#include "kit_audio.h"
+#include "kit_video.h"
 
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
@@ -8,6 +10,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cerrno>
+#include <filesystem>
 #include <map>
 #include <set>
 
@@ -190,46 +194,63 @@ std::string htmlToText(std::string_view html, std::vector<std::string>* links) {
     return "# " + title + "\n\n" + clean;
 }
 
-double noteFreq(const std::string& note) {
-    if (note.empty()) return -1;
-    if (isdigit((unsigned char)note[0])) {
-        double f = atof(note.c_str());
-        return f > 0 && f < 30000 ? f : -1;
-    }
-    static const int semis[] = {9, 11, 0, 2, 4, 5, 7};  // A B C D E F G
-    char n = (char)toupper((unsigned char)note[0]);
-    if (n < 'A' || n > 'G') return -1;
-    int s = semis[n - 'A'];
-    size_t i = 1;
-    if (i < note.size() && note[i] == '#') ++s, ++i;
-    else if (i < note.size() && note[i] == 'b') --s, ++i;
-    if (i >= note.size() || !(isdigit((unsigned char)note[i]) || note[i] == '-')) return -1;
-    int oct = atoi(note.c_str() + i);
-    int midi = (oct + 1) * 12 + s;
-    return 440.0 * std::pow(2.0, (midi - 69) / 12.0);
-}
-
 std::string springEasing(double k, double c, double m, double* durationMs) {
-    double x = 0, v = 0, dt = 1.0 / 1000;
-    std::vector<double> xs;
-    int settled = 0;
-    for (int i = 0; i < 10000; ++i) {
-        double a = (-k * (x - 1) - c * v) / m;
-        v += a * dt;
-        x += v * dt;
-        xs.push_back(x);
-        settled = std::fabs(x - 1) < 0.001 && std::fabs(v) < 0.01 ? settled + 1 : 0;
-        if (settled > 20) break;
+    if (durationMs) *durationMs = 0;
+    if (!std::isfinite(k) || !std::isfinite(c) || !std::isfinite(m) || k <= 0 || c <= 0 || m <= 0) return "";
+    const double omega = std::sqrt(k) / std::sqrt(m), alpha = (c / m) / 2;
+    if (!std::isfinite(omega) || !std::isfinite(alpha) || omega <= 0 || alpha <= 0) return "";
+    const double ratio = alpha / omega;
+    const bool critical = std::fabs(ratio - 1) < 1e-8;
+    const double beta = ratio < 1 && !critical ? omega * std::sqrt((1 - ratio) * (1 + ratio)) : 0;
+    const double root = ratio > 1 && !critical ? std::sqrt((1 - 1 / ratio) * (1 + 1 / ratio)) : 0;
+    const double slow = ratio > 1 ? -(omega / alpha) * omega / (1 + root) : 0;
+    const double fast = ratio > 1 ? -alpha * (1 + root) : 0;
+    if (!std::isfinite(beta) || !std::isfinite(fast) || (ratio > 1 && slow == 0)) return "";
+    // Closed-form unit-step response, starting at rest. The Euler integrator
+    // previously diverged for stiff springs and silently snapped unfinished ones.
+    auto response = [&](double t, bool envelope) {
+        double error, speed;
+        if (critical) {
+            const double wt = omega * t, decay = std::exp(-wt);
+            error = (1 + wt) * decay;
+            speed = omega * wt * decay;
+        } else if (ratio < 1) {
+            const double decay = std::exp(-alpha * t), q = alpha / beta;
+            error = decay * (envelope ? std::hypot(1.0, q) : std::cos(beta * t) + q * std::sin(beta * t));
+            speed = decay * (omega / beta) * omega;
+        } else {
+            const double a = -fast / (slow - fast), b = slow / (slow - fast);
+            error = a * std::exp(slow * t) + b * std::exp(fast * t);
+            speed = a * (-slow) * (std::exp(slow * t) - std::exp(fast * t));
+        }
+        return std::pair<double, double>{error, speed};
+    };
+    auto settled = [&](double t) {
+        const auto [error, speed] = response(t, true);
+        return std::isfinite(error) && std::isfinite(speed) && error <= 0.001 && speed <= 0.01;
+    };
+    // Bound both the settling horizon and the amount of generated CSS.
+    double lo = 0, hi = 0.001;
+    while (hi < 60 && !settled(hi)) hi = std::min(60.0, hi * 2);
+    if (!settled(hi)) return "";
+    for (int i = 0; i < 40; ++i) {
+        double mid = (lo + hi) / 2;
+        if (settled(mid)) hi = mid;
+        else lo = mid;
     }
-    if (durationMs) *durationMs = (double)xs.size();
-    std::string s = "linear(0";
-    const int n = 40;
-    for (int i = 1; i <= n; ++i) {
-        char b[16];
-        snprintf(b, sizeof b, ", %.3g", i == n ? 1.0 : xs[(xs.size() - 1) * i / n]);
-        s += b;
+    const double intervals = std::max(40.0, std::ceil(beta * hi * 16 / M_PI));
+    if (!std::isfinite(intervals) || intervals > 2048) return "";
+    const int count = (int)intervals;
+    std::string result = "linear(0";
+    for (int i = 1; i < count; ++i) {
+        const double value = 1 - response(hi * i / count, false).first;
+        if (!std::isfinite(value)) return "";
+        char text[32];
+        snprintf(text, sizeof text, ", %.6g", value);
+        result += text;
     }
-    return s + ")";
+    if (durationMs) *durationMs = hi * 1000;
+    return result + ", 1)";
 }
 
 std::vector<std::string> slopScan(const std::string& path, const std::string& content) {
@@ -309,6 +330,12 @@ std::string hostProbe(const std::string& dir) {
                              "google-chrome", "chromium", "sqlite3", "gdb", "valgrind", "strace"})
         if (!whichExe(tool).empty()) have += std::string(have.empty() ? "" : " ") + tool;
     s += "tools: " + have + "\n";
+    bool chrome = false;
+    for (const char* name : {"google-chrome", "chromium", "chromium-browser", "google-chrome-stable"})
+        chrome = chrome || !whichExe(name).empty();
+    s += "capabilities: native audio/SFX + analysis; frames " + std::string(chrome ? "available" : "need Chrome/Chromium") +
+         "; video " + (chrome && !whichExe("ffmpeg").empty() ? "available (Chrome + FFmpeg)" : "needs Chrome/Chromium + FFmpeg") + "\n";
+    s += "scene contract: local HTML with window.renderFrame(timeSeconds); use kit frame before kit video\n";
     return s;
 }
 
@@ -320,12 +347,53 @@ std::string chromeExe() {
     return "";
 }
 
-std::vector<std::string> chromeArgs(const std::string& exe) {
-    const char* td = getenv("TMPDIR");
-    std::string prof = std::string(td && *td ? td : "/tmp") + "/pocket-chrome-" + std::to_string(getuid());
-    // Already inside Landlock+seccomp: Chrome's namespace sandbox can't nest.
+struct ChromeScratch {
+    std::string path;
+    ChromeScratch() {
+        const char* td = getenv("TMPDIR");
+        std::string pattern = std::string(td && *td ? td : "/tmp") + "/pocket-chrome-XXXXXX";
+        std::vector<char> data(pattern.begin(), pattern.end());
+        data.push_back('\0');
+        if (mkdtemp(data.data())) path = data.data();
+    }
+    ~ChromeScratch() {
+        std::error_code ec;
+        if (!path.empty()) std::filesystem::remove_all(path, ec);
+    }
+};
+
+std::vector<std::string> chromeArgs(const std::string& exe, const std::string& profile) {
+    // Inside the harness Chrome inherits Landlock+seccomp confinement.
     return {exe, "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
-            "--no-first-run", "--disable-dev-shm-usage", "--user-data-dir=" + prof, "--virtual-time-budget=4000"};
+            "--no-first-run", "--disable-dev-shm-usage", "--user-data-dir=" + profile, "--virtual-time-budget=4000"};
+}
+
+bool shotSize(const std::string& text, unsigned& width, unsigned& height) {
+    size_t x = text.find('x');
+    if (x == std::string::npos || x == 0 || x + 1 == text.size()) return false;
+    auto dimension = [](std::string_view value, unsigned& out) {
+        out = 0;
+        for (char c : value) {
+            if (c < '0' || c > '9') return false;
+            out = out * 10 + (unsigned)(c - '0');
+            if (out > 8192) return false;
+        }
+        return out > 0;
+    };
+    return dimension(std::string_view(text).substr(0, x), width) &&
+           dimension(std::string_view(text).substr(x + 1), height) && (uint64_t)width * height <= 32000000;
+}
+
+bool pngSize(std::string_view data, unsigned& width, unsigned& height) {
+    if (data.size() < 33 || data.substr(0, 8) != std::string_view("\x89PNG\r\n\x1a\n", 8) ||
+        data.substr(8, 8) != std::string_view("\0\0\0\x0dIHDR", 8)) return false;
+    auto be32 = [&](size_t i) {
+        uint32_t n = 0;
+        for (size_t j = i; j < i + 4; ++j) n = (n << 8) | (unsigned char)data[j];
+        return n;
+    };
+    width = be32(16), height = be32(20);
+    return width > 0 && height > 0;
 }
 
 int kitWeb(const std::vector<std::string>& a) {
@@ -406,182 +474,100 @@ int kitSearch(const std::vector<std::string>& a) {
 }
 
 int kitShot(const std::vector<std::string>& a, bool dom) {
-    if (a.size() < (dom ? 1u : 2u)) return fail(dom ? "usage: kit dom URL" : "usage: kit shot URL OUT.png [WxH]");
+    if (a.size() < (dom ? 1u : 2u) || a.size() > (dom ? 1u : 3u))
+        return fail(dom ? "usage: kit dom URL" : "usage: kit shot URL OUT.png [WxH]");
+    if (a[0].empty() || a[0][0] == '-' || a[0].find_first_of("\r\n") != std::string::npos)
+        return fail("invalid browser URL");
+    unsigned width = 1280, height = 800;
+    if (!dom && a.size() == 3 && !shotSize(a[2], width, height))
+        return fail("size must be WIDTHxHEIGHT, 1..8192 per dimension and at most 32 million pixels");
     std::string exe = chromeExe();
     if (exe.empty()) return fail("no Chrome/Chromium on PATH");
-    auto args = chromeArgs(exe);
+    ChromeScratch scratch;
+    if (scratch.path.empty()) return fail("cannot create private Chrome directory");
+    auto args = chromeArgs(exe, scratch.path + "/profile");
+    const std::string output = scratch.path + "/frame.png";
     if (dom) args.push_back("--dump-dom");
     else {
-        std::string size = a.size() > 2 ? a[2] : "1280x800";
-        std::replace(size.begin(), size.end(), 'x', ',');
-        args.push_back("--window-size=" + size);
-        args.push_back("--screenshot=" + a[1]);
+        args.push_back("--window-size=" + std::to_string(width) + "," + std::to_string(height));
+        args.push_back("--screenshot=" + output);
     }
     args.push_back(a[0]);
     SpawnResult r = run(args, 60000, 16 << 20);
-    if (!r.ok || r.exitCode != 0) return fail("chrome failed: " + trim(r.err.substr(0, 400)));
+    if (!r.ok || r.exitCode != 0 || r.truncated)
+        return fail("chrome failed: " + (r.truncated ? std::string("output limit exceeded") : trim((r.err + r.error).substr(0, 400))));
     if (dom) printf("%s", htmlToText(r.out).c_str());
-    else printf("screenshot: %s\n", a[1].c_str());
+    else {
+        auto png = readFileBounded(output, 128 << 20);
+        unsigned actualWidth = 0, actualHeight = 0;
+        if (!png.ok || !pngSize(png.value, actualWidth, actualHeight) || actualWidth != width || actualHeight != height)
+            return fail("Chrome did not produce a valid screenshot at the requested size");
+        auto saved = atomicWriteFile(a[1], png.value);
+        if (!saved.ok) return fail(saved.error);
+        printf("screenshot: %s\n", a[1].c_str());
+    }
     return 0;
 }
 
 int kitImg(const std::vector<std::string>& a) {
+    if (a.empty()) return fail("usage: kit img FILE...");
+    bool failed = false;
     for (const auto& path : a) {
         auto t = readFileBounded(path, 64 << 20);
-        if (!t.ok) { printf("%s: %s\n", path.c_str(), t.error.c_str()); continue; }
+        if (!t.ok) { fprintf(stderr, "%s: %s\n", path.c_str(), t.error.c_str()); failed = true; continue; }
         const auto* b = (const unsigned char*)t.value.data();
         size_t n = t.value.size();
-        long w = -1, h = -1;
-        std::string kind = "unknown";
-        auto be16 = [&](size_t i) { return (long)(b[i] << 8 | b[i + 1]); };
-        auto be32 = [&](size_t i) { return (long)((unsigned long)b[i] << 24 | b[i + 1] << 16 | b[i + 2] << 8 | b[i + 3]); };
-        if (n > 24 && !memcmp(b, "\x89PNG", 4)) kind = "png", w = be32(16), h = be32(20);
-        else if (n > 10 && !memcmp(b, "GIF8", 4)) kind = "gif", w = b[6] | b[7] << 8, h = b[8] | b[9] << 8;
-        else if (n > 30 && !memcmp(b, "RIFF", 4) && !memcmp(b + 8, "WEBP", 4)) {
+        unsigned w = 0, h = 0;
+        std::string kind;
+        auto be16 = [&](size_t i) { return (unsigned)(b[i] << 8 | b[i + 1]); };
+        auto le32 = [&](size_t i) { return (uint32_t)b[i] | (uint32_t)b[i + 1] << 8 | (uint32_t)b[i + 2] << 16 | (uint32_t)b[i + 3] << 24; };
+        if (pngSize(t.value, w, h)) kind = "png";
+        else if (n >= 13 && (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6)))
+            kind = "gif", w = b[6] | b[7] << 8, h = b[8] | b[9] << 8;
+        else if (n >= 20 && !memcmp(b, "RIFF", 4) && !memcmp(b + 8, "WEBP", 4) &&
+                 le32(4) >= 12 && le32(4) <= n - 8 && le32(16) <= le32(4) - 12) {
             kind = "webp";
-            if (!memcmp(b + 12, "VP8X", 4)) w = 1 + (b[24] | b[25] << 8 | b[26] << 16), h = 1 + (b[27] | b[28] << 8 | b[29] << 16);
-            else if (!memcmp(b + 12, "VP8 ", 4)) w = (b[26] | b[27] << 8) & 0x3fff, h = (b[28] | b[29] << 8) & 0x3fff;
-            else if (!memcmp(b + 12, "VP8L", 4)) w = 1 + ((b[21] | b[22] << 8) & 0x3fff), h = 1 + ((b[22] >> 6 | b[23] << 2 | b[24] << 10) & 0x3fff);
-        } else if (n > 4 && b[0] == 0xff && b[1] == 0xd8) {
+            if (le32(16) >= 10 && n >= 30 && !memcmp(b + 12, "VP8X", 4))
+                w = 1 + (b[24] | b[25] << 8 | b[26] << 16), h = 1 + (b[27] | b[28] << 8 | b[29] << 16);
+            else if (le32(16) >= 10 && n >= 30 && !memcmp(b + 12, "VP8 ", 4) && !memcmp(b + 23, "\x9d\x01\x2a", 3))
+                w = (b[26] | b[27] << 8) & 0x3fff, h = (b[28] | b[29] << 8) & 0x3fff;
+            else if (le32(16) >= 5 && n >= 25 && !memcmp(b + 12, "VP8L", 4) && b[20] == 0x2f)
+                w = 1 + ((b[21] | b[22] << 8) & 0x3fff), h = 1 + ((b[22] >> 6 | b[23] << 2 | b[24] << 10) & 0x3fff);
+        } else if (n >= 4 && b[0] == 0xff && b[1] == 0xd8) {
             kind = "jpeg";
-            for (size_t i = 2; i + 9 < n;) {
-                if (b[i] != 0xff) { ++i; continue; }
-                unsigned m = b[i + 1];
-                if (m >= 0xc0 && m <= 0xcf && m != 0xc4 && m != 0xc8 && m != 0xcc) { h = be16(i + 5); w = be16(i + 7); break; }
-                i += 2 + (size_t)be16(i + 2);
+            for (size_t i = 2; i < n;) {
+                if (b[i++] != 0xff) break;
+                while (i < n && b[i] == 0xff) ++i;
+                if (i == n) break;
+                const unsigned marker = b[i++];
+                if (marker == 0xd9 || marker == 0xda || marker == 0) break;
+                if (marker == 1 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+                if (i + 2 > n) break;
+                const size_t length = be16(i);
+                if (length < 2 || length > n - i) break;
+                if (marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc) {
+                    if (length >= 8 && b[i + 7] > 0 && length >= 8 + 3u * b[i + 7])
+                        h = be16(i + 3), w = be16(i + 5);
+                    break;
+                }
+                i += length;
             }
-        } else if (t.value.find("<svg") != std::string::npos) {
-            kind = "svg";
-            size_t p = t.value.find("<svg");
-            std::string tag = t.value.substr(p, t.value.find('>', p) - p);
-            printf("%s: svg viewBox=\"%s\" width=%s height=%s, %zu bytes\n", path.c_str(), attr(tag, "viewbox").c_str(),
-                   attr(tag, "width").c_str(), attr(tag, "height").c_str(), n);
-            continue;
+        } else {
+            size_t p = t.value.find("<svg"), end = p == std::string::npos ? p : t.value.find('>', p);
+            if (p != std::string::npos && end != std::string::npos && p + 4 < n &&
+                (isspace(b[p + 4]) || b[p + 4] == '>' || b[p + 4] == '/')) {
+                std::string tag = t.value.substr(p, end - p);
+                printf("%s: svg viewBox=\"%s\" width=%s height=%s, %zu bytes\n", path.c_str(), attr(tag, "viewbox").c_str(),
+                       attr(tag, "width").c_str(), attr(tag, "height").c_str(), n);
+                continue;
+            }
         }
-        printf("%s: %s %ldx%ld, %zu bytes\n", path.c_str(), kind.c_str(), w, h, n);
+        if (kind.empty() || !w || !h) {
+            fprintf(stderr, "%s: unsupported or invalid image header\n", path.c_str());
+            failed = true;
+        } else printf("%s: %s %ux%u, %zu bytes\n", path.c_str(), kind.c_str(), w, h, n);
     }
-    return a.empty() ? fail("usage: kit img FILE...") : 0;
-}
-
-void putLe(std::string& s, uint32_t v, int bytes) {
-    for (int i = 0; i < bytes; ++i) s += (char)(v >> (8 * i) & 0xff);
-}
-
-int kitWav(const std::vector<std::string>& a) {
-    if (a.size() < 2) return fail("usage: kit wav OUT.wav \"C4:.25 E4:.25 R:.25 440:.5\" [--wave sine|square|saw|tri] [--bpm N] [--gain G]");
-    std::string wave = "sine";
-    double bpm = 0, gain = 0.3;
-    for (size_t i = 2; i + 1 < a.size(); i += 2) {
-        if (a[i] == "--wave") wave = a[i + 1];
-        else if (a[i] == "--bpm") bpm = atof(a[i + 1].c_str());
-        else if (a[i] == "--gain") gain = std::clamp(atof(a[i + 1].c_str()), 0.0, 1.0);
-    }
-    const int rate = 44100;
-    std::string pcm;
-    double phase = 0;
-    std::string spec = a[1];
-    std::replace(spec.begin(), spec.end(), ',', ' ');
-    std::vector<std::string> events;
-    for (const auto& l : splitLines(spec))
-        for (size_t p = 0; p < l.size();) {
-            size_t q = l.find(' ', p);
-            if (q != p) events.push_back(l.substr(p, q == std::string::npos ? std::string::npos : q - p));
-            p = q == std::string::npos ? l.size() : q + 1;
-        }
-    for (const auto& ev : events) {
-        size_t colon = ev.find(':');
-        std::string note = ev.substr(0, colon);
-        double dur = colon == std::string::npos ? 0.25 : atof(ev.c_str() + colon + 1);
-        if (bpm > 0) dur *= 60.0 / bpm;
-        double f = toupper((unsigned char)note[0]) == 'R' ? 0 : noteFreq(note);
-        if (f < 0 || dur <= 0 || dur > 60) return fail("bad event \"" + ev + "\"");
-        long n = (long)(dur * rate);
-        for (long i = 0; i < n; ++i) {
-            double t = (double)i / rate, env = std::min({1.0, t / 0.005, (dur - t) / 0.03});
-            phase += f / rate;
-            phase -= std::floor(phase);
-            double s = wave == "square" ? (phase < 0.5 ? 1 : -1)
-                       : wave == "saw"  ? 2 * phase - 1
-                       : wave == "tri"  ? 1 - 4 * std::fabs(phase - 0.5)
-                                        : std::sin(2 * M_PI * phase);
-            putLe(pcm, (uint16_t)(int16_t)std::lround(f > 0 ? s * std::max(0.0, env) * gain * 32767 : 0), 2);
-        }
-    }
-    std::string wav = "RIFF";
-    putLe(wav, 36 + (uint32_t)pcm.size(), 4);
-    wav += "WAVEfmt ";
-    putLe(wav, 16, 4), putLe(wav, 1, 2), putLe(wav, 1, 2), putLe(wav, rate, 4), putLe(wav, rate * 2, 4);
-    putLe(wav, 2, 2), putLe(wav, 16, 2);
-    wav += "data";
-    putLe(wav, (uint32_t)pcm.size(), 4);
-    auto w = atomicWriteFile(a[0], wav + pcm);
-    if (!w.ok) return fail(w.error);
-    printf("%s: %.2fs mono 16-bit %d Hz (%s)\n", a[0].c_str(), pcm.size() / 2.0 / rate, rate, wave.c_str());
-    return 0;
-}
-
-int kitAudio(const std::vector<std::string>& a) {
-    if (a.empty()) return fail("usage: kit audio FILE.wav");
-    auto t = readFileBounded(a[0], 512 << 20);
-    if (!t.ok) return fail(t.error);
-    const std::string& d = t.value;
-    if (d.size() < 44 || d.compare(0, 4, "RIFF") || d.compare(8, 4, "WAVE")) return fail("not a RIFF/WAVE file (convert with ffmpeg -i in.x out.wav)");
-    auto le = [&](size_t i, int n) { uint32_t v = 0; for (int k = n - 1; k >= 0; --k) v = v << 8 | (unsigned char)d[i + k]; return v; };
-    int ch = 0, bits = 0;
-    long rate = 0;
-    size_t data = 0, len = 0;
-    for (size_t p = 12; p + 8 <= d.size();) {
-        uint32_t sz = le(p + 4, 4);
-        if (!d.compare(p, 4, "fmt ")) ch = (int)le(p + 10, 2), rate = le(p + 12, 4), bits = (int)le(p + 22, 2);
-        if (!d.compare(p, 4, "data")) { data = p + 8; len = std::min<size_t>(sz, d.size() - data); break; }
-        p += 8 + sz + (sz & 1);
-    }
-    if (!data || bits != 16 || ch < 1 || rate <= 0) return fail("need 16-bit PCM WAV");
-    size_t frames = len / (2 * (size_t)ch);
-    std::vector<float> mono(frames);
-    double sum = 0, peak = 0;
-    long clip = 0;
-    for (size_t i = 0; i < frames; ++i) {
-        double s = 0;
-        for (int c = 0; c < ch; ++c) {
-            double v = (int16_t)le(data + (i * ch + c) * 2, 2) / 32768.0;
-            if (std::fabs(v) > 0.999) ++clip;
-            s += v;
-        }
-        s /= ch;
-        mono[i] = (float)s;
-        sum += s * s;
-        peak = std::max(peak, std::fabs(s));
-    }
-    auto db = [](double x) { return x > 0 ? 20 * std::log10(x) : -120.0; };
-    // Pitch: autocorrelation over the loudest 4096-sample window.
-    size_t win = 4096, best = 0;
-    double bestE = -1;
-    for (size_t s = 0; s + win <= frames; s += win / 2) {
-        double e = 0;
-        for (size_t i = s; i < s + win; i += 4) e += mono[i] * mono[i];
-        if (e > bestE) bestE = e, best = s;
-    }
-    double pitch = 0;
-    if (frames >= win) {
-        double bestR = 0;
-        for (long lag = rate / 2000; lag <= rate / 50; ++lag) {
-            double r = 0;
-            for (size_t i = best; i + (size_t)lag < best + win; ++i) r += mono[i] * mono[i + lag];
-            if (r > bestR) bestR = r, pitch = (double)rate / lag;
-        }
-    }
-    long silent = 0;
-    for (size_t s = 0; s + rate / 10 <= frames; s += rate / 10) {
-        double e = 0;
-        for (size_t i = s; i < s + rate / 10; ++i) e += mono[i] * mono[i];
-        if (db(std::sqrt(e / (rate / 10))) < -50) ++silent;
-    }
-    printf("%s: %.2fs, %d ch, %ld Hz\npeak %.1f dBFS · rms %.1f dBFS · clipped samples %ld\n"
-           "dominant pitch ~%.1f Hz · silence %.1fs\n",
-           a[0].c_str(), (double)frames / rate, ch, rate, db(peak), db(std::sqrt(sum / std::max<size_t>(1, frames))),
-           clip, pitch, silent / 10.0);
-    return 0;
+    return failed ? 1 : 0;
 }
 
 int kitSvg(const std::vector<std::string>& a) {
@@ -624,29 +610,38 @@ int kitSvg(const std::vector<std::string>& a) {
 }
 
 int kitSpring(const std::vector<std::string>& a) {
-    double k = a.size() > 0 ? atof(a[0].c_str()) : 170, c = a.size() > 1 ? atof(a[1].c_str()) : 26,
-           m = a.size() > 2 ? atof(a[2].c_str()) : 1;
-    if (k <= 0 || c < 0 || m <= 0) return fail("usage: kit spring [stiffness=170] [damping=26] [mass=1]");
+    double values[] = {170, 26, 1};
+    if (a.size() > 3) return fail("usage: kit spring [stiffness=170] [damping=26] [mass=1]");
+    for (size_t i = 0; i < a.size(); ++i) {
+        char* end = nullptr;
+        errno = 0;
+        values[i] = strtod(a[i].c_str(), &end);
+        if (end == a[i].c_str() || *end || errno == ERANGE || !std::isfinite(values[i]) || values[i] <= 0)
+            return fail("spring parameters must be finite positive numbers; damping=0 never settles");
+    }
+    const double k = values[0], c = values[1], m = values[2];
     double ms = 0;
     std::string e = springEasing(k, c, m, &ms);
-    double zeta = c / (2 * std::sqrt(k * m));
-    printf("spring k=%g c=%g m=%g · damping ratio %.2f (%s) · settles in %.0f ms\n", k, c, m, zeta,
-           zeta < 1 ? "bouncy" : zeta == 1 ? "critical" : "overdamped", ms);
-    printf("css: transition: transform %.0fms %s;\n", ms, e.c_str());
+    if (e.empty()) return fail("spring cannot be represented by a settled easing within 60 seconds and 2048 samples");
+    double zeta = (c / m) / 2 / (std::sqrt(k) / std::sqrt(m));
+    printf("spring k=%g c=%g m=%g · damping ratio %.4g (%s) · settles in %.6g ms\n", k, c, m, zeta,
+           std::fabs(zeta - 1) < 1e-8 ? "critical" : zeta < 1 ? "bouncy" : "overdamped", ms);
+    printf("css: transition: transform %.6gms %s;\n", ms, e.c_str());
     printf("presets: gentle 120 14 · wobbly 180 12 · stiff 210 20 · slow 280 60 · snappy 400 30\n");
     return 0;
 }
 
 int kitSlop(const std::vector<std::string>& a) {
     int found = 0;
+    bool failed = false;
     for (const auto& p : a) {
         auto t = readFileBounded(p, 16 << 20);
-        if (!t.ok) { printf("%s: %s\n", p.c_str(), t.error.c_str()); continue; }
+        if (!t.ok) { fprintf(stderr, "%s: %s\n", p.c_str(), t.error.c_str()); failed = true; continue; }
         for (const auto& f : slopScan(p, t.value)) printf("%s: %s\n", p.c_str(), f.c_str()), ++found;
     }
     if (a.empty()) return fail("usage: kit slop FILE...");
-    if (!found) printf("clean: no placeholders, stubs, conflict markers or AI-tell phrasing\n");
-    return found ? 1 : 0;
+    if (!found && !failed) printf("clean: no placeholders, stubs, conflict markers or AI-tell phrasing\n");
+    return found || failed ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -804,6 +799,9 @@ int kitMain(int argc, char** argv) {
     if (sub == "dom") return kitShot(a, true);
     if (sub == "probe") { printf("%s", hostProbe(a.empty() ? "." : a[0]).c_str()); return 0; }
     if (sub == "img") return kitImg(a);
+    if (sub == "video") return kitVideo(a);
+    if (sub == "frame") return kitFrame(a);
+    if (sub == "sfx") return kitSfx(a);
     if (sub == "wav") return kitWav(a);
     if (sub == "audio") return kitAudio(a);
     if (sub == "svg") return kitSvg(a);
@@ -817,6 +815,9 @@ int kitMain(int argc, char** argv) {
            "  search QUERY           web search (title, url, snippet)\n"
            "  dom URL                JS-rendered page text via headless Chrome\n"
            "  shot URL OUT.png [WxH] screenshot via headless Chrome (visual QA)\n"
+           "  frame HTML OUT.png     deterministic scene frame (--time, --size)\n"
+           "  video HTML OUT.mp4     render a scene (--duration, --fps, --size, --audio)\n"
+           "  sfx OUT.wav PRESET     native click/chime/laser/whoosh/impact/tone/noise\n"
            "  img FILE...            image type + dimensions (png/jpeg/gif/webp/svg)\n"
            "  svg FILE               SVG lint: structure, viewBox, ids, animation count\n"
            "  spring [k] [c] [m]     physical spring -> CSS linear() easing + duration\n"

@@ -6,6 +6,9 @@ tests/*.o
 tests/*.d
 tests/run_tests
 
+# Optional capability example outputs
+build/
+
 # Local dev scratch
 *.tmp.*
 *~
