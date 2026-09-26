@@ -2,10 +2,32 @@
 
 # PocketHarness
 
-A deliberately tiny, Linux-native C++ coding-agent TUI harness. It feels like
+A deliberately tiny, Linux-native C/C++ coding-agent TUI harness. It feels like
 Pi when used interactively, but architecturally it is the opposite of the big
-agent frameworks: no SDKs, no runtimes, no plugins, no MCP, no hooks, no
-orchestration layers, no dependency jungle.
+agent frameworks: no SDKs, no runtimes, no plugins, no MCP, no orchestration
+layers, no dependency jungle — and no other languages in the box.
+
+Everything a big harness spreads over dozens of extensions lives here as a
+few small native functions in the core:
+
+- **Overseer** — one supervisor instead of observer/watchmaker/council/guardian
+  stacks: expert brief before work, autonomy nudges, verification demands,
+  a review council, stop hooks, and `/goal` audits. It can never trap a turn.
+- **Judges** — cheap structured decisions: `respan/span-01` reads transcripts,
+  typesafe **Jev** reads content (both via OpenRouter's decisions API, about
+  $0.000001–$0.00002 a call), a local **Qwen3.5-0.8B** (llama.cpp, started on
+  demand, niced) answers single questions for free, and a native naive-Bayes
+  classifier covers offline sessions.
+- **Native intelligence** — fuzzy search, BM25 ranking, learned provider
+  quirks and EWMA health, a code index (`kit find/sym/refs`) instead of
+  vector DBs, embeddings or LSP servers.
+- **`pocket kit`** — web, search, headless-Chrome DOM/screenshots, image/SVG
+  lint, spring easings, WAV synthesis/analysis, anti-slop scans, host probe.
+- **Wisdom** — a compact doctrine in every prompt plus a retrieved book of
+  domain practice (UI, brand, backend, security, data, motion, research...).
+- **30+ providers, one catalog** — every keyed provider's live model list,
+  refreshed daily in the background, searchable in `/models`; ChatGPT
+  **Codex** login supported; total cost (models + judges) always visible.
 
 > PocketHarness intentionally delegates general-purpose functionality to Linux
 > instead of accumulating wrappers, plugins and orchestration layers.
@@ -23,11 +45,13 @@ terminal → agent loop → model provider → optional tool call → Linux/file
 ```
 
 One competent engineer should be able to understand essentially the entire
-architecture in an afternoon. (About 8k lines of C++ including headers, 12 translation units.)
+architecture in an afternoon. (About 11k lines of C++ including headers, 17 translation units.)
 
 ## Install
 
 Requirements: `g++` (C++20), `make`, `curl`. No bundled third-party code.
+Optional: Chrome/Chromium for `kit shot/dom`, a llama.cpp `llama-server` + GGUF
+for the free local judge.
 
 ```bash
 git clone https://github.com/yunusemrejr/pocketharness
@@ -56,17 +80,23 @@ pocket -m glm -p "Review src/network.cpp."
 pocket -m ollama:qwen3:8b -t none --max-tokens 2048 -p "Explain this project."
 pocket --resume         # newest idle session in this workspace
 pocket --sessions       # list workspaces, active/idle sessions, previews
+pocket -g "make the settings page elegant and fix the save bug"   # autonomous goal
+pocket --models flash   # fuzzy-search the live catalog (pocket --refresh-catalog)
+pocket kit              # native superpowers (also available to the model)
 ```
 
-Set provider keys as environment variables (never in files that get committed):
+Set provider keys as environment variables, or keep them in
+`~/.config/pocketharness/env` (`KEY=value` lines, mode 0600, loaded at
+startup, never overriding the shell). Never in files that get committed:
 
 ```bash
 export DEEPSEEK_API_KEY=...
-export OPENROUTER_API_KEY=...
+export OPENROUTER_API_KEY=...     # also enables the Span/Jev judges
 ```
 
-Slash commands: `/model` `/thinking` `/compact` `/skills` `/session`
-`/security` `/help` `/quit`. Keys: Enter submits, Ctrl-J/Alt-Enter newline,
+Slash commands: `/models` (assign main · fast · fallback · review, fuzzy
+search over the catalog) `/model` `/goal` `/thinking` `/compact` `/undo`
+`/skills` `/session` `/brain` `/catalog` `/security` `/help` `/quit`. Keys: Enter submits, Ctrl-J/Alt-Enter newline,
 Up/Down history, Ctrl-C cancels (empty prompt quits), Ctrl-D quits.
 Paste is bracketed (multi-line paste never submits early); the pinned bottom
 bar always shows the input box plus context/tok-s/cache KPIs.
@@ -92,6 +122,53 @@ file (never via environment, which the model can read). Provider keys are
 never inherited implicitly: a child authenticates only through explicit
 user-level `expose_env` passthrough. Kernel confinement is inherited and
 cannot be shed — under `--offline` the whole subtree loses `AF_INET`.
+
+## The overseer
+
+Weak and strong models get the same standards, enforced by the harness:
+
+1. **Brief.** A substantial request ("fix", "build", "redesign", ...) first
+   goes to the `fast` model as a planning council: intent, the questions a
+   domain expert would ask (identity, typography, architecture, data,
+   security...) answered decisively from the project's evidence and the
+   wisdom book, acceptance criteria, and the average outcome to avoid. The
+   brief rides along with the request; the user's words win on conflict.
+2. **Skill hints.** BM25 finds candidate skills; Jev confirms relevance in
+   one batched call; the hint names them for loading.
+3. **Guardian on every change.** Writes/edits are scanned natively
+   (placeholders, "rest unchanged" elisions, stubs, conflict markers,
+   invalid JSON, AI-tell prose); UI and prose files also get a Jev taste
+   check for template-grade design and fake content. `post_edit` hooks run
+   too. Findings return to the model immediately.
+4. **Watchmaker.** The same call failing three times gets a "change
+   approach" note; long turns get a convergence check; identical batches stop.
+5. **Stop gate.** When the model answers without tools, Span reads the turn:
+   asking permission, announcing work without doing it, dropped
+   requirements, premature completion → a short `[overseer]` nudge and the
+   turn continues. Files changed but never verified → a verification demand.
+   Failing `stop` hooks → their output. Changed work → the **review
+   council**: Span prefilters (clean work skips the paid review), then each
+   `review` model answers LGTM or defects; a majority of objections goes
+   back to the worker once.
+6. **Goals.** `/goal TEXT` (or `pocket -g`) runs turns until an audit says
+   the goal is met: Span confirms cheaply when it is sure, otherwise the
+   `fast` model audits the digest and lists what remains. Stricter limits,
+   review always on.
+
+Every check is bounded (a few nudges per turn); every remote judge
+refines and never gates; offline, the native classifier and heuristics
+still run. `/brain` shows nudges, reviews, fallbacks, distillations and
+side cost; `review: false` / `autonomy: false` switch the overseer off.
+
+## Roles, fallback, cost
+
+`/models` assigns four roles, saved in `~/.config/pocketharness/roles.json`:
+`main` does the work; `fast` writes briefs, summaries and goal audits;
+`fallback` takes a request when `main` stays down after its own retries
+(5xx/429/transport — never on 4xx); `review` is the council (comma-separate
+several models for a majority vote). Total cost in the status bar includes
+judges, reviews, briefs and summaries; unreported cost is estimated from
+catalog prices and marked `~`.
 
 ## The five tools
 
@@ -120,8 +197,31 @@ authority boundary, test surface, and context cost.
 - **bash** — normal Linux commands with captured stdout/stderr, exit status,
   timeout, cancellation, `pipefail`, sandboxing, and network access on by default
   (`--offline` denies it: guard fails fast, seccomp blocks the sockets).
-- **skill** — `list` / `search` / `load` Markdown skills (metadata first,
-  full text only when deliberately loaded).
+- **skill** — `list` / `search` / `load` Markdown skills (names first,
+  BM25 search with descriptions, full text only when deliberately loaded).
+
+Everything else is a subcommand of the same binary, staged on the sandbox
+`PATH` each session so the model reaches it through `bash`:
+
+```
+pocket kit web URL          readable page text + numbered links
+pocket kit search QUERY     keyless web search (DuckDuckGo html → lite)
+pocket kit dom URL          JS-rendered text via headless Chrome
+pocket kit shot URL OUT.png screenshot for visual QA (desktop/mobile sizes)
+pocket kit img FILE...      png/jpeg/gif/webp/svg type + dimensions
+pocket kit svg FILE         structure, viewBox, ids, animation count
+pocket kit spring K C M     physical spring → CSS linear() easing + duration
+pocket kit wav OUT "C4:.25 R:.25 440:.5"   synthesize tones (sine/square/saw/tri)
+pocket kit audio FILE.wav   loudness, peak, clipping, pitch, silence
+pocket kit slop FILE...     placeholders, stubs, conflict markers, AI-tell prose
+pocket kit find QUERY       ranked code search (BM25 over chunks, no index)
+pocket kit sym NAME|.       definitions (outline with ".") — LSP-lite
+pocket kit refs NAME        whole-word references
+pocket kit probe            OS, CPU, memory, disk, GPU, toolchain
+```
+
+A tool costs a schema in every request; a kit subcommand costs one line in
+the system prompt.
 
 ## Configuration
 
@@ -147,6 +247,19 @@ One transparent user config, optional project overlay. See
   "models": {
     "glm": { "provider": "orcarouter", "model": "z-ai/glm-5.3-flash" }
   },
+  "roles": { "fast": "deepseek:deepseek-flash", "review": "deepseek:deepseek-flash,openrouter:z-ai/glm-5.3-flash" },
+  "hooks": {
+    "post_edit": ["case {file} in *.py) python3 -m py_compile {file};; esac"],
+    "pre_bash": [],
+    "stop": ["make -s test"]
+  },
+  "review": true,
+  "autonomy": true,
+  "jev": true,
+  "local_lm": {
+    "server": "~/llama.cpp/llama-server", "model": "~/models/Qwen3.5-0.8B-Q4_0.gguf",
+    "key_file": "", "port": 18735, "threads": 4, "ctx": 4096
+  },
   "tool_network": true,
   "bash_timeout": 120,
   "output_limit": 262144,
@@ -157,8 +270,14 @@ One transparent user config, optional project overlay. See
 }
 ```
 
+Hooks run in exactly the bash-tool sandbox (`{file}`/`{cmd}` expand
+shell-quoted): `post_edit` failures return to the model, a failing
+`pre_bash` blocks the command, failing `stop` hooks keep the turn going.
+`local_lm` is optional: the harness starts `llama-server` on loopback only
+when a judgement needs it (niced, thread-capped) and stops it on exit.
+
 Security-sensitive keys (`providers`, `tool_network`, `allow_read`,
-`allow_write`, `expose_env`, timeouts, `max_rounds`) from **project**
+`allow_write`, `expose_env`, `local_lm`, timeouts, `max_rounds`) from **project**
 config are ignored
 with a warning — a repository must never silently escalate its own authority,
 and especially never redirect provider endpoints (which decide where API
@@ -180,8 +299,13 @@ produces precise errors, never silent guesses.
 }
 ```
 
-Built-in provider names also include `openai`, `ollama`, `lmstudio`, and
-`llamacpp`; use `provider:model-id` directly. The local presets point to loopback
+Built-in providers (just export the key): `openrouter orcarouter deepseek
+friendli together deepinfra cerebras groq mistral xai gemini nvidia
+fireworks moonshot zai agnes atria longcat ollama-cloud qwen runinfra
+streamlake xiaomi stepfun kimi-coding minimax anthropic openai codex`, plus
+local `ollama lmstudio llamacpp`. `codex` uses your ChatGPT login from
+`~/.codex/auth.json` (read-only: run `codex` to refresh it) over the Codex
+Responses API. Use `provider:model-id` directly. The local presets point to loopback
 ports 11434, 1234, and 8080 respectively. Install/load the model in your server;
 PocketHarness does not start a model daemon or allocate its GPU memory.
 
@@ -223,11 +347,25 @@ LM Studio server (default `127.0.0.1:1234`) before running pocket.
 
 ## Providers: wire protocols, not brands
 
-No per-vendor classes. Two protocol implementations driven by config data:
+No per-vendor classes. Three protocol implementations driven by config data:
 
 - **openai** — OpenAI-compatible chat + tool calling (OpenRouter, OrcaRouter,
   DeepSeek, Friendli, Together, DeepInfra, local servers, ...).
-- **anthropic** — Anthropic Messages + tool use.
+- **anthropic** — Anthropic Messages + tool use (Kimi coding, MiniMax too).
+- **codex** — OpenAI Responses over the ChatGPT Codex backend, encrypted
+  reasoning replayed to the same model.
+
+**Self-maintaining catalog.** `stateDir()/catalog.json` merges every keyed
+provider's `/models` listing (context, reasoning support, vision, prices),
+refreshed in a background thread once a day, so new model slugs appear
+without edits. A model the catalog marks as non-reasoning never receives
+effort parameters.
+
+**Learned quirks.** When a provider rejects a request with a recognizable
+400 (unsupported reasoning effort, `stream_options`, the wrong max-token
+parameter), the harness records the quirk for that model in `brain.json`
+and retries without it — once, then forever after. Per-provider EWMA
+health is tracked the same way (`/brain`).
 
 Model specs: `alias`, `provider:model`, or `provider:model@routing`:
 
@@ -297,7 +435,13 @@ PocketHarness keeps prompt prefixes stable by design:
   stderr output. Unreported = unknown, never inferred.
 
 Compaction legitimately establishes a new prefix; afterwards the new prefix
-stays stable again. There is no cache manager, daemon, or subsystem — just a
+stays stable again. The threshold adapts: with measured cache reuse
+(resent context is cheap) compaction waits until 90% of the window;
+without it, it runs at 75%, summarized by the cheaper `fast` model.
+Byte-identical large tool results are replaced by a reference to the
+earlier call, and oversized outputs (12–48 KB) are distilled by Jev,
+which keeps the chunks relevant to the task (errors always kept) instead
+of a blind head/tail cut. There is no cache manager, daemon, or subsystem — just a
 stable prefix and honest counters.
 
 Tool results are capped **once**, keeping their head and tail within 12k bytes.
@@ -343,21 +487,30 @@ repository-controlled input (like `POCKET.md`); kernel security boundaries
 never depend on prompt text.
 
 Project instructions come from the nearest `POCKET.md` (preferred) or
-`AGENTS.md` walking up from the workspace. Effective context is always just:
-frozen system prompt + project instructions + loaded skills + conversation —
-nothing hidden, nothing injected per-turn.
+`AGENTS.md` walking up from the workspace. The frozen prompt also carries
+the wisdom doctrine and an **awareness block** captured at session start:
+host (OS, CPU, memory, disk, GPU, toolchain), date, git state, the
+project's verify command, the guardrails actually enforced, and
+`.pocket/memory.md` (durable project notes the model appends to).
+Briefs, skill hints and overseer notes arrive as ordinary appended
+messages, visible in the transcript, never spliced into the prefix.
+`~/.config/pocketharness/wisdom.md` (`## ` sections) replaces the built-in
+wisdom book.
 
 ## Skills
 
-The intentionally flexible layer. A skill is just:
+The intentionally flexible layer. 165 skills ship with the repo (UI/UX,
+motion, SVG, audio, video, research, ML, security, systems, web, ...)
+and `make install` places them in the bundled layer. A skill is just:
 
 ```
-~/.config/pocketharness/skills/<name>/SKILL.md   # global
-./.pocket/skills/<name>/SKILL.md                 # project (wins on collision)
+~/.local/share/pocketharness/skills/<name>/SKILL.md  # bundled (make install)
+~/.config/pocketharness/skills/<name>/SKILL.md       # yours (wins)
+./.pocket/skills/<name>/SKILL.md                     # project (wins on collision)
 ```
 
-No manifests, no code, no SDK. Directory name + first heading + first
-paragraph are the metadata. The model sees only that skills exist until it
+No manifests, no code, no SDK. Directory name + first heading + the
+frontmatter `description:` (or first paragraph) are the metadata. The model sees only that skills exist until it
 loads one. `search` ranks by token overlap (name hits outrank heading,
 heading outranks preview). See `examples/skills/` for a starter skill, and
 `skills/web-research/` for the bundled curl-based web client guide
@@ -481,8 +634,8 @@ and provider keys stay out of the model environment.
 ```
 ~/src/pocketharness/                 source / Git repo
 ~/.local/bin/pocket                  installed executable
-~/.config/pocketharness/config.json  user config (+ system.md, skills/)
-~/.local/share/pocketharness/        sessions + state
+~/.config/pocketharness/config.json  user config (+ roles.json, env, system.md, wisdom.md, skills/)
+~/.local/share/pocketharness/        sessions, catalog.json, brain.json, bundled skills
 ~/.cache/pocketharness/              disposable cache
 ```
 
@@ -490,8 +643,7 @@ and provider keys stay out of the model environment.
 make               # build ./pocket
 make test          # functional + security + localhost curl integration tests
 make sanitize      # AddressSanitizer + UndefinedBehaviorSanitizer
-make install       # install to ~/.local/bin
-make install-skills  # copy bundled skills to ~/.config/pocketharness/skills
+make install       # install to ~/.local/bin + bundled skills
 make clean
 ```
 
@@ -501,14 +653,15 @@ with GCC and Clang, then runs the sanitizer suite.
 
 ## Anti-goals (the constitution)
 
-No extension/plugin API, hooks, event bus, MCP, dependency graph, councils,
-swarms, subagent/workflow frameworks, embedded browser, semantic memory,
-telemetry, local-ML helpers, prompt-injection systems,
-capability registries, Linux-command wrappers, DI frameworks, or enterprise
-ceremony. No libcurl/Boost/ncurses/OpenSSL linkage, no SQLite, no browser
-runtime, no `web_search` subsystem, no special Git or web tool, no
-background-job framework. Boring function > framework; struct > hierarchy;
-file > service; subprocess > plugin; Linux primitive > custom subsystem;
-deletion > abstraction.
+No extension/plugin API, event bus, MCP, dependency graph, swarms,
+subagent/workflow frameworks, embedded browser runtime, vector database,
+telemetry, capability registries, Linux-command wrappers, DI frameworks,
+or enterprise ceremony. No libcurl/Boost/ncurses/OpenSSL linkage, no
+SQLite, no second language in the harness. What bigger harnesses build as
+subsystems — councils, observers, guardians, memory, model routing,
+indexing — exists here only as a few bounded functions in the core, each
+replaceable by deleting it. Boring function > framework; struct >
+hierarchy; file > service; subprocess > plugin; Linux primitive > custom
+subsystem; deletion > abstraction.
 
 If PocketHarness starts resembling the frameworks it replaced, simplify.

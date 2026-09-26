@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Motion graphics timeline starter</title>
+<style>
+  :root { color-scheme: dark; --bg: #10131a; --ink: #f4f7fb; --accent: #79d6ff; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--ink); font: 700 5vw/1.05 system-ui, sans-serif; }
+  main { display: grid; min-height: 100vh; place-items: center; padding: 8vw; text-align: center; }
+  #title { max-width: 12em; }
+  .beat { color: var(--accent); font-size: .32em; letter-spacing: .12em; text-transform: uppercase; }
+  .exporting { overflow: hidden; }
+</style>
+<main><div id="title"><div class="beat"></div><div class="message"></div></div></main>
+<script>
+  const beats = [
+    { start: 0, end: 1, label: "Opening", message: "A clear idea" },
+    { start: 1, end: 2, label: "Development", message: "One beat at a time" },
+    { start: 2, end: 3, label: "Close", message: "Make it memorable" },
+  ];
+  const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+  const ease = value => value * value * (3 - 2 * value);
+  window.renderFrame = seconds => {
+    const time = Math.max(0, Number(seconds) || 0);
+    const beat = beats.find(item => time >= item.start && time < item.end) || beats.at(-1);
+    const progress = beat.end === beat.start ? 1 : clamp((time - beat.start) / (beat.end - beat.start), 0, 1);
+    const entrance = ease(clamp(progress * 4, 0, 1));
+    document.querySelector(".beat").textContent = beat.label;
+    document.querySelector(".message").textContent = beat.message;
+    document.querySelector("#title").style.opacity = String(entrance);
+    document.querySelector("#title").style.transform = `translateY(${(1 - entrance) * 24}px)`;
+  };
+  window.renderFrame(0);
+</script>

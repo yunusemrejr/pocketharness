@@ -1,0 +1,9 @@
+# Verification and public releases
+
+Trace each change from staging through validation, installation and live use. Permission-sensitive changes need both the denied case (harness mutation without authority) and the allowed case (project-local edits) tested. The working directory is context, not transferable authority. When a required isolation or verification mechanism is unavailable, fail closed: label the actual boundary and the unsupported operations.
+
+For skill changes, re-validate every edited skill with `muse skills validate <dir> --json` and require `valid: true` with zero diagnostics. For store or configuration changes, verify exact CLI behavior with `--json` output before and after, using bounded reads rather than live mutations where possible. Run focused checks; broaden coverage only when failures or shared dependencies justify it. Record what was measured and what remains unverified.
+
+Treat installed skills as read-only artifacts of their staged sources; reinstall or update through `muse skills install` / `muse skills update` instead of editing the store in place. Re-running an unchanged validation or install repeats the same suite: do it once per unchanged state, and re-run only after a change. Never skip validation to save a step.
+
+Private backups and public exports have different contracts. Private backups may contain credentials and personal history; keep them private and verify restore structure and permissions. Public releases must be reviewed and scanned before staging or pushing. Never copy the live harness wholesale or assume `.gitignore` cleans tracked history. Include generic skills and environment-variable examples; exclude personal account details, session logs, private datasets, credentials and machine-specific configuration. Verify a fresh installation when the change affects install behavior. Local secrets remain intact.

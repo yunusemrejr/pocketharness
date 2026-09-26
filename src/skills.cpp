@@ -1,6 +1,9 @@
 // PocketHarness - skill discovery/search/load implementation.
 #include "skills.h"
 
+#include "brain.h"
+#include "config.h"
+
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -13,18 +16,6 @@ namespace pocket {
 
 namespace {
 
-std::vector<std::string> splitWords(const std::string& s) {
-    std::vector<std::string> out;
-    size_t i = 0;
-    while (i < s.size()) {
-        while (i < s.size() && isspace((unsigned char)s[i])) ++i;
-        size_t j = i;
-        while (j < s.size() && !isspace((unsigned char)s[j])) ++j;
-        if (j > i) out.push_back(s.substr(i, j - i));
-        i = j;
-    }
-    return out;
-}
 
 void scanDir(const std::string& dir, const std::string& source, std::vector<SkillMeta>& out) {
     DIR* d = opendir(dir.c_str());
@@ -47,9 +38,17 @@ void scanDir(const std::string& dir, const std::string& source, std::vector<Skil
         m.path = md;
         auto t = readFileBounded(md, 1 << 18);
         if (t.ok) {
-            bool inPara = false;
-            std::string para;
-            for (const std::string& line : splitLines(t.value)) {
+            bool inPara = false, front = startsWith(t.value, "---");
+            std::string para, desc;
+            std::vector<std::string> lines = splitLines(t.value);
+            size_t i = 0;
+            // YAML-ish frontmatter: only `description:` matters (one line).
+            if (front)
+                for (i = 1; i < lines.size() && trim(lines[i]) != "---"; ++i)
+                    if (startsWith(lines[i], "description:")) desc = trim(lines[i].substr(12));
+            if (front) ++i;
+            for (; i < lines.size(); ++i) {
+                const std::string& line = lines[i];
                 std::string s = trim(line);
                 if (m.heading.empty() && startsWith(s, "#")) {
                     m.heading = trim(s.substr(s.find_first_not_of('#')));
@@ -64,6 +63,7 @@ void scanDir(const std::string& dir, const std::string& source, std::vector<Skil
                 para += s;
                 if (para.size() > 300) break;
             }
+            if (!desc.empty()) para = desc;
             m.preview = para.size() > 300 ? para.substr(0, 300) + "..." : para;
         }
         out.push_back(std::move(m));
@@ -74,15 +74,18 @@ void scanDir(const std::string& dir, const std::string& source, std::vector<Skil
 
 std::vector<SkillMeta> skillDiscover(const std::string& workspace) {
     std::vector<SkillMeta> out;
-    scanDir(globalSkillDir(), "global", out);
-    // Project skills override globals with the same name.
-    std::vector<SkillMeta> proj;
-    scanDir(projectSkillDir(workspace), "project", proj);
-    for (auto& pm : proj) {
-        out.erase(std::remove_if(out.begin(), out.end(),
-                                 [&](const SkillMeta& m) { return m.name == pm.name; }),
-                  out.end());
-        out.push_back(std::move(pm));
+    scanDir(bundledSkillDir(), "bundled", out);
+    // Later layers override earlier ones: bundled < global < project.
+    for (auto [dir, src] : {std::pair{globalSkillDir(), "global"},
+                            std::pair{projectSkillDir(workspace), "project"}}) {
+        std::vector<SkillMeta> layer;
+        scanDir(dir, src, layer);
+        for (auto& pm : layer) {
+            out.erase(std::remove_if(out.begin(), out.end(),
+                                     [&](const SkillMeta& m) { return m.name == pm.name; }),
+                      out.end());
+            out.push_back(std::move(pm));
+        }
     }
     std::sort(out.begin(), out.end(),
               [](const SkillMeta& a, const SkillMeta& b) { return a.name < b.name; });
@@ -90,32 +93,25 @@ std::vector<SkillMeta> skillDiscover(const std::string& workspace) {
 }
 
 std::vector<SkillMeta> skillSearch(const std::vector<SkillMeta>& all, const std::string& query) {
-    std::string q = toLower(trim(query));
-    if (q.empty()) return all;
-    // Token-overlap ranking: every query word scores where it hits, with
-    // name hits weighing most. At least one token must match.
-    std::vector<std::string> toks;
-    for (const std::string& w : splitWords(q))
-        if (w.size() > 1) toks.push_back(w);
-    if (toks.empty()) toks.push_back(q);
-    std::vector<std::pair<long, SkillMeta>> scored;
+    if (trim(query).empty()) return all;
+    // BM25 over name (x3), heading (x2) and description, plus a fuzzy name
+    // bonus so typos and partial names still land on the right skill.
+    std::vector<std::string> docs;
     for (const auto& m : all) {
-        std::string name = toLower(m.name), head = toLower(m.heading),
-                    prev = toLower(m.preview);
-        long score = 0;
-        for (const auto& t : toks) {
-            if (name.find(t) != std::string::npos) score += 10;
-            if (head.find(t) != std::string::npos) score += 4;
-            if (prev.find(t) != std::string::npos) score += 1;
-        }
-        if (score > 0) scored.emplace_back(score, m);
+        std::string n = m.name;
+        std::replace(n.begin(), n.end(), '-', ' ');
+        docs.push_back(n + " " + n + " " + n + " " + m.heading + " " + m.heading + " " + m.preview);
     }
-    std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
-        if (a.first != b.first) return a.first > b.first;
-        return a.second.name < b.second.name;
-    });
+    std::vector<double> score = bm25(docs, query);
+    std::vector<std::pair<double, size_t>> ranked;
+    for (size_t i = 0; i < all.size(); ++i) {
+        double f = fuzzyScore(query, all[i].name);
+        double s = score[i] + (f >= 0.8 ? 4 * f : 0);
+        if (s > 0) ranked.push_back({s, i});
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
     std::vector<SkillMeta> out;
-    for (auto& s : scored) out.push_back(std::move(s.second));
+    for (const auto& [s, i] : ranked) out.push_back(all[i]);
     return out;
 }
 

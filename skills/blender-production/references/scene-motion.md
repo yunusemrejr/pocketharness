@@ -1,0 +1,9 @@
+# Scene and motion
+
+Establish meters-per-scene-unit and frame rate before simulation. For frame f, use t=(f-f0)/fps consistently; fractional frame rates require their actual rational value. Evaluate animated transforms through the dependency graph when modifiers, constraints or rigs affect the result. Distinguish local, parent and world transforms. Applying scale can change modifier, rig or physics behavior; do it intentionally before setup rather than indiscriminately after animation.
+
+Use constraints and drivers for causal relationships, keyframes for artistic timing and simulation for physically coupled motion. Keep dependent pieces connected through all frames. Quaternion interpolation avoids some Euler discontinuities but still requires consistent orientation and shortest-path choices. A loop needs matching position and velocity at the seam; matching only first and last positions can jerk. Inspect multiple intermediate frames and the loop boundary.
+
+For a basic projectile, compare sampled positions to x=x0+v0*t+0.5*g*t*t in consistent units. For springs, omega=sqrt(k/m) gives a characteristic timescale; choose multiple simulation steps across it and verify convergence by reducing timestep. Increased substeps cannot fix wrong mass, scale or collision geometry. Check penetration, energy behavior and contact stability before baking. Record simulation seeds and cache ranges.
+
+Keep topology appropriate to deformation; inspect normals, thin surfaces and material assignments. Use instancing for repeated assets and share materials when intended. Treat high subdivision and large textures as measured costs. Validate geometry and motion at preview quality first, then refine. Read the installed-version [Blender manual](https://docs.blender.org/manual/en/latest/) and [bpy API](https://docs.blender.org/api/current/) for exact property names and supported operations.

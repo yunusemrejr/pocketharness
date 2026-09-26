@@ -132,6 +132,26 @@ struct AnthropicStreamAcc {
     ChatResponse finish();
 };
 
+// OpenAI Responses stream (ChatGPT Codex backend). Reasoning items are kept
+// encrypted for replay to the same model, like Anthropic signed thinking.
+struct CodexStreamAcc {
+    std::string text, reasoning, error, stopReason;
+    bool done = false;
+    std::vector<ToolCall> calls;
+    json::Array items;  // reasoning items for replay
+    long inTokens = -1, outTokens = -1, cacheHit = -1, cacheMiss = -1;
+    double cost = -1;
+    void feed(const json::Value& payload);
+    ChatResponse finish();
+};
+json::Value buildCodexBody(const ChatRequest& req);
+// Codex credentials from the Codex CLI or Pi login (read-only; the refresh
+// token is never rotated here). Err explains how to log in again.
+struct CodexAuth {
+    std::string token, accountId;
+};
+Result<CodexAuth> codexAuth();
+
 // Non-streaming response parsers (pure, unit-tested).
 Result<ChatResponse> parseOpenAiResponse(const json::Value& v);
 Result<ChatResponse> parseAnthropicResponse(const json::Value& v);
@@ -152,6 +172,18 @@ bool curlAvailable();
 // inputTokenLimit). Handles {"data":[...]}, Gemini {"models":[...]} and
 // bare [...] shapes. -1 when unpublished.
 long parseModelsContext(const std::string& body, const std::string& modelId);
+
+// Bounded GET (body "") or JSON POST through the confined provider curl.
+// secretHeader (e.g. "Authorization: Bearer k") is staged in a 0600 -K
+// config, never argv. Returns the 2xx body, else "HTTP n: ..." / transport.
+Result<std::string> httpRequest(const std::string& url, const std::string& secretHeader,
+                                const std::string& body, long timeoutMs,
+                                const std::vector<std::string>& headers = {});
+std::string providerAuthHeader(const ProviderCfg& prov, const std::string& key);
+// Raw GET {base}/models body, cached per endpoint per process ("" on failure).
+std::string fetchModelsBody(const ProviderCfg& prov, long timeoutMs);
+// Apply one learned quirk (see brain.h) to model options.
+void applyQuirk(ModelOptions& o, const std::string& quirk);
 
 // Live context window via GET {base}/models, cached per process. Secret
 // staging is internal (parent-only dir); needs no caller tmp dir.

@@ -4,8 +4,12 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <algorithm>
 #include <cmath>
 
+#include "brain.h"
+#include "kit.h"
+#include "oversee.h"
 #include "process.h"
 #include "skills.h"
 
@@ -71,6 +75,50 @@ std::string replaceAll(const std::string& hay, const std::string& needle,
     return out;
 }
 
+void rememberUndo(ToolEnv& env, const std::string& path) {
+    auto old = boxRead(*env.auth, path, 4 << 20);
+    auto exists = boxExists(*env.auth, path);
+    if (!old.ok && exists.ok && exists.value) return;  // too large/unreadable: no journal
+    env.undo.push_back({path, old.ok, old.ok ? old.value : ""});
+    if (env.undo.size() > kMaxUndo) env.undo.erase(env.undo.begin());
+}
+
+// Guardian pass after every successful change: built-in anti-slop checks
+// plus post_edit hooks. Findings go straight back to the model.
+std::string afterChange(ToolEnv& env, const std::string& path, const std::string& content) {
+    if (std::find(env.changedFiles.begin(), env.changedFiles.end(), path) == env.changedFiles.end())
+        env.changedFiles.push_back(path);
+    std::string out;
+    auto findings = slopScan(path, content);
+    if (!findings.empty()) {
+        out += "\n[quality] fix before finishing:";
+        for (size_t i = 0; i < findings.size() && i < 8; ++i) out += "\n  " + findings[i];
+    }
+    // Taste check: Jev spots template-grade UI and copy that no regex can.
+    std::string lp = toLower(path);
+    bool visual = false;
+    for (const char* ext : {".html", ".css", ".jsx", ".tsx", ".vue", ".svelte", ".md", ".astro", ".scss"})
+        visual = visual || endsWith(lp, ext);
+    if (visual && env.cfg && content.size() >= 300) {
+        auto v = decide(*env.cfg, json::Object{{"file", path}, {"content", content.substr(0, 20000)}},
+                        {{"generic", "Is this generic AI-template work (stock purple/blue gradients, emoji decoration, "
+                                     "pulsing dots, buzzword hero copy, glassmorphism everywhere, lorem-style filler)?"},
+                         {"fake", "Does it contain placeholder, fake or made-up content presented as real?"}},
+                        false, &env.sideCost);
+        if (v.count("generic") && v["generic"] >= 0.8)
+            out += "\n[quality:jev] reads as generic AI-template design/copy (p=" + std::to_string(v["generic"]).substr(0, 4) +
+                   "): give it a deliberate identity.";
+        if (v.count("fake") && v["fake"] >= 0.85)
+            out += "\n[quality:jev] contains placeholder or fake content (p=" + std::to_string(v["fake"]).substr(0, 4) + ").";
+    }
+    if (env.cfg && env.cfg->hooks.count("post_edit"))
+        for (const auto& cmd : env.cfg->hooks.at("post_edit")) {
+            ToolResult h = runHook(env, cmd, "file", path);
+            if (!h.ok) out += "\n[hook post_edit failed] " + cmd + "\n" + h.output.substr(0, 2000);
+        }
+    return out;
+}
+
 ToolResult toolRead(ToolEnv& env, const json::Value& args) {
     std::string path = args.at("path").asStr();
     long offset = args.at("offset").asInt(1), limit = args.at("limit").asInt(200);
@@ -119,6 +167,7 @@ ToolResult toolWrite(ToolEnv& env, const json::Value& args) {
         r.output = "write: missing content";
         return r;
     }
+    rememberUndo(env, path);
     auto w = boxWrite(*env.auth, path, content, 0644);
     if (!w.ok) {
         r.output = w.error;
@@ -126,7 +175,8 @@ ToolResult toolWrite(ToolEnv& env, const json::Value& args) {
     }
     emit(env, "write " + path + " (" + std::to_string(content.size()) + " bytes)");
     r.ok = true;
-    r.output = "wrote " + path + " (" + std::to_string(content.size()) + " bytes)";
+    r.output = "wrote " + path + " (" + std::to_string(content.size()) + " bytes)" +
+               afterChange(env, path, content);
     return r;
 }
 
@@ -155,44 +205,16 @@ ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
             return {false, "edit: result exceeds 4 MiB; file untouched"};
         updated = replaceAll(updated, oldText, newText);
     }
+    rememberUndo(env, path);
     auto w = boxWrite(*env.auth, path, updated, 0644);
     if (!w.ok) return {false, w.error};
     emit(env, "edit " + path);
-    return {true, "edited " + path + " (" + std::to_string(edits.size()) + " replacement step(s))"};
+    return {true, "edited " + path + " (" + std::to_string(edits.size()) + " replacement step(s))" +
+                      afterChange(env, path, updated)};
 }
 
-ToolResult toolBash(ToolEnv& env, const json::Value& args) {
+ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
     ToolResult r;
-    std::string cmd = args.at("command").asStr();
-    long timeoutSec = args.at("timeout").asInt(env.cfg ? env.cfg->bashTimeoutSec : 120);
-    if (cmd.empty()) {
-        r.output = "bash: missing command";
-        return r;
-    }
-    if (timeoutSec < 1) timeoutSec = 1;
-    if (timeoutSec > 3600) timeoutSec = 3600;
-
-    GuardResult g = classifyCommand(cmd, env.workspace, env.allowNet);
-    if (g.verdict == Verdict::Deny) {
-        r.output = "blocked: " + g.reason;
-        return r;
-    }
-    if (g.verdict == Verdict::Ask) {
-        bool approved = false;
-        if (env.interactive && env.askApproval) {
-            approved = env.askApproval(cmd, g.reason);
-        } else if (env.allowDestructive) {
-            fprintf(stderr, "pocket: destructive command allowed by --allow-destructive: %s\n",
-                    cmd.substr(0, 200).c_str());
-            approved = true;
-        }
-        if (!approved) {
-            r.output = "blocked, needs human approval: " + g.reason + "\nCommand: " + cmd;
-            return r;
-        }
-    }
-
-    emit(env, "$ " + (cmd.size() > 300 ? cmd.substr(0, 300) + "..." : cmd));
     ChildSpec cs;
     cs.auth = env.auth;  // read-only paths; the lambda below copies the pointer
     cs.workspace = env.workspace;
@@ -244,6 +266,47 @@ ToolResult toolBash(ToolEnv& env, const json::Value& args) {
     return r;
 }
 
+ToolResult toolBash(ToolEnv& env, const json::Value& args) {
+    ToolResult r;
+    std::string cmd = args.at("command").asStr();
+    long timeoutSec = args.at("timeout").asInt(env.cfg ? env.cfg->bashTimeoutSec : 120);
+    if (cmd.empty()) {
+        r.output = "bash: missing command";
+        return r;
+    }
+    if (timeoutSec < 1) timeoutSec = 1;
+    if (timeoutSec > 3600) timeoutSec = 3600;
+
+    GuardResult g = classifyCommand(cmd, env.workspace, env.allowNet);
+    if (g.verdict == Verdict::Deny) {
+        r.output = "blocked: " + g.reason;
+        return r;
+    }
+    if (g.verdict == Verdict::Ask) {
+        bool approved = false;
+        if (env.interactive && env.askApproval) {
+            approved = env.askApproval(cmd, g.reason);
+        } else if (env.allowDestructive) {
+            fprintf(stderr, "pocket: destructive command allowed by --allow-destructive: %s\n",
+                    cmd.substr(0, 200).c_str());
+            approved = true;
+        }
+        if (!approved) {
+            r.output = "blocked, needs human approval: " + g.reason + "\nCommand: " + cmd;
+            return r;
+        }
+    }
+
+    if (env.cfg && env.cfg->hooks.count("pre_bash"))
+        for (const auto& hook : env.cfg->hooks.at("pre_bash")) {
+            ToolResult h = runHook(env, hook, "cmd", cmd);
+            if (!h.ok) return {false, "blocked by pre_bash hook: " + hook + "\n" + h.output.substr(0, 2000)};
+        }
+    emit(env, "$ " + (cmd.size() > 300 ? cmd.substr(0, 300) + "..." : cmd));
+    ++env.bashRuns;
+    return spawnBash(env, cmd, timeoutSec);
+}
+
 ToolResult toolSkill(ToolEnv& env, const json::Value& args) {
     ToolResult r;
     std::string action = toLower(args.at("action").asStr());
@@ -255,10 +318,11 @@ ToolResult toolSkill(ToolEnv& env, const json::Value& args) {
                        " or .pocket/skills/)";
             return r;
         }
-        std::string out = std::to_string(all.size()) + " skill(s):\n";
-        for (const auto& m : all) out += skillOneLine(m) + "\n";
+        // Names only: the catalog stays small however many skills exist.
+        std::string out = std::to_string(all.size()) + " skills (search {query} for descriptions):\n";
+        for (size_t i = 0; i < all.size(); ++i) out += (i ? ", " : "") + all[i].name;
         r.ok = true;
-        r.output = out;
+        r.output = out + "\n";
         return r;
     }
     if (action == "search") {
@@ -269,8 +333,8 @@ ToolResult toolSkill(ToolEnv& env, const json::Value& args) {
             r.output = "no skills match \"" + q + "\"";
             return r;
         }
-        std::string out = std::to_string(hits.size()) + " match(es):\n";
-        for (const auto& m : hits) out += skillOneLine(m) + "\n";
+        std::string out = std::to_string(hits.size()) + " match(es), best first:\n";
+        for (size_t i = 0; i < hits.size() && i < 8; ++i) out += skillOneLine(hits[i]) + "\n";
         r.ok = true;
         r.output = out;
         return r;
@@ -284,7 +348,10 @@ ToolResult toolSkill(ToolEnv& env, const json::Value& args) {
         }
         emit(env, "skill load " + name);
         r.ok = true;
-        r.output = loaded.value;
+        r.output = loaded.value +
+                   "\n\n[harness] Tools here: read, write, edit, bash, skill. Where this skill names "
+                   "another tool, use the bash equivalent (`pocket kit` covers web, search, browser "
+                   "capture, images, SVG, springs, audio and quality scans).";
         return r;
     }
     r.output = "skill: unknown action \"" + action + "\" (list|search|load)";
@@ -343,6 +410,35 @@ ToolResult runTool(ToolEnv& env, const std::string& name, const std::string& arg
         env.onToolDone(name, done.ok && dispatched, summary);
     }
     return done;
+}
+
+std::string shellQuote(const std::string& s) {
+    std::string o = "'";
+    for (char c : s) o += c == '\'' ? std::string("'\\''") : std::string(1, c);
+    return o + "'";
+}
+
+ToolResult runHook(ToolEnv& env, std::string cmd, const std::string& var, const std::string& value) {
+    if (!var.empty())
+        for (size_t p; (p = cmd.find("{" + var + "}")) != std::string::npos;)
+            cmd.replace(p, var.size() + 2, shellQuote(value));
+    if (!env.auth) return {false, "hook: tool authority unavailable"};
+    return spawnBash(env, cmd, env.cfg ? env.cfg->bashTimeoutSec : 120);
+}
+
+std::string undoLast(ToolEnv& env) {
+    if (env.undo.empty()) return "nothing to undo";
+    if (!env.auth) return "undo: tool authority unavailable";
+    UndoEntry e = std::move(env.undo.back());
+    env.undo.pop_back();
+    if (!e.existed) {
+        // The file was created by the agent: remove it again.
+        std::string p = e.path[0] == '/' ? e.path : env.workspace + "/" + e.path;
+        return unlink(p.c_str()) == 0 ? "removed " + e.path + " (was created by the agent)"
+                                      : "undo: cannot remove " + e.path;
+    }
+    auto w = boxWrite(*env.auth, e.path, e.content, 0644);
+    return w.ok ? "restored " + e.path + " (" + std::to_string(e.content.size()) + " bytes)" : "undo: " + w.error;
 }
 
 }  // namespace pocket

@@ -18,6 +18,9 @@
 #include <optional>
 #include <thread>
 
+#include "brain.h"
+#include "catalog.h"
+#include "oversee.h"
 #include "skills.h"
 
 namespace pocket {
@@ -30,7 +33,6 @@ const char* C_BOLD = "\033[1m";
 const char* C_DIM = "\033[2m";
 const char* C_GREEN = "\033[32m";
 const char* C_YELLOW = "\033[33m";
-const char* C_MAGENTA = "\033[35m";
 const char* C_CYAN = "\033[36m";
 const char* C_RED = "\033[31m";
 const char* C_REV = "\033[7m";
@@ -205,8 +207,8 @@ std::string gotoRc(int r, int c = 1) {
     return "\033[" + std::to_string(r) + ";" + std::to_string(c) + "H";
 }
 
-const char* kCommands[] = {"/model", "/thinking", "/compact", "/skills",
-                            "/session", "/security", "/help", "/quit", nullptr};
+const char* kCommands[] = {"/models", "/model", "/goal", "/thinking", "/compact", "/undo", "/skills",
+                            "/session", "/brain", "/catalog", "/security", "/help", "/quit", nullptr};
 
 struct Editor {
     std::vector<std::string> lines{""};
@@ -719,10 +721,17 @@ std::string fmtK(long n) {
 
 std::vector<size_t> pickFilter(const std::vector<std::string>& labels,
                                const std::string& filter) {
-    std::vector<size_t> out;
+    // Substring hits first (predictable), then fuzzy hits for typos and
+    // scattered words ("glm flsh" -> glm-5.3-flash), best first.
+    std::vector<size_t> out, fuzzy;
     std::string f = toLower(filter);
     for (size_t i = 0; i < labels.size(); ++i)
         if (f.empty() || toLower(labels[i]).find(f) != std::string::npos) out.push_back(i);
+    if (f.empty()) return out;
+    std::vector<bool> taken(labels.size());
+    for (size_t i : out) taken[i] = true;
+    for (size_t i : fuzzyRank(labels, filter, 0.6))
+        if (!taken[i]) out.push_back(i);
     return out;
 }
 
@@ -888,6 +897,12 @@ std::string kpiText(TuiOpts& opts, Agent& agent, int cols) {
     long cp = recentPct(st);
     if (cp < 0) cp = cachePct(st);
     trio += cp < 0 ? " · cache —" : " · cache " + std::to_string(cp) + "%";
+    if (st.costSeen) {
+        char b[32];
+        snprintf(b, sizeof b, " · %s$%.3f", st.costEstimated ? "~" : "", st.cost);
+        trio += b;
+    }
+    if (!agent.goal().empty()) trio = "◎ goal · " + trio;
     std::string spec = sanitizeTerminal(shortModel(opts.model.spec));
     std::string full = trio + " · " + spec + " · " + sanitizeTerminal(opts.thinking);
     if (visibleWidth(full) <= (size_t)cols) return full;
@@ -1013,21 +1028,84 @@ std::string promptFor(TuiOpts& opts, Agent& agent) {
     return p;
 }
 
+// ---------------------------------------------------------------------------
+// Banner: a tiny Game Boy drops into a denim pocket, info to its right.
+// ---------------------------------------------------------------------------
+const char* kGameBoy[] = {"╭─────────╮", "│ ┌─────┐ │", "│ │ ▒▒▒ │ │", "│ └─────┘ │",
+                          "│ ┼   ● ● │", "│   ═ ═   │", "╰─────────╯"};
+const char* kPocket[] = {"┏━━━━━━━━━━━━━┓", "┃┄┄┄┄┄┄┄┄┄┄┄┄┄┃", "┃             ┃", "╲             ╱",
+                         " ╲▁▁▁▁▁▁▁▁▁▁▁╱ "};
+constexpr int kArtRows = 10, kRim = 5, kArtW = 15;
+
+// Visible substring [from, from+n) of a UTF-8 string (all glyphs width 1).
+std::string glyphs(const std::string& s, size_t from, size_t n) {
+    std::string out;
+    size_t g = 0;
+    for (size_t i = 0; i < s.size(); i += (size_t)utf8Len((unsigned char)s[i]), ++g)
+        if (g >= from && g < from + n) out += s.substr(i, (size_t)utf8Len((unsigned char)s[i]));
+    return out;
+}
+
+std::string paintGlyph(const std::string& g) {
+    const char* c = g == "▒" ? "\033[38;5;149m" : g == "●" ? "\033[38;5;168m" : g == "┼" || g == "═" ? "\033[38;5;240m"
+                  : g == "┄" ? "\033[38;5;179m" : (g == "┏" || g == "━" || g == "┓" || g == "┃" || g == "╲" ||
+                                                    g == "╱" || g == "▁") ? "\033[38;5;67m" : "\033[38;5;252m";
+    return g == " " ? g : col(c) + g + col(C_RESET);
+}
+
+std::string artRow(int row, int gbTop) {
+    std::string out;
+    for (int x = 0; x < kArtW; ++x) {
+        std::string g = " ";
+        if (row >= kRim && row - kRim < 5) g = glyphs(kPocket[row - kRim], (size_t)x, 1);
+        int gy = row - gbTop, gx = x - 2;
+        bool behind = row >= kRim;  // the pocket's front hides the lower Game Boy
+        if (!behind && gy >= 0 && gy < 7 && gx >= 0 && gx < 11) g = glyphs(kGameBoy[gy], (size_t)gx, 1);
+        out += paintGlyph(g);
+    }
+    return out;
+}
+
 void printBanner(TuiOpts& opts) {
     const SandboxCaps& caps = sandboxCaps();
-    // Sanitize dynamic parts only: sanitizing the composed string would strip
-    // our own color sequences.
-    std::string ws = sanitizeTerminal(opts.workspace);
-    std::string sid = sanitizeTerminal(opts.sessionId);
-    std::string spec = sanitizeTerminal(opts.model.spec);
-    std::string think = sanitizeTerminal(opts.thinking);
-    std::string b = std::string(col(C_BOLD)) + "pocket " + kVersion + col(C_RESET) + "  " +
-                    col(C_DIM) + ws + col(C_RESET) + "\n" + col(C_DIM) + "session " +
-                    sid + " · " + spec + " · thinking " + think +
-                    col(C_RESET) + "\n";
+    int cols = termWidth();
+    auto fit = [&](const std::string& plain) { return cutBytes(sanitizeTerminal(plain), (size_t)std::max(0, cols - kArtW - 3)); };
+    std::string roles;
+    for (const char* r : {"fast", "fallback", "review"})
+        if (opts.cfg && opts.cfg->roles.count(r)) roles += std::string(roles.empty() ? "" : " · ") + r + " " + shortModel(opts.cfg->roles.at(r));
+    std::vector<std::string> info = {
+        "",
+        col(C_BOLD) + std::string("pocket") + col(C_RESET) + col(C_DIM) + " " + kVersion + col(C_RESET),
+        col("\033[38;5;37m") + fit(opts.model.spec + " · thinking " + opts.thinking) + col(C_RESET),
+        col(C_DIM) + fit(opts.workspace) + col(C_RESET),
+        col(C_DIM) + fit("session " + opts.sessionId) + col(C_RESET),
+        col(C_DIM) + fit(roles.empty() ? "roles: /models to assign fast · fallback · review" : roles) + col(C_RESET),
+        col(C_DIM) + fit(opts.cfg ? judgeStatus(*opts.cfg) : "") + col(C_RESET),
+        col(C_DIM) + fit(std::string("tools net ") + (opts.allowNet ? "on" : "off") + " · sandbox " +
+                         (caps.landlock ? "landlock" : "no-landlock") + (caps.seccompNet ? "+seccomp" : "")) + col(C_RESET),
+        col(C_DIM) + fit("Enter send · Ctrl-J newline · /goal · /models · /help") + col(C_RESET),
+        ""};
+    bool tiny = cols < kArtW + 20 || termRows() < 16;
+    bool animate = useColor() && !tiny && !getenv("POCKET_NO_ANIM");
+    auto frame = [&](int top) {
+        std::string f;
+        for (int r = 0; r < kArtRows; ++r) f += " " + artRow(r, top) + "  " + info[(size_t)r] + "\033[K\n";
+        return f;
+    };
+    if (tiny) {
+        for (const auto& l : info)
+            if (!l.empty()) writeAll(STDOUT_FILENO, l + "\n");
+    } else if (animate) {
+        const int drops[] = {-7, -4, -1, 2, 3, 2};
+        for (size_t i = 0; i < std::size(drops); ++i) {
+            if (i) writeAll(STDOUT_FILENO, "\033[" + std::to_string(kArtRows) + "A");
+            writeAll(STDOUT_FILENO, frame(drops[i]));
+            usleep(i + 1 < std::size(drops) ? 60000 : 0);
+        }
+    } else writeAll(STDOUT_FILENO, frame(2));
+    std::string b;
     if (!opts.systemSource.empty())
-        b += col(C_DIM) + std::string("system prompt: ") + sanitizeTerminal(opts.systemSource) +
-             col(C_RESET) + "\n";
+        b += col(C_DIM) + std::string("system prompt: ") + sanitizeTerminal(opts.systemSource) + col(C_RESET) + "\n";
     if (opts.unsafe)
         b += std::string(col(C_RED)) + col(C_BOLD) +
              "UNSAFE MODE — model tools have broader user-account authority." + col(C_RESET) + "\n";
@@ -1037,7 +1115,6 @@ void printBanner(TuiOpts& opts) {
         b += col(C_YELLOW) + std::string("note: seccomp unavailable — model network isolation is OFF (run with --network only if intended)") + col(C_RESET) + "\n";
     if (!caps.openat2)
         b += col(C_YELLOW) + std::string("note: openat2 unavailable — native file tools refuse symlinks entirely (strict fallback)") + col(C_RESET) + "\n";
-    b += col(C_DIM) + "Enter submits · Ctrl-J newline · /help commands · Ctrl-C cancels · Ctrl-D quits" + col(C_RESET) + "\n";
     writeAll(STDOUT_FILENO, b);
 }
 
@@ -1077,7 +1154,7 @@ std::string attachPastedImages(TuiOpts& opts, Agent& agent, const std::string& t
 }
 
 int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, SharedInput& shared,
-                       std::atomic<bool>& cancel, BottomBar* bar) {
+                       std::atomic<bool>& cancel, BottomBar* bar, bool goal = false) {
     struct Gate {
         SharedInput& s;
         explicit Gate(SharedInput& v) : s(v) { s.enabled.store(true); }
@@ -1093,19 +1170,19 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
             if (bar) bar->liveKpi();
         },
         [&](const std::string& note) {
-            rend.write(col(C_DIM) + "(" + sanitizeTerminal(note) + ")" + col(C_RESET) + "\n");
+            rend.write(col("\033[38;5;179m") + "  ◇ " + sanitizeTerminal(note) + col(C_RESET) + "\n");
         },
         [&](std::string_view chunk) {
             if (cancel.load()) return;
             if (!thinkHead) {
                 thinkHead = true;
-                rend.write(col(C_DIM) + std::string("💭 thinking:") + col(C_RESET) + "\n");
+                rend.write(col(C_DIM) + std::string("∴ thinking") + col(C_RESET) + "\n");
             }
             rend.feed(chunk, true);
             if (bar) bar->liveKpi();
         });
     opts.tools->onEvent = [&](const std::string& line) {
-        rend.write(col(C_DIM) + "  ⚙ " + sanitizeTerminal(line) + col(C_RESET) + "\n");
+        rend.write(col(C_DIM) + "  › " + sanitizeTerminal(line) + col(C_RESET) + "\n");
     };
     opts.tools->onToolDone = [&](const std::string& name, bool ok, const std::string& summary) {
         std::string mark = ok ? (col(C_GREEN) + std::string("  ✓ ")) : (col(C_RED) + std::string("  ✗ "));
@@ -1116,7 +1193,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
                 block += col(C_DIM) + "      [...]" + col(C_RESET) + "\n";
                 break;
             }
-            block += col(C_DIM) + "      " + sanitizeTerminal(ln).substr(0, 160) + col(C_RESET) + "\n";
+            block += col(C_DIM) + "      " + cutBytes(sanitizeTerminal(ln), (size_t)std::max(20, termWidth() - 8)) + col(C_RESET) + "\n";
             ++shown;
         }
         rend.write(block);
@@ -1126,8 +1203,8 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
         std::lock_guard<std::mutex> lk(shared.mu);
         shared.q.clear();
     }
-    writeAll(STDOUT_FILENO, col(C_MAGENTA) + std::string("assistant:") + col(C_RESET) + "\n");
-    std::string err = agent.runTurn(input);
+    writeAll(STDOUT_FILENO, col("\033[38;5;37m") + std::string(goal ? "◎ goal" : "◆ pocket") + col(C_RESET) + "\n");
+    std::string err = goal ? agent.runGoal(input) : agent.runTurn(input);
     rend.flush();
     g_endPartial = nullptr;
     if (err == "cancelled") {
@@ -1361,7 +1438,12 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
     if (cmd == "quit" || cmd == "exit" || cmd == "q") return false;
     if (cmd == "help") {
         say("commands:\n"
-            "  /model [spec]     pick or switch model (filterable; provider:model works too)\n"
+            "  /models           assign models to roles: main · fast · fallback · review (fuzzy search)\n"
+            "  /model [spec]     switch the main model directly\n"
+            "  /goal [text]      work fully autonomously until the goal is audited as met\n"
+            "  /undo             revert the newest file change made by the agent\n"
+            "  /brain            learned quirks, provider health, judges, overseer stats\n"
+            "  /catalog          refresh the live model catalog now\n"
             "  /thinking [level] auto/off/none/minimal/low/medium/high/xhigh/max\n"
             "  /compact          summarize older context now\n"
             "  /skills [query]   list or search Markdown skills\n"
@@ -1398,32 +1480,95 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         sessionSaveMeta(opts.sessionId, m);
         say("thinking: " + t + "\n");
     };
+    auto pickModel = [&](const std::string& title, const std::string& initial, bool allowNone) -> std::string {
+        auto all = catalogLoad(*opts.cfg);
+        std::vector<std::string> labels, specs;
+        if (allowNone) labels.push_back("(none) — clear this role"), specs.push_back("-");
+        for (const auto& m : opts.cfg->models) {
+            labels.push_back(m.alias + " = " + m.provider + ":" + m.model + (m.routing.empty() ? "" : "@" + m.routing));
+            specs.push_back(m.alias);
+        }
+        for (const auto& m : all) {
+            labels.push_back(catalogLabel(m));
+            specs.push_back(m.provider + ":" + m.id);
+        }
+        PickResult pr = pickOne(title, labels, initial);
+        if (!pr.submitted) return "";
+        if (!pr.filter.empty() && resolveModel(*opts.cfg, pr.filter).ok) return pr.filter;
+        if (pr.index >= 0) return specs[(size_t)pr.index];
+        return pr.filter;  // invalid text: the caller reports the precise error
+    };
     if (cmd == "model") {
         if (!args.empty() && resolveModel(*opts.cfg, args).ok) {
             useModel(args);  // exact spec: switch directly, no picker
             return true;
         }
-        std::vector<std::string> labels, specs;
-        for (const auto& m : opts.cfg->models) {
-            std::string lb = m.alias + " = " + m.provider + ":" + m.model +
-                             (m.routing.empty() ? "" : "@" + m.routing);
-            auto rm = resolveModel(*opts.cfg, m.alias);
-            if (rm.ok && rm.value.spec == opts.model.spec) lb += "  ●";
-            labels.push_back(lb);
-            specs.push_back(m.alias);
+        std::string spec = pickModel("main model — now " + opts.model.spec + " · type to search", args, false);
+        if (spec.empty()) say("(cancelled)\n");
+        else useModel(spec);
+        return true;
+    }
+    if (cmd == "models") {
+        static const char* kRoles[] = {"main", "fast", "fallback", "review"};
+        static const char* kWhat[] = {"does the work", "briefs, summaries, audits", "takes over when main fails",
+                                      "the review council (comma-separate several)"};
+        std::vector<std::string> labels;
+        for (size_t i = 0; i < 4; ++i) {
+            std::string now = i == 0 ? opts.model.spec : opts.cfg->roles.count(kRoles[i]) ? opts.cfg->roles[kRoles[i]] : "—";
+            char b[256];
+            snprintf(b, sizeof b, "%-9s %-44s %s", kRoles[i], now.c_str(), kWhat[i]);
+            labels.push_back(b);
         }
-        std::string provs;
-        for (const auto& p : opts.cfg->providers) provs += p.name + " ";
-        PickResult pr = pickOne("model — now: " + opts.model.spec + " (providers: " + trim(provs) +
-                                    "); type provider:model to use it directly",
-                                labels, args);
-        if (!pr.submitted) {
+        PickResult r = pickOne("models — pick a role to assign", labels, "");
+        if (!r.submitted || r.index < 0) {
             say("(cancelled)\n");
             return true;
         }
-        if (!pr.filter.empty() && resolveModel(*opts.cfg, pr.filter).ok) useModel(pr.filter);
-        else if (pr.index >= 0) useModel(specs[(size_t)pr.index]);
-        else useModel(pr.filter);  // invalid text: precise error, nothing switched
+        std::string roleName = kRoles[r.index];
+        std::string spec = pickModel(roleName + " model · type to search " + std::to_string(catalogLoad(*opts.cfg).size()) +
+                                         " catalog models (provider:model works too)",
+                                     "", roleName != "main");
+        if (spec.empty()) { say("(cancelled)\n"); return true; }
+        if (roleName == "main") {
+            useModel(spec);
+            if (resolveModel(*opts.cfg, spec).ok) (void)saveRole("main", spec), opts.cfg->roles["main"] = spec;
+            return true;
+        }
+        std::vector<ResolvedModel> resolved;
+        if (spec != "-")
+            for (std::string one : splitLines([&] { std::string t = spec; std::replace(t.begin(), t.end(), ',', '\n'); return t; }())) {
+                auto rm = resolveModel(*opts.cfg, trim(one));
+                if (!rm.ok) {
+                    say(col(C_RED) + std::string("error: ") + rm.error + col(C_RESET) + "\n");
+                    return true;
+                }
+                catalogApply(*opts.cfg, rm.value);
+                resolved.push_back(rm.value);
+            }
+        auto saved = saveRole(roleName, spec == "-" ? "" : spec);
+        if (spec == "-") opts.cfg->roles.erase(roleName);
+        else opts.cfg->roles[roleName] = spec;
+        agent.setRole(roleName, resolved);
+        say(roleName + ": " + (spec == "-" ? "cleared" : spec) + (saved.ok ? " (saved)" : " (not saved: " + saved.error + ")") + "\n");
+        return true;
+    }
+    if (cmd == "undo") {
+        say(undoLast(*opts.tools) + "\n");
+        return true;
+    }
+    if (cmd == "brain") {
+        const AgentStats& st = agent.stats();
+        say(judgeStatus(*opts.cfg) + "\n");
+        char b[256];
+        snprintf(b, sizeof b, "overseer: %d nudges · %d reviews · %d fallbacks · %d distilled/deduped · side cost $%.5f\n",
+                 st.nudges, st.reviews, st.fallbacks, st.deduped, st.sideCost);
+        say(b);
+        say("learned (" + stateDir() + "/brain.json):\n" + brainStatus());
+        return true;
+    }
+    if (cmd == "catalog") {
+        say("refreshing catalog from every keyed provider...\n");
+        say(catalogRefresh(*opts.cfg) + "\n");
         return true;
     }
     if (cmd == "thinking") {
@@ -1490,8 +1635,9 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             say("cache: unreported by provider\n");
         }
         if (st.costSeen) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "cost: $%.4f (reported)\n", st.cost);
+            char buf[256];
+            snprintf(buf, sizeof(buf), "cost: %s$%.4f (%s) · overseer/judges $%.5f\n", st.costEstimated ? "~" : "",
+                     st.cost, st.costEstimated ? "partly estimated from catalog prices" : "reported", st.sideCost);
             say(buf);
         }
         return true;
@@ -1572,6 +1718,17 @@ int tuiRun(TuiOpts& opts) {
         if (bar.active)  // pinned input isn't in the scrollback: echo it
             writeAll(STDOUT_FILENO,
                      col(C_BOLD) + "> " + col(C_RESET) + sanitizeTerminal(text) + "\n");
+        if (startsWith(text, "/goal")) {
+            std::string g = trim(text.substr(5));
+            if (g.empty() || g == "clear") {
+                if (g == "clear") agent.clearGoal();
+                writeAll(STDOUT_FILENO, "goal: " + (agent.goal().empty() ? std::string("none") : sanitizeTerminal(agent.goal())) +
+                                            " · usage: /goal <what must be true when done>\n");
+                continue;
+            }
+            runTurnInteractive(opts, agent, g, shared, cancel, &bar, true);
+            continue;
+        }
         if (text[0] == '/') {
             if (!runCommand(opts, agent, text)) break;
             continue;
@@ -1646,7 +1803,7 @@ int lineRun(TuiOpts& opts) {
         if (ttyIn) writeAll(STDOUT_FILENO, promptFor(opts, agent));
         if (!std::getline(std::cin, line)) break;
         if (trim(line).empty()) continue;
-        if (line[0] == '/') {
+        if (line[0] == '/' && !startsWith(line, "/goal ")) {
             if (!runCommand(opts, agent, line)) break;
             continue;
         }
@@ -1654,7 +1811,7 @@ int lineRun(TuiOpts& opts) {
         rend = StreamRenderer{};
         g_endPartial = [&] { rend.endLine(); };
         if (!g_plain) writeAll(STDOUT_FILENO, "assistant:\n");
-        std::string err = agent.runTurn(line);
+        std::string err = startsWith(line, "/goal ") ? agent.runGoal(trim(line.substr(6))) : agent.runTurn(line);
         rend.flush();
         g_endPartial = nullptr;
         if (!err.empty() && err != "cancelled")

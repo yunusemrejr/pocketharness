@@ -1,0 +1,9 @@
+# Formulas and data
+
+Inventory cell types before transforming. Text IDs such as 00123 and long account numbers must remain strings. Excel numeric precision is unsuitable for arbitrary long identifiers. Distinguish stored serial dates from display formats; inspect workbook date epoch and timezone policy before conversion. CSV carries neither formulas-as-types nor styles or multiple sheets; specify delimiter, encoding, quoting and the sheet selected.
+
+When editing formulas, preserve relative/absolute references and named ranges; inserting rows through a library does not prove all dependent objects moved correctly. Use tables or bounded ranges for large calculations; avoid volatile functions or full-column array operations when a bounded formula suffices. Validate denominators and missing data explicitly instead of hiding every failure with IFERROR.
+
+openpyxl can read formula text or last cached values through data_only; it does not calculate formulas. XlsxWriter writes formulas and calculation flags, but does not run the calculation engine. For result verification use Excel or Calc recalculation, then reopen the resulting file and compare totals against an independent small calculation. Engine differences in dynamic arrays and newer functions require target-application verification. [openpyxl tutorial](https://openpyxl.readthedocs.io/en/3.1/tutorial.html), [XlsxWriter formulas](https://xlsxwriter.readthedocs.io/working_with_formulas.html).
+
+For programmatic CSV imports or exports intended as data, explicitly write formula-looking input as text according to the target application's behavior. Do not globally escape trusted user-authored formulas. Check empty ranges, one-row datasets, duplicated keys, negative amounts and leap-day boundaries. For pivots verify refreshed totals, source range and filters; cached pivot displays can be stale even when cells look plausible.

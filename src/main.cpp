@@ -11,6 +11,11 @@
 #include <cstdio>
 
 #include "agent.h"
+#include "brain.h"
+#include "catalog.h"
+#include "kit.h"
+#include "oversee.h"
+#include "skills.h"
 #include "common.h"
 #include "config.h"
 #include "process.h"
@@ -41,11 +46,15 @@ void usage() {
         "  pocket -p \"prompt\"            non-interactive single turn (composable)\n"
         "  pocket --resume [id]          resume newest (or given) session\n"
         "  pocket --sessions             list sessions\n"
+        "  pocket --models [query]       search the live model catalog\n"
+        "  pocket kit                    native superpowers (web, search, browser, media, code index)\n"
         "\n"
         "options:\n"
         "  -m, --model SPEC     provider:model[@routing] or alias (default: config)\n"
         "  -t, --thinking LVL   auto|off|none|minimal|low|medium|high|xhigh|max\n"
         "  -p, --print PROMPT   non-interactive prompt (stdout = final answer)\n"
+        "  -g, --goal GOAL      non-interactive goal: work + audit until verifiably met\n"
+        "  --refresh-catalog    refetch every keyed provider's model list now\n"
         "  --image PATH         attach an image (PNG/JPEG/GIF/WebP, max 5 MiB, repeatable)\n"
         "  --resume [id]        resume a session (interactive unless -p)\n"
         "  --sessions           list sessions and exit\n"
@@ -109,6 +118,7 @@ int pocketMain(int argc, char** argv);
 
 int main(int argc, char** argv) {
     setlocale(LC_ALL, "");
+    if (argc > 1 && std::string(argv[1]) == "kit") return pocket::kitMain(argc - 1, argv + 1);
     return pocket::pocketMain(argc, argv);
 }
 
@@ -120,7 +130,8 @@ int pocketMain(int argc, char** argv) {
     std::string modelSpec;
     std::string thinkingCli;
     std::string resumeId;
-    bool resume = false, listSessions = false;
+    bool resume = false, listSessions = false, listModels = false, refreshCatalog = false;
+    std::string modelQuery, goalText;
     bool optNetwork = false, optUnsafe = false, optAllowRoot = false, optNoNetwork = false;
     bool optAllowDestructive = false;
     bool optHelp = false, optVersion = false;
@@ -139,6 +150,12 @@ int pocketMain(int argc, char** argv) {
         if (a == "--help" || a == "-h") optHelp = true;
         else if (a == "--version" || a == "-v") optVersion = true;
         else if (a == "-p" || a == "--print") prompt = needVal("-p");
+        else if (a == "-g" || a == "--goal") prompt = goalText = needVal("--goal");
+        else if (a == "--refresh-catalog") refreshCatalog = true;
+        else if (a == "--models") {
+            listModels = true;
+            if (i + 1 < argc && !startsWithDash(argv[i + 1])) modelQuery = argv[++i];
+        }
         else if (a == "-m" || a == "--model") modelSpec = needVal("-m");
         else if (a == "-t" || a == "--thinking") thinkingCli = needVal("-t");
         else if (a == "--resume") {
@@ -232,6 +249,9 @@ int pocketMain(int argc, char** argv) {
         }
     }
 
+    // Provider keys from the user env file (never overriding the shell).
+    loadEnvFile(userEnvPath());
+
     // --- config (CLI grants authority; project config cannot escalate) ---
     auto cfgR = loadConfig(workspace);
     if (!cfgR.ok) {
@@ -271,6 +291,17 @@ int pocketMain(int argc, char** argv) {
             fprintf(stderr, "pocket: bad --thinking (auto|off|none|minimal|low|medium|high|xhigh|max)\n");
             return 2;
         }
+    }
+
+    if (refreshCatalog || listModels) {
+        if (refreshCatalog) fprintf(stderr, "%s\n", catalogRefresh(cfg).c_str());
+        if (!listModels) return 0;
+        auto all = catalogLoad(cfg);
+        if (all.empty()) fprintf(stderr, "catalog empty: run pocket --refresh-catalog\n");
+        std::vector<std::string> labels;
+        for (const auto& m : all) labels.push_back(catalogLabel(m));
+        for (size_t i : fuzzyRank(labels, modelQuery)) printf("%s\n", labels[i].c_str());
+        return 0;
     }
 
     if (listSessions) {
@@ -376,10 +407,18 @@ int pocketMain(int argc, char** argv) {
                         "\nnet=" + (allowNet ? "1" : "0") + "\n",
                     0600);
 
-    // Live context window unless config pins one explicitly.
-    if (!hasExplicitContext(cfg, model.provider.name, model.model)) {
-        long live = fetchModelContext(model.provider, model.model);
-        if (live > 0) model.context = live;
+    // Catalog: live window/reasoning/prices; daily background refresh.
+    catalogApply(cfg, model);
+    if (depth == 0) catalogRefreshIfStale(cfg);
+
+    // Stage this binary on the sandbox PATH: `pocket kit` and recursive
+    // `pocket -p` must work inside confinement, wherever pocket is installed.
+    char selfPath[PATH_MAX];
+    if (auto self = realpath("/proc/self/exe", selfPath) ? readFileBounded(selfPath, 64 << 20)
+                                                         : Result<std::string>::Err("");
+        self.ok) {
+        ensureDir(sessionTmp + "/bin", 0700);
+        (void)atomicWriteFile(sessionTmp + "/bin/pocket", self.value, 0700);
     }
 
     ToolEnv tools;
@@ -393,8 +432,57 @@ int pocketMain(int argc, char** argv) {
     tools.interactive = prompt.empty();
     tools.allowDestructive = optAllowDestructive;
 
+    // Roles resolve once; a broken role is reported and skipped, never fatal.
+    auto role = [&](const std::string& name) {
+        std::vector<ResolvedModel> out;
+        if (!cfg.roles.count(name)) return out;
+        for (std::string spec : splitLines(cfg.roles[name])) {
+            for (size_t p; (p = spec.find(',')) != std::string::npos;) spec[p] = '\n';
+            for (const auto& one : splitLines(spec)) {
+                if (trim(one).empty()) continue;
+                auto r = resolveModel(cfg, trim(one));
+                if (!r.ok) { fprintf(stderr, "pocket: role %s: %s\n", name.c_str(), r.error.c_str()); continue; }
+                catalogApply(cfg, r.value);
+                out.push_back(r.value);
+            }
+        }
+        return out;
+    };
+
     AgentOpts ao;
     ao.model = model;
+    ao.fast = role("fast");
+    ao.fallback = role("fallback");
+    ao.reviewers = role("review");
+    ao.autonomy = cfg.autonomy;
+    ao.review = cfg.review;
+    ao.brief = cfg.review;
+    if (cfg.hooks.count("stop")) ao.stopHooks = cfg.hooks["stop"];
+    ao.awareness = awarenessBlock(workspace, cfg, allowNet, optUnsafe, prompt.empty(),
+                                  optMaxRounds > 0 ? optMaxRounds : cfg.maxRounds);
+    ao.judge = [&cfg](const std::string& q, const std::string& text, double* cost) {
+        return judgeYes(cfg, q, text, cost);
+    };
+    ao.decide = [&cfg](const json::Value& state, const std::vector<Question>& qs, bool transcript, double* cost) {
+        return decide(cfg, state, qs, transcript, cost);
+    };
+    ao.hint = [&cfg, workspace](const std::string& text) -> std::string {
+        if (!needsBrief(text)) return "";
+        auto hits = skillSearch(skillDiscover(workspace), text);
+        if (hits.size() > 3) hits.resize(3);
+        if (hits.empty()) return "";
+        std::vector<Question> qs;
+        for (size_t i = 0; i < hits.size(); ++i)
+            qs.push_back({"s" + std::to_string(i), "Would the guide \"" + hits[i].name + ": " + hits[i].preview.substr(0, 200) +
+                                                       "\" materially help an expert do this task well?"});
+        auto p = decide(cfg, json::Object{{"task", text.substr(0, 2000)}}, qs, false);
+        std::vector<std::string> keep;
+        for (size_t i = 0; i < hits.size(); ++i)
+            if (p.empty() ? i == 0 : p["s" + std::to_string(i)] >= 0.7) keep.push_back(hits[i].name);
+        if (keep.empty()) return "";
+        return "[harness] Relevant skill" + std::string(keep.size() > 1 ? "s: " : ": ") + join(keep, ", ") +
+               " — load with skill(action=load, name=...) before starting.";
+    };
     ao.thinking = thinking;
     ao.maxRounds = optMaxRounds > 0 ? optMaxRounds : cfg.maxRounds;
     ao.maxTokens = optMaxTokens;
@@ -433,13 +521,18 @@ int pocketMain(int argc, char** argv) {
         tools.cancel = &printCancel;
         agent.setCancel(&printCancel);
         bool errTty = isatty(STDERR_FILENO);
+        bool midLine = false;  // notices must start on their own line
         agent.setCallbacks(
             [&](std::string_view tok) {
                 std::string s = sanitizeTerminal(std::string(tok));
                 (void)!fwrite(s.data(), 1, s.size(), stdout);
                 fflush(stdout);
+                if (!s.empty()) midLine = s.back() != '\n';
             },
-            [&](const std::string& note) { fprintf(stderr, "(%s)\n", sanitizeTerminal(note).c_str()); },
+            [&](const std::string& note) {
+                fprintf(stderr, "%s(%s)\n", midLine ? "\n" : "", sanitizeTerminal(note).c_str());
+                midLine = false;
+            },
             [&](std::string_view chunk) {
                 // Thinking streams to stderr so stdout stays the pure answer.
                 std::string s = sanitizeTerminal(std::string(chunk));
@@ -450,7 +543,7 @@ int pocketMain(int argc, char** argv) {
         tools.onToolDone = [&](const std::string& name, bool ok, const std::string&) {
             fprintf(stderr, "%s %s\n", ok ? "✓" : "✗", name.c_str());
         };
-        std::string err = agent.runTurn(prompt);
+        std::string err = goalText.empty() ? agent.runTurn(prompt) : agent.runGoal(goalText);
         sigaction(SIGINT, &oldInt, nullptr);
         sigaction(SIGTERM, &oldTerm, nullptr);
         printf("\n");
@@ -462,6 +555,8 @@ int pocketMain(int argc, char** argv) {
             fprintf(stderr, "cache: %ld hit / %ld miss (%ld%% reported reuse)\n", st.cacheHit,
                     st.cacheMiss, pct);
         }
+        if (st.costSeen)
+            fprintf(stderr, "cost: %s$%.4f (overseer $%.4f)\n", st.costEstimated ? "~" : "", st.cost, st.sideCost);
         if (err == "cancelled") {
             fprintf(stderr, "cancelled\n");
             rc = 130;
@@ -493,6 +588,7 @@ int pocketMain(int argc, char** argv) {
         }
     }
 
+    judgeShutdown();
     authorityClose(auth);
     return rc;
 }

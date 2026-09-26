@@ -1,0 +1,17 @@
+# Discovery, identity and publication status
+
+Translate the research question into concept groups with synonyms, exact technical phrases, exclusion terms and date boundaries. Preserve the executed query, database, retrieval date and result count. Use a broad discovery pass followed by targeted citation chasing and author or venue searches when justified. A search engine's ranking is not an evidence-quality score, and citation counts are not a substitute for reading methods.
+
+Use arXiv for preprints and versioned technical manuscripts, PubMed for biomedical indexing, Crossref for DOI and publisher metadata, and OpenAlex for broad work discovery and citation relationships. These channels overlap but have different coverage and metadata semantics. arXiv exposes query and pagination behavior through its documented API; check current access policy and preserve version suffixes when identifying the paper read. [arXiv API manual](https://github.com/arXiv/arxiv-docs/blob/develop/source/help/api/user-manual.md).
+
+PubMed search and retrieval workflows can use the Entrez E-utilities; separate identifiers returned by search from full bibliographic or abstract retrieval. A PMID is not a PMCID and neither guarantees freely accessible full text. Check the actual record and links rather than constructing a PDF URL from an identifier. Follow current NCBI API identification, batching and rate-limit guidance. [NCBI E-utilities documentation](https://www.ncbi.nlm.nih.gov/books/NBK25501/).
+
+Deduplicate primarily by canonical DOI or authoritative identifiers, then investigate title, author and year matches. Preprint and journal versions may be related yet not identical; retain a family relationship instead of deleting one blindly. Track conference abstracts, workshop papers, extended journal articles, datasets and code repositories as different research objects. Normalize DOI URL prefixes for matching without changing the original citation record. Use title similarity as a review candidate, not proof of identity.
+
+Crossref metadata includes bibliographic information and publication updates, including retraction information from contributing sources. Missing update metadata is not proof that no correction exists: inspect the publisher page when publication status matters. Keep the original record and the linked update, with dates and the reason relevant to your synthesis. [Crossref REST API](https://www.crossref.org/documentation/retrieve-metadata/rest-api/) and [versioning guidance](https://www.crossref.org/documentation/principles-practices/best-practices/versioning/).
+
+OpenAlex distinguishes works such as articles, preprints and datasets and exposes stable work identifiers through its API. Verify current authentication, access and charging rules rather than assuming all historical API access patterns remain free. Metadata access and full-text rights are separate questions. [OpenAlex works documentation](https://help.openalex.org/data/works/) and [API reference](https://help.openalex.org/api/).
+
+Build a screening ledger with inclusion decision, reason, available full-text version and unresolved status. For a review requiring comprehensive coverage, retain excluded-paper reasons and document database limitations. Do not expand an abstract into unobserved methods. If the paper is inaccessible, state which claims are supported by the available metadata and which require full-text verification.
+
+Primary source links checked 2026-09-09; verify current API and access requirements when executing the workflow.

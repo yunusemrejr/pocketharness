@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Editable motion timeline</title>
+<style>
+  *{box-sizing:border-box}body{margin:0;background:#141a22;color:#f3f0e8;font-family:system-ui,sans-serif}
+  svg{display:block;width:100vw;height:100vh}button{position:fixed;bottom:16px;left:16px;padding:10px 16px}
+  body.exporting button{display:none}
+</style>
+<svg viewBox="0 0 1280 720" role="img" aria-labelledby="label">
+  <title id="label">A title and subtitle on a six-second timeline</title>
+  <rect width="1280" height="720" fill="#141a22"/>
+  <rect id="rule" x="120" y="246" width="0" height="5" fill="#e5b66b"/>
+  <g id="title"><text x="120" y="354" fill="#f3f0e8" font-size="72" font-weight="650">A clear idea.</text></g>
+  <g id="subtitle"><text x="124" y="414" fill="#b4bcc9" font-size="28">Give it room to move.</text></g>
+</svg>
+<button type="button" id="play">Replay</button>
+<script>
+const clamp=x=>Math.max(0,Math.min(1,x));
+const ease=x=>1-(1-x)**3;
+const progress=(t,start,length)=>ease(clamp((t-start)/length));
+const title=document.querySelector('#title'),subtitle=document.querySelector('#subtitle'),rule=document.querySelector('#rule');
+let playing=0;
+window.renderFrame = function(seconds){
+  const t=Math.max(0,Math.min(6,seconds)),end=1-progress(t,5.2,0.7);
+  const a=progress(t,.3,.75),b=progress(t,1.1,.7);
+  rule.setAttribute('width',String(96*progress(t,.1,.6)*end));
+  title.setAttribute('opacity',String(a*end));title.setAttribute('transform',`translate(0 ${32*(1-a)})`);
+  subtitle.setAttribute('opacity',String(b*end));subtitle.setAttribute('transform',`translate(0 ${20*(1-b)})`);
+};
+document.querySelector('#play').onclick=()=>{
+  cancelAnimationFrame(playing);
+  if(matchMedia('(prefers-reduced-motion:reduce)').matches){window.renderFrame(3);return;}
+  const start=performance.now();
+  const tick=now=>{const t=(now-start)/1000;window.renderFrame(t);if(t<6)playing=requestAnimationFrame(tick);};
+  playing=requestAnimationFrame(tick);
+};
+window.renderFrame(3);
+</script>
+</html>

@@ -1025,7 +1025,8 @@ std::vector<std::string> buildChildEnv(const std::vector<std::string>& exposeEnv
     set("TEMP=" + tmpdir);
     set("HOME=" + home);
     set("SHELL=/bin/bash");
-    set("PATH=" + filterChildPath(getenv("PATH"), workspace, tmpdir));
+    // $TMPDIR/bin holds the session's staged copy of pocket (kit + recursion).
+    set("PATH=" + tmpdir + "/bin:" + filterChildPath(getenv("PATH"), workspace, tmpdir));
     // Marker only (lets scripts detect the harness). Everything else a
     // recursive pocket needs lives in $TMPDIR/pocket.parent, never here.
     set("POCKETHARNESS=1");

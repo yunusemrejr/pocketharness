@@ -1,0 +1,9 @@
+# Exchange and drawings
+
+Retain the native source: FCStd for FreeCAD history, DWG for AutoCAD-native features, or source scripts for OpenSCAD. STEP can transfer boundary-representation solids but usually not the original editable feature history. STL is a tessellated mesh and may lack units; set and verify scale explicitly. DXF is useful for drawing exchange, but support varies by entity and version. Never rename extensions to simulate conversion.
+
+For DWG use a supported installed application or converter with known licensing and version support. FreeCAD/LibreCAD capability should be checked locally; do not assume full native DWG fidelity. Compare layers, blocks, dimensions, external references, fonts, line types and model/paper space after conversion. Consult the installed-version [AutoCAD documentation](https://help.autodesk.com/view/ACD/2026/ENU/) for commands and supported formats.
+
+For 2D fabrication paths verify closed contours, no duplicate edges, intended holes, units and actual dimensions. Curves approximated with polylines require a declared tolerance. For 3D printing verify watertight manifold mesh, normals, disconnected components and wall thickness appropriate to the process. Geometry checks do not replace a slicer preview or process-specific validation.
+
+Reimport exchange files into a fresh document and compare bounding box, body count, critical dimensions and visible features to the source. Check exported STEP solids rather than trusting export success. For engineering drawings show useful projections, dimension units, scale, tolerances and revision information; avoid redundant dimensions that conflict. Deliver neutral formats alongside the native source when requested, identifying any loss of constraints or object semantics. Keep automated exports local unless external sharing was requested.

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.0
+
+- Overseer: expert brief before substantial work, Span-read stop gate
+  (permission asks, announced-but-undone work, dropped requirements,
+  premature completion), verification demands, `stop` hooks, a review
+  council with Span prefilter and majority vote, a watchmaker for repeated
+  failures, and `/goal` (`pocket -g`) with Span/LLM audits. All bounded.
+- Judges: batched OpenRouter decisions (respan/span-01 for transcripts,
+  typesafe Jev for content), an on-demand local llama.cpp Qwen judge, and a
+  native naive-Bayes fallback. Jev also distills oversized tool output and
+  flags template-grade UI/copy after edits.
+- Native intelligence: fuzzy + BM25 ranking, learned provider quirks from
+  400s, EWMA provider health, adaptive compaction threshold, duplicate-result
+  references.
+- `pocket kit`: web, search, headless-Chrome DOM/screenshot, img, svg,
+  spring, wav, audio, slop, code index (find/sym/refs), probe. The binary is
+  staged on the sandbox PATH, which also makes recursive `pocket` work under
+  confinement.
+- 30+ built-in providers, ChatGPT Codex (Responses API) login, a daily
+  self-refreshing model catalog, `/models` role assignment (main, fast,
+  fallback, review) with fuzzy search, fallback on provider outages, and
+  total cost including judges.
+- Hooks (`post_edit`, `pre_bash`, `stop`), `/undo`, `/brain`, `/catalog`,
+  provider keys from `~/.config/pocketharness/env`, an awareness block
+  (host, git, verify command, guardrails, project memory) and the wisdom
+  doctrine in the frozen prompt.
+- 165 bundled skills (installed by `make install`), frontmatter-aware and
+  BM25-searched; non-C/C++ code assets removed.
+- TUI: animated Game Boy-in-a-pocket banner, cost and goal in the status bar,
+  cleaner glyphs, UTF-8-safe truncation.
+
 ## 0.3.1
 
 - Serialize only valid UTF-8 JSON: preserve valid text and replace invalid bytes

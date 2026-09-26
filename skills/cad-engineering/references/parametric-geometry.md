@@ -1,0 +1,9 @@
+# Parametric geometry
+
+State a dimensional contract before scripting: units, primary dimensions, hole locations, thickness, clearances and expected body count. Derive repeated dimensions from named parameters. For sketches, constrain design intent until the remaining degrees of freedom are intentional; redundant constraints can fail just as underconstrained sketches can drift. Avoid arbitrary fixed positions where a relation to a datum expresses the actual requirement.
+
+In FreeCAD use document objects and recompute before inspecting shapes. Geometry validity, closure and expected solid count are separate checks. Inspect null/invalid results after boolean operations and use tighter local geometry reasoning instead of escalating tolerances until an operation happens to pass. The official [TopoShape API](https://freecad.github.io/SourceDoc/d8/ded/classPart_1_1TopoShape.html) exposes validity, closure, boolean and exchange operations; verify the installed Python wrapper for exact calls.
+
+Use coordinate transforms deliberately: points, directions and normals transform differently, and degrees versus radians mistakes can produce plausible wrong shapes. Check bounding box against expected dimensions. For a simple box verify volume L*W*H; for drilled or boolean-cut parts compare analytic expectations where possible. A nonzero volume alone does not prove the shape is correct.
+
+For OpenSCAD expose parameters and assertions, use a true geometry render before export, and select tessellation from feature size rather than an enormous global fragment count. For circular approximation radius r and segment angle theta, sagitta error is r*(1-cos(theta/2)); choose resolution from a tolerance. Keep numerical modeling tolerance distinct from manufacturing tolerance. Test parameter extremes and a realistic default. Changes to dimensions should preserve intended topology, not just render once.

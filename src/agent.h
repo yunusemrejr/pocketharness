@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common.h"
+#include "oversee.h"
 #include "provider.h"
 #include "session.h"
 #include "tools.h"
@@ -30,7 +31,7 @@ std::string validateHistory(const std::vector<ChatMessage>& msgs);
 // Pure enough to unit test: takes workspace, returns prompt text.
 // The base prompt is file-overridable: .pocket/system.md wins, then
 // ~/.config/pocketharness/system.md, then the minimal built-in below.
-std::string buildSystemPrompt(const std::string& workspace);
+std::string buildSystemPrompt(const std::string& workspace, const std::string& awareness = "");
 // Which base prompt is active: "" = built-in, else the override file path.
 std::string systemPromptSource(const std::string& workspace);
 
@@ -73,7 +74,27 @@ struct AgentOpts {
     std::function<void(std::string_view chunk)> onReasoning;  // live thinking preview
     std::function<void(const std::string&)> onNotice;  // compaction, retries, etc.
     std::function<Result<ChatResponse>(const ChatRequest&, const ChatCallbacks&)> request = chatRequest;
+    // --- overseer (all optional; unset = plain agent loop) ---
+    std::string awareness;           // frozen environment/guardrail block
+    std::vector<ResolvedModel> fast;       // role "fast": summaries, goal audits (0..1)
+    std::vector<ResolvedModel> fallback;   // role "fallback": provider failure (0..1)
+    std::vector<ResolvedModel> reviewers;  // the council (majority decides)
+    bool autonomy = false;           // nudge early stops / permission asks
+    bool review = false;             // council reviews changed work
+    std::vector<std::string> stopHooks;
+    // P(yes) judge (local LM / Jev); -1 unavailable. cost += USD spent.
+    std::function<double(const std::string& q, const std::string& text, double* cost)> judge;
+    // Batched Span/Jev decisions (see oversee.h); empty map = unavailable.
+    std::function<std::map<std::string, double>(const json::Value& state, const std::vector<Question>& qs,
+                                                 bool transcript, double* cost)> decide;
+    // Skill hint for a new user message ("" = none).
+    std::function<std::string(const std::string& userText)> hint;
+    bool brief = false;              // expert brief before substantial requests
 };
+
+// True for requests that deserve an expert brief (imperative work, not a
+// quick question). Pure, unit-tested.
+bool needsBrief(const std::string& userText);
 
 struct AgentStats {
     long inTokens = 0;  // summed when the provider reports usage, else stays 0
@@ -95,6 +116,10 @@ struct AgentStats {
     std::deque<std::pair<long, long>> cacheWindow;
     long recentHit = 0;
     long recentMiss = 0;
+    // Overseer accounting: side cost = judges, reviews, audits, summaries.
+    double sideCost = 0;
+    bool costEstimated = false;  // part of `cost` came from catalog prices
+    int nudges = 0, reviews = 0, fallbacks = 0, deduped = 0;
 };
 
 inline constexpr size_t kCacheWindow = 20;
@@ -116,6 +141,12 @@ class Agent {
     // Force compaction now (used by /compact). Error text or "".
     std::string compactNow();
 
+    // Goal mode: work, then audit "is the goal met?" and continue until it
+    // is (or maxCycles). Stricter overseer checks than a plain turn.
+    std::string runGoal(const std::string& goal, int maxCycles = 12);
+    const std::string& goal() const { return goal_; }
+    void clearGoal() { goal_.clear(); }
+
     // Queue an image file for the next user message ("", or error text).
     // Persists bytes under the session dir (resume-safe) plus a working
     // copy in the session tmp dir (visible to model tools).
@@ -136,6 +167,11 @@ class Agent {
         opts_.onReasoning = std::move(reasoning);
     }
     void setCancel(std::atomic<bool>* c) { opts_.cancel = c; }
+    void setRole(const std::string& role, const std::vector<ResolvedModel>& v) {
+        if (role == "fast") opts_.fast = v;
+        else if (role == "fallback") opts_.fallback = v;
+        else if (role == "review") opts_.reviewers = v;
+    }
     long contextUsed() const;  // estimated tokens in the next request
     long contextMax() const { return opts_.model.context; }
     const AgentStats& stats() const { return stats_; }
@@ -147,10 +183,21 @@ class Agent {
 
   private:
     Result<ChatResponse> requestOnce();
+    Result<ChatResponse> sideRequest(const ResolvedModel& m, const std::string& system,
+                                     const std::string& user, long maxTokens);
+    std::string stopGate(const std::string& finalText);
+    std::string councilReview();
+    std::string makeBrief(const std::string& request);
+    std::string turnDigest(size_t maxBytes) const;
+    json::Value turnTranscript(const std::string& finalText) const;
+    std::map<std::string, double> ask(const json::Value& state, const std::vector<Question>& qs, bool transcript);
+    std::string distill(const std::string& output);
+    void pushUser(const std::string& text);
     std::string maybeCompact();
     long completionBudget() const;
     long estimateContext() const;
-    void recordResponse(const ChatResponse& response, long elapsedMs);
+    void recordResponse(const ChatResponse& response, long elapsedMs, const ResolvedModel* m = nullptr,
+                        bool side = false);
     void appendSession(const SessionEvent& ev);
     void saveStats();
     // Load the frozen prefix from the session sidecar, or freeze it now.
@@ -166,6 +213,12 @@ class Agent {
     std::vector<ToolDef> toolDefs_;
     long lastEstimate_ = 0;
     std::string persistenceError_;
+    std::string goal_;
+    // Per-turn overseer state.
+    size_t turnStart_ = 0;
+    int turnNudges_ = 0, turnGates_ = 0;
+    bool unverified_ = false, verifyNudged_ = false, reviewed_ = false;
+    std::vector<std::string> hookNagged_;
 };
 
 }  // namespace pocket

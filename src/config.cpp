@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <cmath>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace pocket {
@@ -17,6 +18,9 @@ std::string projectSystemPath(const std::string& workspace) {
     return projectDir(workspace) + "/system.md";
 }
 std::string projectDir(const std::string& workspace) { return workspace + "/.pocket"; }
+std::string bundledSkillDir() { return stateDir() + "/skills"; }
+std::string userRolesPath() { return userConfigDir() + "/roles.json"; }
+std::string userEnvPath() { return userConfigDir() + "/env"; }
 std::string projectConfigPath(const std::string& workspace) {
     return projectDir(workspace) + "/config.json";
 }
@@ -27,15 +31,38 @@ std::string projectSkillDir(const std::string& workspace) {
 Config defaultConfig() {
     Config c;
     c.defaultModel = "orcarouter:z-ai/glm-5.3-flash";
+    // Wire protocols are code; vendors are data. Every endpoint below is
+    // OpenAI-compatible unless marked, and needs only its key in the env.
     c.providers = {
         {"orcarouter", "openai", "https://api.orcarouter.ai/v1", "ORCAROUTER_API_KEY"},
         {"openrouter", "openai", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"},
         {"deepseek", "openai", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"},
-        {"friendli", "openai", "https://api.friendli.ai/v1", "FRIENDLI_API_KEY"},
+        {"friendli", "openai", "https://api.friendli.ai/serverless/v1", "FRIENDLI_API_KEY"},
         {"together", "openai", "https://api.together.xyz/v1", "TOGETHER_API_KEY"},
         {"deepinfra", "openai", "https://api.deepinfra.com/v1/openai", "DEEPINFRA_API_KEY"},
+        {"cerebras", "openai", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY"},
+        {"groq", "openai", "https://api.groq.com/openai/v1", "GROQ_API_KEY"},
+        {"mistral", "openai", "https://api.mistral.ai/v1", "MISTRAL_API_KEY"},
+        {"xai", "openai", "https://api.x.ai/v1", "XAI_API_KEY"},
+        {"gemini", "openai", "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"},
+        {"nvidia", "openai", "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY"},
+        {"fireworks", "openai", "https://api.fireworks.ai/inference/v1", "FIREWORKS_API_KEY"},
+        {"moonshot", "openai", "https://api.moonshot.ai/v1", "MOONSHOT_API_KEY"},
+        {"zai", "openai", "https://api.z.ai/api/paas/v4", "ZAI_API_KEY"},
+        {"agnes", "openai", "https://apihub.agnes-ai.com/v1", "AGNES_API_KEY"},
+        {"atria", "openai", "https://api.atria-asi.ai/v1", "ATRIA_API_KEY"},
+        {"longcat", "openai", "https://api.longcat.chat/openai/v1", "LONGCAT_API_KEY"},
+        {"ollama-cloud", "openai", "https://ollama.com/v1", "OLLAMA_API_KEY"},
+        {"qwen", "openai", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "QWEN_API_KEY"},
+        {"runinfra", "openai", "https://api.runinfra.ai/v1", "RUNINFRA_API_KEY"},
+        {"streamlake", "openai", "https://vanchin.streamlake.ai/api/gateway/coding/v1", "STREAMLAKE_API_KEY"},
+        {"xiaomi", "openai", "https://token-plan-sgp.xiaomimimo.com/v1", "XIAOMI_TOKEN_PLAN_SGP_API_KEY"},
+        {"stepfun", "openai", "https://api.stepfun.ai/step_plan/v1", "STEPFUN_API_KEY"},
+        {"kimi-coding", "anthropic", "https://api.kimi.com/coding", "KIMI_API_KEY"},
+        {"minimax", "anthropic", "https://api.minimax.io/anthropic", "MINIMAX_API_KEY"},
         {"anthropic", "anthropic", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY"},
         {"openai", "openai", "https://api.openai.com/v1", "OPENAI_API_KEY"},
+        {"codex", "codex", "https://chatgpt.com/backend-api", ""},  // ChatGPT login (~/.codex/auth.json)
         {"ollama", "openai", "http://127.0.0.1:11434/v1", ""},
         {"lmstudio", "openai", "http://127.0.0.1:1234/v1", ""},
         {"llamacpp", "openai", "http://127.0.0.1:8080/v1", ""},
@@ -45,6 +72,7 @@ Config defaultConfig() {
     c.models = {
         {"glm", "orcarouter", "z-ai/glm-5.3-flash", "", 1310720, true},
         {"deepseek", "deepseek", "deepseek-flash", "", 1048576, true},
+        {"codex", "codex", "gpt-5.5", "", 272000, true},
     };
     return c;
 }
@@ -143,9 +171,9 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
                 pc.protocol = kv.second.at("protocol").asStr().empty()
                                   ? "openai"
                                   : toLower(kv.second.at("protocol").asStr());
-                if (pc.protocol != "openai" && pc.protocol != "anthropic")
+                if (pc.protocol != "openai" && pc.protocol != "anthropic" && pc.protocol != "codex")
                     return VoidResult::Err("provider \"" + kv.first +
-                                           "\": protocol must be \"openai\" or \"anthropic\"");
+                                           "\": protocol must be \"openai\", \"anthropic\" or \"codex\"");
                 pc.baseUrl = kv.second.at("base_url").asStr();
                 if (pc.baseUrl.empty())
                     return VoidResult::Err("provider \"" + kv.first + "\" needs \"base_url\"");
@@ -154,7 +182,7 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
                                            "\": base_url must be https, or http loopback "
                                            "(localhost/127./::1 for local daemons)");
                 pc.keyEnv = kv.second.at("key_env").asStr();
-                if (pc.keyEnv.empty()) {
+                if (pc.keyEnv.empty() && pc.protocol != "codex") {
                     // Local daemons (LM Studio, Ollama, llama.cpp) usually run
                     // without auth; remote endpoints always need a key.
                     if (!isLoopbackHttp(pc.baseUrl))
@@ -234,6 +262,31 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
         }
     }
 
+    if (v.has("roles")) {
+        if (!o.at("roles").isObj()) return typeErr("roles", "an object of role -> model spec");
+        for (const auto& [role, spec] : o.at("roles").asObj()) {
+            if (!spec.isStr()) return typeErr("roles", "an object of role -> model spec");
+            cfg.roles[role] = spec.asStr();
+        }
+    }
+    if (v.has("hooks")) {
+        if (!o.at("hooks").isObj()) return typeErr("hooks", "an object of event -> [commands]");
+        for (const auto& [ev, cmds] : o.at("hooks").asObj()) {
+            if (ev != "post_edit" && ev != "pre_bash" && ev != "stop")
+                return VoidResult::Err("unknown hook event \"" + ev + "\" (post_edit/pre_bash/stop)");
+            if (!cmds.isArr()) return typeErr("hooks", "an object of event -> [commands]");
+            for (const auto& c : cmds.asArr()) {
+                if (!c.isStr()) return typeErr("hooks", "an object of event -> [commands]");
+                cfg.hooks[ev].push_back(c.asStr());
+            }
+        }
+    }
+    for (auto [key, dst] : {std::pair{"review", &cfg.review}, std::pair{"autonomy", &cfg.autonomy},
+                           std::pair{"jev", &cfg.jev}}) {
+        if (!v.has(key)) continue;
+        if (!o.at(key).isBool()) return typeErr(key, "a boolean");
+        *dst = o.at(key).asBool();
+    }
     // Security authority: user config only. Project config must not escalate.
     auto secKey = [&](const char* k) -> bool {
         if (!v.has(k)) return false;
@@ -281,6 +334,19 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
         auto r = strList("allow_write", cfg.allowWrite);
         if (!r.ok) return r;
     }
+    if (secKey("local_lm")) {
+        const auto& l = o.at("local_lm");
+        if (!l.isObj()) return typeErr("local_lm", "an object");
+        cfg.localLm.server = expandHome(l.at("server").asStr());
+        cfg.localLm.model = expandHome(l.at("model").asStr());
+        cfg.localLm.keyFile = expandHome(l.at("key_file").asStr());
+        cfg.localLm.port = (int)l.at("port").asInt(18735);
+        cfg.localLm.threads = (int)l.at("threads").asInt(4);
+        cfg.localLm.ctx = (int)l.at("ctx").asInt(4096);
+        if (cfg.localLm.port < 1024 || cfg.localLm.port > 65535 || cfg.localLm.threads < 1 ||
+            cfg.localLm.threads > 64 || cfg.localLm.ctx < 512)
+            return typeErr("local_lm", "valid port (1024..65535), threads (1..64), ctx (>=512)");
+    }
     if (secKey("expose_env")) {
         auto r = strList("expose_env", cfg.exposeEnv);
         if (!r.ok) return r;
@@ -313,7 +379,52 @@ Result<Config> loadConfig(const std::string& workspace) {
         if (!r.ok) return Result<Config>::Err(pp + ": " + r.error);
         if (!warn.empty()) fprintf(stderr, "pocket: %s", warn.c_str());
     }
+    // roles.json (written by /models) wins over config roles.
+    if (auto t = readFileBounded(userRolesPath(), 65536); t.ok) {
+        auto v = json::parse(t.value);
+        if (v.ok)
+            for (const auto& [role, spec] : v.value.isObj() ? v.value.asObj() : json::Object{})
+                if (spec.isStr() && !spec.asStr().empty()) cfg.roles[role] = spec.asStr();
+    }
+    if (cfg.roles.count("main")) cfg.defaultModel = cfg.roles["main"];
     return Result<Config>::Ok(std::move(cfg));
+}
+
+VoidResult saveRole(const std::string& role, const std::string& spec) {
+    json::Object roles;
+    if (auto t = readFileBounded(userRolesPath(), 65536); t.ok) {
+        auto v = json::parse(t.value);
+        if (v.ok && v.value.isObj()) roles = v.value.asObj();
+    }
+    if (spec.empty()) roles.erase(role);
+    else roles[role] = spec;
+    auto d = ensureDir(userConfigDir(), 0700);
+    if (!d.ok) return d;
+    return atomicWriteFile(userRolesPath(), json::stringify(json::Value(roles), true) + "\n", 0600);
+}
+
+int loadEnvFile(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return 0;
+    if (st.st_uid != geteuid() || (st.st_mode & 077)) {
+        fprintf(stderr, "pocket: ignoring %s (must be owned by you, mode 0600)\n", path.c_str());
+        return 0;
+    }
+    auto t = readFileBounded(path, 1 << 16);
+    if (!t.ok) return 0;
+    int n = 0;
+    for (std::string line : splitLines(t.value)) {
+        line = trim(line);
+        if (startsWith(line, "export ")) line = trim(line.substr(7));
+        size_t eq = line.find('=');
+        if (line.empty() || line[0] == '#' || eq == std::string::npos) continue;
+        std::string k = line.substr(0, eq), val = trim(line.substr(eq + 1));
+        if (val.size() >= 2 && (val[0] == '"' || val[0] == '\'') && val.back() == val[0])
+            val = val.substr(1, val.size() - 2);
+        if (!validEnvName(k) || val.empty()) continue;
+        if (!getenv(k.c_str()) && setenv(k.c_str(), val.c_str(), 0) == 0) ++n;
+    }
+    return n;
 }
 
 Result<ResolvedModel> resolveModel(const Config& cfg, const std::string& spec) {

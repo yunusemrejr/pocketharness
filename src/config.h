@@ -2,6 +2,7 @@
 // Providers are data (wire protocols), not vendor classes.
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -22,10 +23,13 @@ std::string projectSystemPath(const std::string& workspace);  // <ws>/.pocket/sy
 std::string projectDir(const std::string& workspace);  // <ws>/.pocket
 std::string projectConfigPath(const std::string& workspace);
 std::string projectSkillDir(const std::string& workspace);
+std::string bundledSkillDir();  // ~/.local/share/pocketharness/skills (make install)
+std::string userRolesPath();    // ~/.config/pocketharness/roles.json (/models writes it)
+std::string userEnvPath();      // ~/.config/pocketharness/env (KEY=value, 0600)
 
 struct ProviderCfg {
     std::string name;
-    std::string protocol = "openai";  // "openai" | "anthropic"
+    std::string protocol = "openai";  // "openai" | "anthropic" | "codex"
     std::string baseUrl;
     std::string keyEnv;  // env var holding the API key (never the key itself)
 };
@@ -63,6 +67,19 @@ struct Config {
     std::vector<std::string> allowRead;
     std::vector<std::string> allowWrite;
     std::vector<std::string> exposeEnv;
+    // Model roles: main (default), fast (summaries, judging), fallback (on
+    // provider failure), review (the overseer council). Values are specs.
+    std::map<std::string, std::string> roles;
+    // Shell hooks run in the same sandbox as the bash tool. Events:
+    // post_edit ({file} = changed path), pre_bash ({cmd}), stop (end of turn).
+    std::map<std::string, std::vector<std::string>> hooks;
+    bool review = true;    // overseer reviews changed work before a turn ends
+    bool autonomy = true;  // nudge models that stop early or ask permission
+    bool jev = true;       // OpenRouter Jev judge (when OPENROUTER_API_KEY is set)
+    struct LocalLm {       // optional llama.cpp judge, started on demand
+        std::string server, model, keyFile;
+        int port = 18735, threads = 4, ctx = 4096;
+    } localLm;
 };
 
 struct ResolvedModel {
@@ -72,6 +89,7 @@ struct ResolvedModel {
     long context = 200000;
     std::string spec;     // canonical spec string for display/state
     ModelOptions options{};
+    double inPrice = -1, outPrice = -1;  // USD per 1M tokens (catalog), -1 unknown
 };
 
 bool validThinking(const std::string& level);
@@ -95,5 +113,13 @@ bool isLoopbackHttp(const std::string& url);
 
 // Built-in provider defaults used when no user config exists.
 Config defaultConfig();
+
+// Persist one role -> spec in roles.json (user config dir, 0600).
+VoidResult saveRole(const std::string& role, const std::string& spec);
+
+// Load KEY=value / export KEY=value lines from the user env file into the
+// process environment (never overriding). Refused unless owned by the user
+// and not group/world accessible. Returns the number of keys loaded.
+int loadEnvFile(const std::string& path);
 
 }  // namespace pocket

@@ -47,5 +47,26 @@
   "allow_read": [],
   "allow_write": [],
   "expose_env": [],
-  "max_rounds": 100
+  "max_rounds": 100,
+  "roles": {
+    "fast": "deepseek",
+    "fallback": "deepseek",
+    "review": "deepseek,openrouter:z-ai/glm-5.3-flash"
+  },
+  "hooks": {
+    "post_edit": [],
+    "pre_bash": [],
+    "stop": []
+  },
+  "review": true,
+  "autonomy": true,
+  "jev": true,
+  "local_lm": {
+    "server": "~/llama.cpp/build/bin/llama-server",
+    "model": "~/models/Qwen3.5-0.8B-Q4_0.gguf",
+    "key_file": "",
+    "port": 18735,
+    "threads": 4,
+    "ctx": 4096
+  }
 }

@@ -8,6 +8,7 @@ LDLIBS ?= -lpthread
 
 SRC := src/common.cpp src/json.cpp src/config.cpp src/session.cpp src/skills.cpp \
        src/sandbox.cpp src/process.cpp src/provider.cpp src/tools.cpp src/agent.cpp \
+       src/brain.cpp src/catalog.cpp src/kit.cpp src/oversee.cpp src/wisdom.cpp \
        src/tui.cpp src/main.cpp
 OBJ := $(SRC:.cpp=.o)
 BIN := pocket
@@ -15,13 +16,15 @@ BIN := pocket
 TEST_SRC := tests/test_main.cpp tests/test_json.cpp tests/test_common.cpp tests/test_config.cpp \
             tests/test_session.cpp tests/test_skills.cpp tests/test_sandbox.cpp \
             tests/test_provider.cpp tests/test_tools.cpp tests/test_agent.cpp \
-            tests/test_tui.cpp tests/test_process.cpp tests/test_transport.cpp
+            tests/test_tui.cpp tests/test_process.cpp tests/test_transport.cpp \
+            tests/test_brain.cpp tests/test_kit.cpp
 TEST_OBJ := $(TEST_SRC:.cpp=.o)
 TEST_LIB := $(filter-out src/main.o,$(OBJ))
 TEST_BIN := tests/run_tests
 
 PREFIX ?= $(HOME)/.local
 BINDIR := $(PREFIX)/bin
+SKILLDIR := $(HOME)/.local/share/pocketharness/skills
 
 all: $(BIN)
 
@@ -46,18 +49,14 @@ sanitize:
 install: $(BIN)
 	mkdir -p $(BINDIR)
 	install -m 0755 $(BIN) $(BINDIR)/pocket
-	@echo "installed $(BINDIR)/pocket"
-
-# Optional: copy the bundled skills into the user skill dir. Never runs as
-# part of `install`: skills are user configuration, not program files.
-install-skills:
-	mkdir -p $(HOME)/.config/pocketharness/skills
-	cp -r skills/* $(HOME)/.config/pocketharness/skills/
-	@echo "installed skills to $(HOME)/.config/pocketharness/skills"
+	@# Bundled skills are program data: replaced wholesale on every install.
+	@# Your own skills live in ~/.config/pocketharness/skills and win on name.
+	rm -rf $(SKILLDIR) && mkdir -p $(SKILLDIR) && cp -r skills/. $(SKILLDIR)/
+	@echo "installed $(BINDIR)/pocket and $$(ls skills | wc -l) bundled skills"
 
 clean:
 	rm -f $(OBJ) $(BIN) $(TEST_OBJ) $(TEST_BIN) $(OBJ:.o=.d) $(TEST_OBJ:.o=.d)
 
 -include $(OBJ:.o=.d) $(TEST_OBJ:.o=.d)
 
-.PHONY: all test sanitize install install-skills clean
+.PHONY: all test sanitize install clean
