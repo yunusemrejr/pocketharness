@@ -75,3 +75,4 @@ See `fonts` skill. Performance lens: one woff2, subset, `swap`, preload primary,
 - Preloading everything = network thrashing; preload only the ONE next-likely asset.
 - Adding a CDN to an already-fast static site: extra TLS handshake can net-negative.
 - Optimizing a fast page because the tool says 87/100 — verify the metric the user feels (INP/LCP) before chasing the score.
+`pocket kit net URL` splits a request into DNS, connect, TLS and first-byte time and lists caching/compression headers; `pocket kit bench -n 20 'CMD'` times builds or scripts with median, p95 and peak RSS.

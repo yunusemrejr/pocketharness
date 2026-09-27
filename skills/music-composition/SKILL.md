@@ -7,6 +7,8 @@ description: Compose original melodies, harmony, rhythm and arrangements; create
 
 Use the user's mood, instrumentation, references and duration to make musical choices. Establish a tonal center or deliberate atonality, meter, tempo, motif and form. Start with a short coherent phrase; develop repetition and contrast before adding parts. Keep bass, chord voicing and melody intentional rather than generating unrelated scale notes.
 
+Render sketches natively with `pocket kit wav` (chords `C4+E4+G4`, simultaneous tracks separated by `|`, drum hits `K`/`S`/`H`, a `saw>` prefix per track) and check levels with `pocket kit audio`; load the procedural-audio skill for the full syntax.
+
 Turn the explicit score into type-1 MIDI, editable JSON and an audible WAV sketch using available local MIDI tooling (a MIDI library plus a simple software renderer, with no model or soundfont required). Read [score format and arrangement](references/score.md) before constructing the score data. The sketch format supports constant tempo, eight tonal tracks and two-minute sketches. The renderer does not invent the musical content or render realistic instruments.
 
 For picture, map cue points to seconds, then quarter-note beats; choose tempo and phrase lengths to support the edit. Record intentional pickups, holds, endings and loop seams. For longer work or tempo maps, use an available DAW/MIDI library with the same timing contract.

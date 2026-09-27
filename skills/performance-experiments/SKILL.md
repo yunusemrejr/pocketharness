@@ -16,3 +16,5 @@ State the user-visible performance target and representative workload. Keep corr
 Example: a GPU kernel launch returns before work finishes. Use the runtime's supported synchronization or timing events around the measured region.
 
 Deliver a reproducible benchmark and a bottleneck-supported explanation. If improvement is within noise, say so and avoid complexity without a demonstrated benefit. Use statistical-experiments for formal treatment-effect or causal population claims.
+
+`pocket kit bench [-n RUNS] [-w WARMUP] 'CMD'` reports min/median/mean±sd/p95/max wall time, CPU time and peak RSS; compare medians over enough runs rather than a single timing.

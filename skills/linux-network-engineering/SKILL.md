@@ -19,3 +19,5 @@ Read [diagnosis playbooks](references/diagnosis-playbooks.md) for the rung-by-ru
 ## Evidence and completion
 
 Report the failing rung, the exact commands and outputs that localize it, and the boundary between verified host state and unverified path behavior. Name what changed (if anything), how it was verified, and what remains untested. Do not claim a path is healthy from a single successful ping.
+
+`pocket kit ports [PORT]` lists listening TCP sockets with owning pid and command; `pocket kit wait PORT|URL [SEC]` blocks until a service answers; `pocket kit net URL` shows HTTP timing, TLS verification and headers.

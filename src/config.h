@@ -55,7 +55,7 @@ struct ModelCfg {
 
 struct Config {
     std::string defaultModel;  // model spec, e.g. "orcarouter:glm-5.3-flash"
-    std::string thinking = "auto";
+    std::string thinking = "adaptive";  // per-round level, see Agent::effectiveThinking
     std::vector<ProviderCfg> providers;
     std::vector<ModelCfg> models;
     // Security-relevant knobs. Only the USER config may grant authority;

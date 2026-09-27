@@ -19,3 +19,5 @@ Read [patterns and examples](references/patterns.md) for the relevant implementa
 ## Evidence and completion
 
 Use a small representative case and the relevant failure case to check the result. Report what was executed, what remains unverified, and any material compatibility assumption. Do not invent measured outcomes or treat reading this guide as verification.
+
+Audit a page natively with `pocket kit seo FILE|URL` (title, description, canonical, robots, headings, alt text, share cards, JSON-LD validity, thin content) and check delivery with `pocket kit net URL` (redirects, timing, caching and security headers). Treat the output as a checklist to verify, not a ranking score.

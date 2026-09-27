@@ -198,3 +198,19 @@ TEST(audio_CLI_Invalid_Options_Do_Not_Overwrite_Output) {
     CHECK(kitAudio({file, "extra"}) != 0);
     return "";
 }
+
+TEST(audio_Chords_Tracks_And_Drums_Mix_Without_Clipping) {
+    // Three tracks of one second each: chord, saw bass, drums. Loud gain
+    // would clip when summed; the mix is scaled below full scale instead.
+    const auto wav = synthNotes("C4+E4+G4:1 | saw> C2:.5 C2 | K:.25 H S H", "sine", 0, 1);
+    CHECK(wav.ok);
+    const auto stats = analyzeWav(wav.value);
+    CHECK(stats.ok && stats.value.clippedSamples == 0 && stats.value.peak <= .99 && stats.value.peak > .5);
+    CHECK(stats.value.frames >= 44100);
+    CHECK(!synthNotes("C4+:1").ok);
+    CHECK(!synthNotes("buzz> C4").ok);
+    std::string tracks;
+    for (int i = 0; i < 17; ++i) tracks += "C4|";
+    CHECK(!synthNotes(tracks).ok);
+    return "";
+}

@@ -229,6 +229,7 @@ class Agent {
     std::string runDoublePass();
     void recordOutcome(const std::string& scope, const std::string& reason, const std::string& detail);
     Result<ChatResponse> requestOnce();
+    std::string effectiveThinking() const;
     // With `deferred`, usage is collected there instead of recorded, so
     // concurrent side requests never touch stats_ off the calling thread.
     Result<ChatResponse> sideRequest(const ResolvedModel& m, const std::string& system,
@@ -287,6 +288,7 @@ class Agent {
     size_t turnStart_ = 0;
     int turnNudges_ = 0, turnGates_ = 0;
     bool unverified_ = false, verifyNudged_ = false, reviewed_ = false, calmNext_ = false;
+    std::string thinkNow_ = "high";  // adaptive thinking: level for the next request
     std::vector<std::string> blind_;  // model specs that rejected image input this session
     std::vector<std::string> hookNagged_;
 };

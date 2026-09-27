@@ -16,6 +16,7 @@ int kitMain(int argc, char** argv);  // argv[0] = "kit"
 // Pure helpers (unit-tested).
 std::string htmlToText(std::string_view html, std::vector<std::string>* links = nullptr);
 std::string urlDecode(std::string_view s);
+std::string htmlAttr(std::string_view tag, const std::string& name);  // attribute value, "" if absent
 double noteFreq(const std::string& note);  // "A4" -> 440, "C#5", "Eb3"; -1 invalid
 // Damped spring sampled to CSS linear(); empty if invalid or outside bounded
 // settling/sampling limits. durationMs is zero on failure.

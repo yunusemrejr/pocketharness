@@ -442,3 +442,28 @@ TEST(provider_ServedModel_Captured_Per_Protocol) {
     CHECK(pa.ok && pa.value.servedModel == "claude-z");
     return "";
 }
+
+TEST(provider_Tool_Args_Repair_And_Stream_Merge) {
+    CHECK_EQ(repairToolArgs(""), std::string("{}"));
+    CHECK_EQ(repairToolArgs(R"({"a":1})"), std::string(R"({"a":1})"));
+    CHECK_EQ(repairToolArgs(R"("{\"a\":1}")"), std::string(R"({"a":1})"));
+    CHECK_EQ(repairToolArgs("```json\n{\"a\":\"x\ny\"}\n```"), std::string("{\"a\":\"x\\ny\"}"));
+    std::string why;
+    CHECK(repairToolArgs(R"({"a":"cut)", &why).empty() && why.find("cut off") != std::string::npos);
+    CHECK(repairToolArgs(R"({"a":1}{"b":2})", &why).empty() && why.find("glued") != std::string::npos);
+    // Resent id/name chunks and two calls sharing one index stay separate.
+    OpenAiStreamAcc acc;
+    for (const char* chunk : {
+             R"({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\"path\""}}]}}]})",
+             R"({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":":\"a\"}"}}]}}]})",
+             R"({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c2","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]})"}) {
+        auto v = json::parse(chunk);
+        CHECK(v.ok);
+        acc.feed(v.value);
+    }
+    auto r = acc.finish();
+    CHECK_EQ(r.calls.size(), (size_t)2);
+    CHECK_EQ(r.calls[0].id + r.calls[0].name + r.calls[0].argsJson, std::string(R"(c1read{"path":"a"})"));
+    CHECK_EQ(r.calls[1].id + r.calls[1].name + r.calls[1].argsJson, std::string(R"(c2bash{"command":"ls"})"));
+    return "";
+}

@@ -14,6 +14,7 @@ pocket kit sfx public/audio/transition.wav whoosh --duration .6 --seed 17 --gain
 pocket kit sfx public/audio/hit.wav impact --duration .4 --gain .3
 pocket kit sfx public/audio/laser.wav laser --freq 1800 --end-freq 120 --duration .35
 pocket kit wav public/audio/motif.wav "C5:.5 E5:.5 G5:1 R:.25 G5:.5 C6:1" --bpm 100 --wave sine --gain .22
+pocket kit wav public/audio/loop.wav "C4+E4+G4:2 A3+C4+E4:2 | saw> C2:1 C2 A1 A1 | K:.5 H S H K H S H" --bpm 96 --gain .2
 pocket kit audio public/audio/reveal.wav
 ```
 
@@ -28,7 +29,7 @@ pocket kit audio public/audio/reveal.wav
 - `--seed UINT32`: repeatable noise, default 1; zero is valid.
 - `--rate N`: integer sample rate 8000–96000 Hz, default 44100. Frequencies/filter cutoff must be below .49 times the sample rate.
 
-`wav OUT.wav "NOTE:DURATION ..."` accepts note names (`A4`, `C#5`, `Eb3`), frequencies (`440`), and rests (`R`). Separate events with spaces, tabs, commas or newlines. Durations are seconds unless `--bpm 1..1000` is present, then they are beats. An omitted duration is .25. Supported waves: `sine`, `square`, `saw`, `tri`. A render is limited to 60 seconds and 4096 events. This command produces a sequential melody; it does not interpret chords or MIDI.
+`wav OUT.wav "NOTE:DURATION ..."` accepts note names (`A4`, `C#5`, `Eb3`), frequencies (`440`), and rests (`R`). Separate events with spaces, tabs, commas or newlines. Durations are seconds unless `--bpm 1..1000` is present, then they are beats. An omitted duration is .25. Supported waves: `sine`, `square`, `saw`, `tri`. A render is limited to 60 seconds and 4096 events. Join notes with `+` for a chord (`C4+E4+G4:1`). Separate simultaneous tracks with `|`; they are mixed and scaled below clipping. Prefix a track with a wave, e.g. `saw> C2:.5 C2 A1`, to override `--wave`. `K`, `S` and `H` are kick, snare and hat hits; the event duration advances time while the hit rings out. The limits apply per track (60 seconds), with 4096 events and 16 tracks in total. There is no MIDI input.
 
 Match the cue to the action. Use a brief click for direct input, a chime for a confirmed result, a whoosh for motion and an impact for a reveal. Under speech, keep cue levels low and use the low-pass filter to reduce competition with the voice. Avoid adding an identical cue to every event.
 

@@ -273,13 +273,19 @@ pocket kit sfx OUT.wav whoosh [--duration .6]   seeded native sound effects
 pocket kit img FILE...      png/jpeg/gif/webp/svg type + dimensions
 pocket kit svg FILE         structure, viewBox, ids, animation count
 pocket kit spring K C M     physical spring → CSS linear() easing + duration
-pocket kit wav OUT "C4:.25 R:.25 440:.5"   synthesize tones (sine/square/saw/tri)
+pocket kit wav OUT "C4+E4+G4:1 | saw> C2:.5 C2 | K:.25 H S H"   chords, mixed tracks, drums
 pocket kit audio FILE.wav   loudness, peak, clipping, pitch, silence
 pocket kit slop FILE...     placeholders, stubs, conflict markers, AI-tell prose
 pocket kit find QUERY       ranked code search (BM25 over chunks, no index)
 pocket kit sym NAME|.       definitions (outline with ".") — LSP-lite
 pocket kit refs NAME        whole-word references
 pocket kit probe            OS, CPU, memory, disk, GPU, toolchain
+pocket kit ports [PORT]     listening TCP sockets with owning pid + command
+pocket kit wait PORT|URL    block until a server answers (instead of sleep)
+pocket kit net URL          HTTP timing (dns/connect/tls/ttfb), redirects, headers
+pocket kit seo FILE|URL     title, meta, canonical, headings, alt, share cards, JSON-LD
+pocket kit csv FILE         dataset profile: types, missing, stats, class balance
+pocket kit bench [-n N] CMD min/median/p95 wall time, CPU, peak RSS
 ```
 
 A tool costs a schema in every request; a kit subcommand costs one line in
@@ -486,8 +492,12 @@ announced in the UI, cancellable with Ctrl-C). Numeric `Retry-After` headers are
 the answer has not started streaming — once tokens are visible, a failure
 fails fast rather than duplicating output. Other HTTP 4xx responses never retry.
 
-Thinking levels: `auto/off/none/minimal/low/medium/high/xhigh/max` (`/thinking`
-or `-t`). The default `auto` and compatibility setting `off` omit effort controls;
+Thinking levels: `adaptive/auto/off/none/minimal/low/medium/high/xhigh/max`
+(`/thinking` or `-t`). The default `adaptive` picks a level per request: `high`
+for a new instruction, an overseer nudge, a failed tool or a fresh compaction,
+`medium` right after edits (checking them), `low` while reading successfully.
+Anthropic wires stay at one level there, because changing thinking settings
+invalidates their message cache. `auto` and `off` omit effort controls;
 `none` explicitly disables reasoning where supported. DeepSeek also receives
 its thinking toggle. `max` is sent as `max`; use `xhigh` when that is the model's
 supported maximum. Each endpoint decides which levels its model supports.

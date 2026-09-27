@@ -196,6 +196,49 @@ json::Value buildOpenAiBody(const ChatRequest& req) {
     return json::Value(b);
 }
 
+std::string repairToolArgs(const std::string& raw, std::string* why) {
+    auto isObj = [](const std::string& s) { auto p = json::parse(s); return p.ok && p.value.isObj(); };
+    std::string s = trim(raw);
+    if (s.empty()) return "{}";
+    if (isObj(s)) return s;
+    auto first = json::parse(s);
+    if (first.ok && first.value.isStr() && isObj(first.value.asStr())) return first.value.asStr();
+    size_t start = s.find('{');
+    if (start == std::string::npos) {
+        if (why) *why = first.ok ? "not a JSON object" : first.error;
+        return "";
+    }
+    std::string out;
+    int depth = 0;
+    bool inStr = false, esc = false;
+    size_t i = start;
+    for (; i < s.size(); ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') inStr = false;
+            else if (c < 0x20) {  // raw newline/tab inside a string
+                static const char* hex = "0123456789abcdef";
+                out += c == '\n' ? "\\n" : c == '\t' ? "\\t" : c == '\r' ? "\\r"
+                       : std::string("\\u00") + hex[c >> 4] + hex[c & 15];
+                continue;
+            }
+        } else if (c == '"') inStr = true;
+        else if (c == '{' || c == '[') ++depth;
+        else if ((c == '}' || c == ']') && --depth == 0) { out += (char)c; ++i; break; }
+        out += (char)c;
+    }
+    // A cut-off object is never closed by guesswork: a half-written file must
+    // not land on disk. Trailing junk is dropped only when it is not another call.
+    std::string rest = s.substr(i);
+    if (depth != 0 || inStr) { if (why) *why = "arguments were cut off"; return ""; }
+    if (rest.find('{') != std::string::npos) { if (why) *why = "several JSON objects glued together"; return ""; }
+    if (isObj(out)) return out;
+    if (why) *why = first.error.empty() ? "not a JSON object" : first.error;
+    return "";
+}
+
 json::Value buildAnthropicBody(const ChatRequest& req) {
     json::Object b;
     b["model"] = json::Value(req.model.model);
@@ -343,7 +386,7 @@ void CodexStreamAcc::feed(const json::Value& p) {
         const auto& item = p.at("item");
         std::string it = item.at("type").asStr();
         if (it == "function_call")
-            calls.push_back({item.at("call_id").asStr(), item.at("name").asStr(), item.at("arguments").asStr()});
+            calls.push_back({item.at("call_id").asStr(), item.at("name").asStr(), item.at("arguments").asStr(), ""});
         else if (it == "reasoning") items.push_back(item);
     } else if (type == "response.completed" || type == "response.incomplete") {
         done = type == "response.completed";
@@ -481,11 +524,21 @@ void OpenAiStreamAcc::feed(const json::Value& p) {
             for (const auto& tc : tcs.asArr()) {
                 long idx = streamIndex(tc.at("index"));
                 if (idx < 0 || idx >= 64) { error = "invalid tool call index"; return; }
-                if ((size_t)idx >= pend.size()) pend.resize((size_t)idx + 1);
-                Pending& pe = pend[(size_t)idx];
-                if (tc.has("id") && tc.at("id").isStr()) pe.id += tc.at("id").asStr();
+                // Streams differ: some resend id/name on every chunk, some
+                // reuse one index for parallel calls. A different id at a
+                // used index starts a new call instead of gluing JSON together.
+                const std::string& id = tc.at("id").asStr();
+                if ((size_t)idx >= slot.size()) slot.resize((size_t)idx + 1, SIZE_MAX);
+                if (slot[idx] == SIZE_MAX || (!id.empty() && !pend[slot[idx]].id.empty() && id != pend[slot[idx]].id)) {
+                    if (pend.size() >= 64) { error = "too many tool calls"; return; }
+                    slot[idx] = pend.size();
+                    pend.emplace_back();
+                }
+                Pending& pe = pend[slot[idx]];
+                if (pe.id.empty()) pe.id = id;
                 const auto& fn = tc.at("function");
-                if (fn.has("name") && fn.at("name").isStr()) pe.name += fn.at("name").asStr();
+                const std::string& name = fn.at("name").asStr();
+                if (name != pe.name) pe.name += name;
                 if (fn.has("arguments") && fn.at("arguments").isStr())
                     pe.args += fn.at("arguments").asStr();
             }
@@ -972,17 +1025,27 @@ Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks
             return Result<ChatResponse>::Err("provider output limit reached; increase model max_tokens (no tools executed)");
         if (r.value.text.empty() && r.value.calls.empty())
             return Result<ChatResponse>::Err("empty response from provider");
-        if (r.value.calls.size() > 64) return Result<ChatResponse>::Err("too many tool calls");
+        // A malformed call is answered as a failed tool result, never by
+        // ending the turn: the model re-issues it on the next round.
+        auto& calls = r.value.calls;
+        calls.erase(std::remove_if(calls.begin(), calls.end(), [](const ToolCall& c) { return trim(c.name).empty(); }),
+                    calls.end());
+        if (calls.size() > 64) calls.resize(64);
+        if (r.value.text.empty() && calls.empty()) return Result<ChatResponse>::Err("empty response from provider");
         std::vector<std::string> ids;
-        for (auto& call : r.value.calls) {
-            if (call.id.empty()) call.id = "call-" + randHex(8);  // keyless local adapters
-            if (call.name.empty() || std::find(ids.begin(), ids.end(), call.id) != ids.end())
-                return Result<ChatResponse>::Err("invalid/duplicate tool call");
+        for (auto& call : calls) {
+            call.name = trim(call.name);
+            if (call.id.empty() || std::find(ids.begin(), ids.end(), call.id) != ids.end())
+                call.id = "call-" + randHex(8);  // keyless local adapters, reused ids
             ids.push_back(call.id);
-            if (call.argsJson.empty()) call.argsJson = "{}";
-            auto args = json::parse(call.argsJson);
-            if (!args.ok || !args.value.isObj())
-                return Result<ChatResponse>::Err("invalid tool arguments (no tools executed)");
+            std::string why;
+            std::string fixed = repairToolArgs(call.argsJson, &why);
+            if (fixed.empty()) {
+                call.argsJson = "{}";
+                call.invalid = call.name + ": arguments were not usable JSON (" + why +
+                               "); nothing ran. Re-issue the call with one complete JSON object; "
+                               "split very large content across several smaller edits.";
+            } else call.argsJson = fixed;
         }
         if (r.value.replay.isObj())
             r.value.replay.asObj()["model"] = req.model.provider.name + ":" + req.model.model;
@@ -1260,6 +1323,7 @@ Result<ChatResponse> chatRequest(const ChatRequest& original, const ChatCallback
     // Learned wire quirks apply before the first attempt; a recognizable 400
     // teaches a new one and retries once per quirk. Nothing to configure.
     ChatRequest req = original;
+    if (req.thinking == "adaptive") req.thinking = "medium";  // callers without per-round state
     std::string key = req.model.provider.name + ":" + req.model.model;
     // DeepSeek always supports thinking; a stored "no_reasoning" came from its
     // reasoning-replay 400 (fixed since 0.7.2) and would only disable thinking.

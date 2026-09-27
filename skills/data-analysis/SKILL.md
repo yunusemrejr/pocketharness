@@ -42,3 +42,5 @@ Lead with the answer in one or two sentences, then the evidence: the key numbers
 - Check units, currency, timezone and date boundaries (inclusive/exclusive end).
 - Read one or two raw rows behind a surprising result.
 - If a number is too good or too bad to be true, assume a bug first.
+
+Profile a CSV/TSV before modeling with `pocket kit csv FILE`: inferred column types, missing values, numeric range/mean/std, unique counts, class balance and ragged rows.

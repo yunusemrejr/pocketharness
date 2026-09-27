@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.8.0
+
+- A malformed tool call no longer stops the turn or the goal. Arguments
+  are repaired when that is safe: code fences, a double-encoded string,
+  raw control characters inside strings, and trailing junk are handled.
+  A call that cannot be trusted, such as cut-off JSON or several objects
+  glued together, gets a failed tool result that explains how to re-issue
+  it. The model sees that result and retries; before this, the whole
+  response was rejected with "invalid tool arguments".
+- The OpenAI stream merge no longer concatenates ids or names that a
+  provider repeats in every chunk. A new id at an index that is already
+  used starts a new call. Nameless calls are dropped, missing or duplicate
+  ids are regenerated, and a response is capped at 64 calls.
+- `edit` falls back to a unique block match that ignores whitespace when
+  `old_text` differs only in indentation or trailing spaces, and
+  re-indents the replacement to match. When no match is found, the hint
+  now names the line where the first line matched but later lines
+  differed, or says that the match was ambiguous.
+- `bash` pipelines that end on exit code 141 (SIGPIPE, for example
+  `... | head`) count as success and include a note.
+- Adaptive thinking (`-t adaptive`) is the new default. Effort is chosen
+  per request:
+  - `high` for a new user message, after compaction, or after a failed
+    tool call
+  - `medium` after changes
+  - `low` for read-only steps
+  Anthropic always uses `high`.
+- Efficiency:
+  - The Jev visual judge runs only on the first change to a file in each
+    turn.
+  - Goal continuation resends the goal brief only after it has left the
+    context.
+- `kit wav` is now a polyphonic mixer:
+  - `+` joins notes into chords.
+  - `|` separates up to 16 tracks, and each track can set its own wave
+    with `saw>`.
+  - `K`, `S` and `H` are noise drum voices.
+  - The mix is peak-normalized, so the output never clips.
+- New kit tools:
+  - `ports`: listening sockets with their pid and command
+  - `wait PORT|URL`: use instead of `sleep`
+  - `net URL`: timings, redirects, and missing security headers
+  - `seo FILE|URL`: on-page SEO audit
+  - `csv FILE`: dataset profile
+  - `bench`: repeated timing with CPU and peak RSS
+  The relevant skills now point to these tools.
+
 ## 0.7.2
 
 - DeepSeek thinking mode no longer stops sessions and goals with

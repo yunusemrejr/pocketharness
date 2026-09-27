@@ -2151,7 +2151,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             "  /undo             revert the newest file change made by the agent\n"
             "  /brain            learned quirks, provider health, judges, overseer stats\n"
             "  /catalog          refresh the live model catalog now\n"
-            "  /thinking [level] auto/off/none/minimal/low/medium/high/xhigh/max\n"
+            "  /thinking [level] adaptive/auto/off/…/high/xhigh/max\n"
             "  /double [on|off]  twin first-pass analyses (2× mode), reconciled into one plan\n"
             "  /compact          summarize older context now\n"
             "  /skills [query]   list or search Markdown skills\n"
@@ -2329,10 +2329,10 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             return true;
         }
         if (!args.empty()) {
-            say("usage: /thinking auto|off|none|minimal|low|medium|high|xhigh|max\n");
+            say("usage: /thinking adaptive|auto|off|none|minimal|low|medium|high|xhigh|max\n");
             return true;
         }
-        static const std::vector<std::string> kLevels = {"auto", "off", "none", "minimal", "low", "medium", "high", "xhigh", "max"};
+        static const std::vector<std::string> kLevels = {"auto", "off", "none", "minimal", "low", "medium", "high", "xhigh", "max", "adaptive"};
         PickResult pr = pickOne("thinking — now: " + opts.thinking, kLevels, "");
         if (!pr.submitted) {
             say("(cancelled)\n");
@@ -2341,7 +2341,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         std::string f = toLower(pr.filter);
         if (!f.empty() && validThinking(f)) setLevel(f);
         else if (pr.index >= 0) setLevel(kLevels[(size_t)pr.index]);
-        else say("usage: /thinking auto|off|none|minimal|low|medium|high|xhigh|max\n");
+        else say("usage: /thinking adaptive|auto|off|none|minimal|low|medium|high|xhigh|max\n");
         return true;
     }
     if (cmd == "double") {

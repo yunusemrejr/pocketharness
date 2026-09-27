@@ -63,7 +63,7 @@ void usage() {
         "\n"
         "options:\n"
         "  -m, --model SPEC     provider:model[@routing] or alias (default: config)\n"
-        "  -t, --thinking LVL   auto|off|none|minimal|low|medium|high|xhigh|max\n"
+        "  -t, --thinking LVL   adaptive|auto|off|none|minimal|low|medium|high|xhigh|max\n"
         "  -p, --print PROMPT   non-interactive prompt (stdout = final answer)\n"
         "  -g, --goal GOAL      non-interactive goal: work + audit until verifiably met\n"
         "  --refresh-catalog    refetch every keyed provider's model list now\n"
@@ -346,7 +346,7 @@ int pocketMain(int argc, char** argv) {
     if (!thinkingCli.empty()) {
         thinkingFlag = toLower(thinkingCli);
         if (!validThinking(thinkingFlag)) {
-            fprintf(stderr, "pocket: bad --thinking (auto|off|none|minimal|low|medium|high|xhigh|max)\n");
+            fprintf(stderr, "pocket: bad --thinking (adaptive|auto|off|none|minimal|low|medium|high|xhigh|max)\n");
             return 2;
         }
     }

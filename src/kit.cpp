@@ -1,6 +1,7 @@
 // PocketHarness - `pocket kit` native superpowers.
 #include "kit.h"
 #include "kit_audio.h"
+#include "kit_ops.h"
 #include "kit_video.h"
 
 #include <sys/statvfs.h>
@@ -107,6 +108,8 @@ std::string attr(std::string_view tag, const std::string& name) {
 }
 
 }  // namespace
+
+std::string htmlAttr(std::string_view tag, const std::string& name) { return attr(tag, name); }
 
 std::string urlDecode(std::string_view s) {
     std::string o;
@@ -805,12 +808,18 @@ int kitMain(int argc, char** argv) {
         "  img FILE...            image type + dimensions (png/jpeg/gif/webp/svg)\n"
         "  svg FILE               SVG lint: structure, viewBox, ids, animation count\n"
         "  spring [k] [c] [m]     physical spring -> CSS linear() easing + duration\n"
-        "  wav OUT \"C4:.25 R:.25\"  synthesize notes to WAV (--wave, --bpm, --gain)\n"
+        "  wav OUT \"C4:.25 R:.25\"  music to WAV: chords C4+E4, tracks a|b, drums K/S/H, saw> prefix\n"
         "  audio FILE.wav         loudness, peak, clipping, pitch, silence\n"
         "  slop FILE...           placeholders, stubs, conflict markers, AI-tell prose\n"
         "  find QUERY             ranked code search (BM25 over chunks; no index to maintain)\n"
         "  sym NAME|.             definitions of NAME (\".\" = outline of every declaration)\n"
         "  refs NAME              whole-word references to NAME\n"
+        "  ports [PORT]           listening TCP sockets with owning pid + command\n"
+        "  wait PORT|URL [SEC]    block until a server accepts (instead of sleep)\n"
+        "  net URL                HTTP timing (dns/connect/tls/ttfb), redirects, headers\n"
+        "  seo FILE|URL           on-page SEO: title, meta, canonical, headings, alt, OG, JSON-LD\n"
+        "  csv FILE               dataset profile: types, missing, stats, class balance\n"
+        "  bench [-n N] 'CMD'      timing: min/median/p95 wall, CPU, peak RSS\n"
         "  probe [DIR]            host: OS, CPU, memory, disk, GPU, toolchain\n";
     // `kit SUB --help` is a question, not a failure: print that line, exit 0.
     if (!a.empty() && (a[0] == "--help" || a[0] == "-h")) {
@@ -835,6 +844,12 @@ int kitMain(int argc, char** argv) {
     if (sub == "find") return kitFind(a);
     if (sub == "sym") return kitSym(a, false);
     if (sub == "refs") return kitSym(a, true);
+    if (sub == "ports") return kitPorts(a);
+    if (sub == "wait") return kitWait(a);
+    if (sub == "net") return kitNet(a);
+    if (sub == "seo") return kitSeo(a);
+    if (sub == "csv") return kitCsv(a);
+    if (sub == "bench") return kitBench(a);
     printf("%s", kHelp);
     return sub.empty() || sub == "help" ? 0 : 2;
 }

@@ -113,8 +113,8 @@ std::string afterChange(ToolEnv& env, const std::string& path, const std::string
     // Staging a file is not a project edit; don't run paid style judges or
     // broadcast scratch paths to peer sessions for temporary working pieces.
     if (!env.sessionTmp.empty() && startsWith(path, env.sessionTmp + "/")) return "";
-    if (std::find(env.changedFiles.begin(), env.changedFiles.end(), path) == env.changedFiles.end())
-        env.changedFiles.push_back(path);
+    bool firstTouch = std::find(env.changedFiles.begin(), env.changedFiles.end(), path) == env.changedFiles.end();
+    if (firstTouch) env.changedFiles.push_back(path);
     if (!env.sessionId.empty())
         (void)sessionWorkspacePublish(env.workspace, env.sessionId, "changed", path);
     std::string out;
@@ -128,7 +128,9 @@ std::string afterChange(ToolEnv& env, const std::string& path, const std::string
     bool visual = false;
     for (const char* ext : {".html", ".css", ".jsx", ".tsx", ".vue", ".svelte", ".md", ".astro", ".scss"})
         visual = visual || endsWith(lp, ext);
-    if (visual && env.cfg && content.size() >= 300) {
+    // Once per file per turn: repeated small edits to one page cost a paid
+    // judge call each and rarely change the verdict.
+    if (visual && firstTouch && env.cfg && content.size() >= 300) {
         auto v = decide(*env.cfg, json::Object{{"file", path}, {"content", content.substr(0, 20000)}},
                         {{"generic", "Is this generic AI-template work (stock purple/blue gradients, emoji decoration, "
                                      "pulsing dots, buzzword hero copy, glassmorphism everywhere, lorem-style filler)?"},
@@ -230,6 +232,61 @@ ToolResult toolWrite(ToolEnv& env, const json::Value& args) {
     return r;
 }
 
+// Models often get indentation or trailing spaces slightly wrong. When the
+// exact text is absent, a unique whole-line match that differs only in
+// surrounding whitespace is accepted and new_text is re-indented to fit.
+struct LineSpan { size_t begin, end; };
+std::vector<LineSpan> lineSpans(const std::string& s) {
+    std::vector<LineSpan> v;
+    for (size_t b = 0; b <= s.size();) {
+        size_t e = s.find('\n', b);
+        if (e == std::string::npos) e = s.size();
+        v.push_back({b, e});
+        b = e + 1;
+    }
+    return v;
+}
+std::string indentOf(const std::string& s, LineSpan l) {
+    size_t i = l.begin;
+    while (i < l.end && (s[i] == ' ' || s[i] == '\t')) ++i;
+    return s.substr(l.begin, i - l.begin);
+}
+bool fuzzyEdit(std::string& text, const std::string& oldText, const std::string& newText, std::string* hint) {
+    auto ol = lineSpans(oldText);
+    while (!ol.empty() && trim(oldText.substr(ol.back().begin, ol.back().end - ol.back().begin)).empty()) ol.pop_back();
+    while (!ol.empty() && trim(oldText.substr(ol.front().begin, ol.front().end - ol.front().begin)).empty())
+        ol.erase(ol.begin());
+    if (ol.empty()) return false;
+    auto tl = lineSpans(text);
+    auto lineAt = [](const std::string& s, LineSpan l) { return trim(s.substr(l.begin, l.end - l.begin)); };
+    std::string first = lineAt(oldText, ol[0]);
+    long at = -1, hits = 0, near = -1;
+    for (size_t i = 0; i + ol.size() <= tl.size(); ++i) {
+        if (lineAt(text, tl[i]) != first) continue;
+        if (near < 0) near = (long)i;
+        size_t k = 1;
+        while (k < ol.size() && lineAt(text, tl[i + k]) == lineAt(oldText, ol[k])) ++k;
+        if (k == ol.size()) { at = (long)i; ++hits; }
+    }
+    if (hits != 1) {
+        if (hint && hits > 1) *hint = " Whitespace-insensitive match is ambiguous; add surrounding lines.";
+        else if (hint && near >= 0)
+            *hint = " The first line of old_text is at line " + std::to_string(near + 1) + " but later lines differ.";
+        return false;
+    }
+    // Re-indent: new_text lines carrying old_text's base indent get the file's.
+    std::string from = indentOf(oldText, ol[0]), to = indentOf(text, tl[at]);
+    std::string body;
+    for (auto l : lineSpans(newText)) {
+        std::string line = newText.substr(l.begin, l.end - l.begin);
+        if (from != to && startsWith(line, from) && !trim(line).empty()) line = to + line.substr(from.size());
+        body += line + (l.end < newText.size() ? "\n" : "");
+    }
+    size_t b = tl[at].begin, e = tl[at + ol.size() - 1].end;
+    if (endsWith(body, "\n") && endsWith(oldText, "\n")) body.pop_back();
+    text = text.substr(0, b) + body + text.substr(e);
+    return true;
+}
 ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
     const std::string& path = args.at("path").asStr();
     // Models often mix both forms (edits plus a top-level pair, or edits:[]);
@@ -243,6 +300,7 @@ ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
     auto data = boxRead(*env.auth, path, 4 << 20);
     if (!data.ok) return {false, data.error};
     std::string updated = data.value;
+    int fuzzy = 0;
     for (const auto& edit : edits) {
         const json::Value& oldV = edit.has("old_text") ? edit.at("old_text") : edit.at("old_string");
         const json::Value& newV = edit.has("new_text") ? edit.at("new_text") : edit.at("new_string");
@@ -255,9 +313,12 @@ ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
         if (oldText.empty() || !newV.isStr() || count < 1 || count > 100000 || count != std::floor(count))
             return {false, "edit: need nonempty old_text, string new_text, positive integer expected_matches"};
         long found = countOccurrences(updated, oldText);
+        std::string hint;
+        if (found == 0 && count == 1 && fuzzyEdit(updated, oldText, newText, &hint)) { ++fuzzy; continue; }
         if (found != (long)count)
             return {false, "edit: found " + std::to_string(found) + " occurrence(s), expected " +
-                    std::to_string((long)count) + "; file untouched. Read exact content first."};
+                    std::to_string((long)count) + "; file untouched." +
+                    (hint.empty() ? " Read the exact current lines first." : hint)};
         if (newText.size() > oldText.size() && newText.size() - oldText.size() >
             ((4u << 20) - updated.size()) / (size_t)found)
             return {false, "edit: result exceeds 4 MiB; file untouched"};
@@ -269,6 +330,7 @@ ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
     close(lease.fd); lease.fd = -1;
     emit(env, "edit " + path);
     return {true, "edited " + path + " (" + std::to_string(edits.size()) + " replacement step(s))" +
+                      (fuzzy ? " [" + std::to_string(fuzzy) + " matched ignoring whitespace; re-read if unsure]" : std::string()) +
                       afterChange(env, path, updated)};
 }
 
@@ -351,6 +413,12 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
         return r;
     }
     r.ok = (sr.termSig == 0 && sr.exitCode == 0);
+    // 141 = SIGPIPE under pipefail: `producer | head` closed early, which is
+    // what the command asked for, not a failure.
+    if (sr.termSig == 0 && sr.exitCode == 141 && cmd.find('|') != std::string::npos) {
+        r.ok = true;
+        out += "[note: exit 141 = a pipe reader such as head stopped early; output above is complete for it]\n";
+    }
     r.output = out;
     return r;
 }
@@ -450,7 +518,8 @@ ToolResult toolSkill(ToolEnv& env, const json::Value& args) {
         r.output = loaded.value +
                    "\n\n[harness] Tools here: read, write, edit, bash, skill. Where this skill names "
                    "another tool, use the bash equivalent (`pocket kit` covers web, search, browser "
-                   "capture, images, SVG, springs, audio and quality scans).";
+                   "capture, images, SVG, springs, music/audio, ports/wait, HTTP timing, SEO, CSV profiling, "
+                   "benchmarks and quality scans).";
         return r;
     }
     r.output = "skill: unknown action \"" + action + "\" (list|search|load)";

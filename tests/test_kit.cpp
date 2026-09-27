@@ -229,3 +229,22 @@ TEST(kit_Browser_Arguments_Are_Bounded) {
     CHECK(kitCall({"dom", "about:blank", "extra"}).code != 0);
     return "";
 }
+
+TEST(kit_Csv_Seo_And_Bench_Commands) {
+    std::string dir = "/tmp/pocket-kit-ops-" + std::to_string(getpid());
+    CHECK(ensureDir(dir, 0700).ok);
+    CHECK(atomicWriteFile(dir + "/d.csv", "id;score;label\n1;0.5;a\n2;;b\n3;1.5;a\n4;2;a\n").ok);
+    auto csv = kitCall({"csv", dir + "/d.csv"});
+    CHECK(csv.code == 0 && csv.out.find("4 rows × 3 columns (sep ';')") != std::string::npos);
+    CHECK(csv.out.find("score: float · missing 1") != std::string::npos && csv.out.find("a=3 (75%)") != std::string::npos);
+    CHECK(atomicWriteFile(dir + "/p.html", "<html><head><title>T</title></head><body><h2>x</h2><img src=a></body></html>").ok);
+    auto seo = kitCall({"seo", dir + "/p.html"});
+    CHECK(seo.code == 1 && seo.out.find("no lang") != std::string::npos && seo.out.find("0 <h1>") != std::string::npos &&
+          seo.out.find("without alt") != std::string::npos);
+    auto bench = kitCall({"bench", "-n", "2", "-w", "0", "true"});
+    CHECK(bench.code == 0 && bench.out.find("2 run(s) after 0 warmup") != std::string::npos);
+    CHECK(kitCall({"bench", "-n", "1", "exit 2"}).code == 1);
+    CHECK(kitCall({"wait", "1", "0.3"}).code == 1);
+    rmRf(dir);
+    return "";
+}

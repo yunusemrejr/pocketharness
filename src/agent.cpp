@@ -221,7 +221,7 @@ VoidResult Agent::restore(const std::string& sessionId) {
             messages_.back().replay = ev.replay;
             // New logs commit the full batch with the assistant in one record.
             for (const auto& tc : ev.replay.at("calls").asArr())
-                messages_.back().toolCalls.push_back({tc.at("id").asStr(), tc.at("name").asStr(), tc.at("args").asStr()});
+                messages_.back().toolCalls.push_back({tc.at("id").asStr(), tc.at("name").asStr(), tc.at("args").asStr(), ""});
             if (messages_.back().replay.isObj()) messages_.back().replay.asObj().erase("calls");
         } else if (ev.type == "tool_call") {
             // Attach to the owning assistant message, scanning back past
@@ -586,7 +586,7 @@ Result<ChatResponse> Agent::requestOnce() {
     req.system = system_;  // frozen prefix: byte-identical every request
     req.messages = messages_;  // results were capped once on arrival
     req.tools = toolDefs_;     // fixed schemas in fixed order
-    req.thinking = calmNext_ ? "off" : opts_.thinking;
+    req.thinking = calmNext_ ? "off" : effectiveThinking();
     calmNext_ = false;
     req.stream = true;
     req.maxTokens = completionBudget();
@@ -829,11 +829,22 @@ std::string Agent::compactNow() {
     messages_.front().replay = json::Object{{"compact_summary", r.value.text.substr(0, 24000)}};
     messages_.insert(messages_.end(), kept.begin(), kept.end());
     turnStart_ = turnStart_ >= keepFrom ? turnStart_ - keepFrom + 1 : 0;
+    thinkNow_ = "high";  // re-orient after the summary
     if (opts_.onNotice) opts_.onNotice("context compacted (" + std::to_string(keepFrom) + " messages summarized)");
     return "";
 }
 
+// "adaptive" thinking resolves per request: deep on new instructions, nudges
+// and failures, lighter while reading and checking. Anthropic wires keep one
+// level, since changing thinking settings there invalidates the message cache.
+std::string Agent::effectiveThinking() const {
+    if (opts_.thinking != "adaptive") return opts_.thinking;
+    if (opts_.model.provider.protocol == "anthropic") return "high";
+    return thinkNow_;
+}
+
 void Agent::pushUser(const std::string& text) {
+    if (!startsWith(text, "[harness]")) thinkNow_ = "high";  // new instruction or nudge
     ChatMessage um{"user", text, {}, ""};
     um.images = std::move(pendingImages_);
     pendingImages_.clear();
@@ -1402,7 +1413,7 @@ std::string Agent::runDoublePass() {
     base.system = system_;     // frozen prefix: byte-identical for both streams
     base.messages = messages_;
     base.tools = evidenceTools;
-    base.thinking = opts_.thinking;
+    base.thinking = effectiveThinking();
     base.stream = true;
     base.maxTokens = std::max(512L, std::min(completionBudget(), 2048L));
     base.sessionTag = orSessionId_;
@@ -1482,7 +1493,8 @@ std::string Agent::runDoublePass() {
                 for (size_t k = 0; k < n && s.toolCalls < kDoubleToolCalls; ++k) {
                     const auto& tc = r.value.calls[k];
                     ToolResult tr;
-                    if (tc.name == "read" || tc.name == "bash") tr = runTool(tenv, tc.name, tc.argsJson);
+                    if (!tc.invalid.empty()) tr = {false, tc.invalid};
+                    else if (tc.name == "read" || tc.name == "bash") tr = runTool(tenv, tc.name, tc.argsJson);
                     else tr = {false, tc.name + " is unavailable in a read-only evidence pass"};
                     ++s.toolCalls;
                     if (tc.name == "read") ++s.reads;
@@ -1917,10 +1929,12 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
         }
 
         std::string signature;
+        bool batchFailed = false, batchChanged = false;
         for (const auto& tc : calls) {
             bool stopped = !persistenceError_.empty() || (opts_.cancel && opts_.cancel->load());
             size_t changedBefore = opts_.tools ? opts_.tools->changedFiles.size() : 0;
             ToolResult tr = stopped ? ToolResult{false, "not executed: turn interrupted"} :
+                            !tc.invalid.empty() ? ToolResult{false, tc.invalid} :
                             opts_.tools ? runTool(*opts_.tools, tc.name, tc.argsJson) :
                                           ToolResult{false, "tools unavailable"};
             if (!stopped) stats_.toolCalls++;
@@ -1933,7 +1947,8 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
             if (tc.name == "bash" && tr.ok) unverified_ = false;
             if (opts_.tools && (opts_.tools->changedFiles.size() > changedBefore ||
                                 ((tc.name == "write" || tc.name == "edit") && tr.ok)))
-                unverified_ = true;
+                unverified_ = batchChanged = true;
+            batchFailed = batchFailed || !tr.ok;
             std::string content = tr.output;
             if (!tr.ok) content = "TOOL FAILED: " + content;
             std::string observation = trim(tr.output);
@@ -1972,6 +1987,9 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
             messages_.push_back(ChatMessage{"tool", wire, {}, tc.id});
             appendSession(SessionEvent{"tool_result", content, tc.id, tc.name, "", tr.ok});
         }
+        // Adaptive thinking: think hard after failures, check edits with
+        // moderate effort, skim through successful reading.
+        thinkNow_ = batchFailed ? "high" : batchChanged ? "medium" : "low";
         if (opts_.tools && !opts_.tools->viewImages.empty()) {
             // Tool messages can't carry pixels on every wire: attach them to a
             // short user message right after the batch. Transient by design:
@@ -2110,8 +2128,13 @@ std::string Agent::continueGoal(int maxCycles) {
     saveStats();
     auto cancelled = [&] { return opts_.cancel && opts_.cancel->load(); };
     auto continuation = [&] {
-        return "[goal resume] " + goal_ + "\nContinue from the existing conversation and current files. "
-               "Do not repeat completed work; inspect uncertain tool outcomes before retrying.\n" + goalBrief_;
+        std::string head = "[goal resume] " + goal_ + "\nContinue from the existing conversation and current files. "
+                           "Do not repeat completed work; inspect uncertain tool outcomes before retrying.\n";
+        // The brief (up to 16 KB) is resent only once compaction dropped it.
+        std::string probe = goalBrief_.substr(0, 256);
+        for (const auto& m : messages_)
+            if (!probe.empty() && m.role == "user" && m.content.find(probe) != std::string::npos) return head;
+        return head + goalBrief_;
     };
     if (!persistenceError_.empty()) return finishGoal("session persistence failed: " + persistenceError_);
     if (cancelled()) return finishGoal("cancelled");

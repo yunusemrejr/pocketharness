@@ -100,7 +100,7 @@ bool isLoopbackHttp(const std::string& u) {
 
 bool validThinking(const std::string& t) {
     return t == "auto" || t == "off" || t == "none" || t == "minimal" || t == "low" ||
-           t == "medium" || t == "high" || t == "xhigh" || t == "max";
+           t == "medium" || t == "high" || t == "xhigh" || t == "max" || t == "adaptive";
 }
 
 namespace {
@@ -154,7 +154,7 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
         if (!o.at("thinking").isStr()) return typeErr("thinking", "a string");
         std::string t = toLower(o.at("thinking").asStr());
         if (!validThinking(t))
-            return VoidResult::Err("invalid thinking level (auto/off/none/minimal/low/medium/high/xhigh/max)");
+            return VoidResult::Err("invalid thinking level (adaptive/auto/off/none/minimal/low/medium/high/xhigh/max)");
         cfg.thinking = t;
     }
     if (v.has("providers")) {

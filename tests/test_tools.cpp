@@ -335,3 +335,20 @@ TEST(tools_ReadOnly_Blocks_Mutations_Allows_Evidence) {
     CHECK(defs[0].name == "read" && defs[1].name == "bash");
     return "";
 }
+
+TEST(tools_Edit_Tolerates_Whitespace_Drift_And_Pipe_Close) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(runTool(f.env, "write", R"({"path":"w.c","content":"int f() {\n    if (x) {\n        y();\n    }\n}\n"})").ok);
+    // Indentation lost and trailing space added: still one unique block.
+    ToolResult r = runTool(f.env, "edit", R"({"path":"w.c","old_text":"if (x) {\n    y(); \n}","new_text":"if (x) {\n    z();\n}"})");
+    CHECK(r.ok && r.output.find("ignoring whitespace") != std::string::npos);
+    CHECK_EQ(readFileBounded(f.auth.workspace + "/w.c", 1000).value,
+             std::string("int f() {\n    if (x) {\n        z();\n    }\n}\n"));
+    r = runTool(f.env, "edit", R"({"path":"w.c","old_text":"if (x) {\n  q();","new_text":"no"})");
+    CHECK(!r.ok && r.output.find("at line 2") != std::string::npos);
+    // `yes | head` ends in SIGPIPE (141) under pipefail: that is success.
+    r = runTool(f.env, "bash", R"({"command":"yes | head -n 2"})");
+    CHECK(r.ok && r.output.find("exit 141") != std::string::npos);
+    return "";
+}

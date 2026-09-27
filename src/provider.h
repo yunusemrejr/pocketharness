@@ -17,6 +17,9 @@ struct ToolCall {
     std::string id;
     std::string name;
     std::string argsJson;  // raw JSON object string (may be "")
+    // Set when the model sent unusable arguments: the call is answered with
+    // this error instead of running, so one malformed call never ends a turn.
+    std::string invalid{};
 };
 
 struct ToolDef {
@@ -102,6 +105,11 @@ long retryAfterMs(const std::string& headers);  // numeric Retry-After, bounded 
 json::Value buildOpenAiBody(const ChatRequest& req);
 json::Value buildAnthropicBody(const ChatRequest& req);
 
+// Best-effort fix of model-sent tool arguments: code fences, a double-encoded
+// string, raw control characters inside strings, trailing junk. Returns a
+// JSON object text, or "" (with why) when the call cannot be trusted.
+std::string repairToolArgs(const std::string& raw, std::string* why = nullptr);
+
 // Incremental SSE event splitter: joins multiline data at blank-line boundaries.
 // Lines not starting with "data:" are ignored (event:/comments/id:).
 // Returns payloads; "[DONE]" arrives as a payload and means end-of-stream.
@@ -117,7 +125,8 @@ struct OpenAiStreamAcc {
     struct Pending {
         std::string id, name, args;
     };
-    std::vector<Pending> pend;  // indexed by "index"
+    std::vector<Pending> pend;  // arrival order
+    std::vector<size_t> slot;   // stream "index" -> pend position
     long inTokens = -1, outTokens = -1;
     long cacheHit = -1, cacheMiss = -1;
     double cost = -1;

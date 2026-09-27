@@ -84,6 +84,14 @@ int writeWav(const std::string& path, const Result<std::string>& wav, int rate) 
 }
 
 double db(double x) { return x > 0 ? 20 * std::log10(x) : -120; }
+
+std::vector<std::string> split(const std::string& s, char sep) {
+    std::vector<std::string> out(1);
+    for (char c : s)
+        if (c == sep) out.emplace_back();
+        else out.back().push_back(c);
+    return out;
+}
 }  // namespace
 
 double noteFreq(const std::string& note) {
@@ -103,50 +111,81 @@ double noteFreq(const std::string& note) {
     return 440 * std::exp2(((octave + 1) * 12 + semi - 69) / 12.0);
 }
 
+// Tracks ("|") play at once and are mixed; "C4+E4+G4" is a chord; K/S/H are
+// kick, snare and hat voices; a "saw>" prefix sets one track's waveform.
 Result<std::string> synthNotes(const std::string& notes, const std::string& wave, double bpm, double gain, int rate) {
     using R = Result<std::string>;
+    auto validWave = [](const std::string& w) { return w == "sine" || w == "square" || w == "saw" || w == "tri"; };
     if (rate < 8000 || rate > 96000 || !bounded(gain, 0, 1) || !bounded(bpm, 0, 1000))
         return R::Err("rate must be 8000..96000, gain 0..1, bpm 0..1000");
-    if (wave != "sine" && wave != "square" && wave != "saw" && wave != "tri")
-        return R::Err("wave must be sine, square, saw or tri");
+    if (!validWave(wave)) return R::Err("wave must be sine, square, saw or tri");
     if (notes.empty() || notes.size() > 65536) return R::Err("note sequence must contain 1..65536 bytes");
-    struct Event { double frequency; size_t count; };
-    std::vector<Event> events;
-    size_t total = 0;
-    for (size_t p = 0; p < notes.size();) {
-        p = notes.find_first_not_of(" ,\t\r\n", p);
-        if (p == std::string::npos) break;
-        size_t end = notes.find_first_of(" ,\t\r\n", p);
-        if (end == std::string::npos) end = notes.size();
-        const std::string event = notes.substr(p, end - p);
-        p = end;
-        const size_t colon = event.find(':');
-        const std::string note = event.substr(0, colon);
-        double duration = .25;
-        if (colon != std::string::npos && !number(event.substr(colon + 1), duration))
-            return R::Err("invalid duration in event: " + event);
-        if (bpm > 0) duration *= 60 / bpm;
-        const double freq = note == "R" || note == "r" ? 0 : noteFreq(note);
-        if (!bounded(duration, 1.0 / rate, 60) || freq < 0 || freq >= rate * .5)
-            return R::Err("invalid event (duration >=1 sample, <=60s; frequency below Nyquist): " + event);
-        const size_t count = static_cast<size_t>(std::llround(duration * rate));
-        if (events.size() >= 4096 || count > size_t(rate) * 60 - total)
-            return R::Err("note sequence exceeds 4096 events or 60 seconds");
-        events.push_back({freq, count});
-        total += count;
-    }
-    if (events.empty()) return R::Err("note sequence is empty");
-    std::string out = wavHeader(total, rate);
-    double phase = 0;
-    for (const Event& event : events) {
-        const double step = event.frequency / rate;
-        for (size_t i = 0; i < event.count; ++i) {
-            const double v = step > 0 ? oscillator(wave, phase, step) : 0;
-            sample(out, v * envelope(i, event.count, .005, .03, rate) * gain);
-            phase += step;
-            phase -= std::floor(phase);
+    const size_t cap = size_t(rate) * 60;
+    std::vector<float> mix;
+    size_t events = 0, tracks = 0;
+    for (const std::string& rawTrack : split(notes, '|')) {
+        std::string track = trim(rawTrack), tw = wave;
+        if (size_t gt = track.find('>'); gt != std::string::npos && gt < 8) {
+            tw = trim(track.substr(0, gt));
+            track = track.substr(gt + 1);
+            if (!validWave(tw)) return R::Err("track wave must be sine, square, saw or tri: " + tw);
+        }
+        if (++tracks > 16) return R::Err("at most 16 tracks");
+        size_t at = 0;
+        for (size_t p = 0; p < track.size();) {
+            p = track.find_first_not_of(" ,\t\r\n", p);
+            if (p == std::string::npos) break;
+            size_t end = track.find_first_of(" ,\t\r\n", p);
+            if (end == std::string::npos) end = track.size();
+            const std::string event = track.substr(p, end - p);
+            p = end;
+            const size_t colon = event.find(':');
+            double duration = .25;
+            if (colon != std::string::npos && !number(event.substr(colon + 1), duration))
+                return R::Err("invalid duration in event: " + event);
+            if (bpm > 0) duration *= 60 / bpm;
+            if (!bounded(duration, 1.0 / rate, 60)) return R::Err("invalid duration (>=1 sample, <=60s): " + event);
+            const size_t count = static_cast<size_t>(std::llround(duration * rate));
+            if (++events > 4096 || count > cap - std::min(cap, at))
+                return R::Err("note sequence exceeds 4096 events or 60 seconds per track");
+            if (mix.size() < at + count) mix.resize(at + count);
+            for (const std::string& note : split(event.substr(0, colon), '+')) {
+                if (note == "R" || note == "r") continue;
+                if (note == "K" || note == "S" || note == "H") {  // drums, independent of the note length
+                    uint32_t seed = 0x9e3779b9u ^ uint32_t(at);
+                    double decay = note == "K" ? .28 : note == "S" ? .16 : .05, prev = 0, phase = 0;
+                    size_t n = std::min(size_t(decay * 4 * rate), cap - at);
+                    if (mix.size() < at + n) mix.resize(at + n);
+                    for (size_t i = 0; i < n; ++i) {
+                        double t = double(i) / rate, env = std::exp(-t / decay);
+                        seed ^= seed << 13, seed ^= seed >> 17, seed ^= seed << 5;
+                        double noise = seed / 2147483648.0 - 1, v;
+                        if (note == "K") { phase += (45 + 110 * std::exp(-t * 30)) / rate; v = std::sin(2 * pi * phase); }
+                        else if (note == "S") { phase += 185.0 / rate; v = .7 * noise + .4 * std::sin(2 * pi * phase); }
+                        else { v = noise - prev; prev = noise; }  // first difference: bright hat
+                        mix[at + i] += float(v * env * gain * std::min(1.0, i / (.001 * rate)));
+                    }
+                    continue;
+                }
+                const double freq = noteFreq(note);
+                if (freq <= 0 || freq >= rate * .5) return R::Err("invalid note (C4, F#3, Bb2, Hz below Nyquist, R, K/S/H): " + event);
+                double phase = 0, step = freq / rate;
+                for (size_t i = 0; i < count; ++i) {
+                    mix[at + i] += float(oscillator(tw, phase, step) * envelope(i, count, .005, .03, rate) * gain);
+                    phase += step;
+                    phase -= std::floor(phase);
+                }
+            }
+            at += count;
         }
     }
+    if (mix.empty()) return R::Err("note sequence is empty");
+    // Chords and tracks add up: scale down instead of clipping.
+    float peak = 0;
+    for (float v : mix) peak = std::max(peak, std::fabs(v));
+    const double scale = peak > .98f ? .98 / peak : 1;
+    std::string out = wavHeader(mix.size(), rate);
+    for (float v : mix) sample(out, v * scale);
     return R::Ok(std::move(out));
 }
 
@@ -313,7 +352,7 @@ Result<AudioStats> analyzeWav(std::string_view d) {
 
 int kitWav(const std::vector<std::string>& a) {
     if (a.size() < 2 || (a.size() - 2) % 2)
-        return fail("usage: kit wav OUT.wav \"C4:.25 E4:.25 R:.25 440:.5\" [--wave sine|square|saw|tri] [--bpm 1..1000] [--gain 0..1]");
+        return fail("usage: kit wav OUT.wav \"C4+E4+G4:.5 R:.25 | saw> C2:.75 | K:.25 H S H\" [--wave sine|square|saw|tri] [--bpm 1..1000] [--gain 0..1]");
     std::string wave = "sine";
     double bpm = 0, gain = .3;
     for (size_t i = 2; i < a.size(); i += 2) {
