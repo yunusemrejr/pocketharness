@@ -4,6 +4,7 @@
 // prompt-embedded status (model, thinking, context %).
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <string>
 
@@ -53,6 +54,13 @@ size_t visibleWidth(const std::string& s);
 // Compact counts for the status line: 999, 1k, 12.4k, 200k, 1.5M.
 // Exposed for tests.
 std::string fmtK(long n);
+
+// Footer status line while a turn runs: an animated braille spinner plus
+// elapsed time ("⠋ working 12s · queued 0 · ..."), static "paused" while
+// held. Pure in (now,start) for tests; honors POCKET_NO_ANIM with a
+// static bullet. Exposed for tests.
+std::string busyLine(int64_t now, int64_t start, size_t queued, bool held,
+                     const std::string& hint);
 
 // Picker matching: indices of labels containing filter (case-insensitive;
 // empty filter matches all). Exposed for tests.

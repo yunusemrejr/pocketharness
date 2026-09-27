@@ -2,33 +2,23 @@
 
 # PocketHarness
 
-A deliberately tiny, Linux-native C/C++ coding-agent TUI harness. It feels like
-Pi when used interactively, but architecturally it is the opposite of the big
-agent frameworks: no SDKs, no runtimes, no plugins, no MCP, no orchestration
-layers, no dependency jungle — and no other languages in the box.
+A deliberately tiny, Linux-native coding-agent harness in a single C++ binary.
+It feels like Pi when used interactively — a chat TUI, slash commands,
+autonomous goals — but there is no framework underneath: no SDKs, no
+runtimes, no plugins, no MCP, no orchestration layers, no dependency jungle,
+and no other languages in the box. One competent engineer should be able to
+understand essentially the entire architecture in an afternoon.
 
-Everything a big harness spreads over dozens of extensions lives here as a
-few small native functions in the core:
-
-- **Overseer** — one supervisor instead of observer/watchmaker/council/guardian
-  stacks: expert brief before work, autonomy nudges, verification demands,
-  a review council, stop hooks, and `/goal` audits. It can never trap a turn.
-- **Judges** — cheap structured decisions: `respan/span-01` reads transcripts,
-  typesafe **Jev** reads content (both via OpenRouter's decisions API with
-  reported metered cost), a local **Qwen3.5-0.8B** (llama.cpp, started on
-  demand, niced) answers single questions for free, and a native naive-Bayes
-  classifier covers offline sessions.
-- **Native intelligence** — fuzzy search, BM25 ranking, learned provider
-  quirks and EWMA health, a code index (`kit find/sym/refs`) instead of
-  vector DBs, embeddings or LSP servers.
-- **`pocket kit`** — web, search, headless-Chrome DOM/screenshots, image/SVG
-  lint, spring easings, deterministic HTML-to-PNG/MP4, native sound effects,
-  WAV synthesis/analysis, anti-slop scans, host probe.
-- **Wisdom** — a compact doctrine in every prompt plus a retrieved book of
-  domain practice (UI, brand, backend, security, data, motion, research...).
-- **30+ providers, one catalog** — every keyed provider's live model list,
-  refreshed daily in the background, searchable in `/models`; ChatGPT
-  **Codex** login supported; total cost (models + judges) always visible.
+Conceptually it is one loop: the terminal feeds an agent, the agent calls a
+model provider, the model optionally calls tools, and Linux executes them.
+Everything else is a small native function hung on that loop — a lone
+supervisor (the overseer) instead of stacked councils, cheap structured
+judges instead of vibes, a live model catalog instead of hardcoded slugs,
+frozen session prefixes instead of re-sent context, twin first passes
+(`/double`) instead of single-shot plans, and kernel confinement instead of
+prompt-shaped safety. General-purpose work is delegated to Linux itself
+(`curl` for HTTPS, Chrome for screenshots, FFmpeg for video, llama.cpp for
+the free local judge) rather than wrapped, vendored, or plugged in.
 
 > PocketHarness intentionally delegates general-purpose functionality to Linux
 > instead of accumulating wrappers, plugins and orchestration layers.
@@ -44,9 +34,6 @@ The runtime loop stays obvious:
 ```
 terminal → agent loop → model provider → optional tool call → Linux/filesystem → result → agent loop
 ```
-
-One competent engineer should be able to understand essentially the entire
-architecture in an afternoon. The core stays native C++; optional host tools handle rendering and encoding.
 
 ## Install
 
@@ -99,12 +86,14 @@ export OPENROUTER_API_KEY=...     # also enables the Span/Jev judges
 ```
 
 Slash commands: `/models` (assign main · fast · fallback · review · subagent, fuzzy
-search over the catalog) `/model` `/goal` `/queue` `/thinking` `/compact` `/undo`
+search over the catalog) `/model` `/goal` `/queue` `/thinking` `/double` `/compact` `/undo`
 `/skills` `/session` `/sessions` `/resume` `/brain` `/catalog` `/security` `/help` `/quit`. Keys: Enter submits, Ctrl-J/Alt-Enter newline,
 Up/Down history, Esc pauses work, Ctrl-C cancels (idle empty prompt quits), Ctrl-D quits.
 Paste is bracketed (multi-line paste never submits early); the pinned bottom
 bar shows the input box, full provider/model/thinking, combined metered cost,
-and context/tok-s/cache KPIs, with the full session ID above them. The composer
+and context/tok-s/cache KPIs, with the full session ID above them. While a
+turn runs, the status line shows a live spinner with elapsed time, so a
+silent model or a long tool never looks frozen. The composer
 stays live during generation: Enter queues a message visibly. Work yields after
 the current tool batch so follow-ups take effect before another model request.
 Esc stops the current work and holds the queue until a new follow-up or
@@ -208,6 +197,28 @@ Catalog estimates are marked `~`; unavailable billing data is marked
 `+ unreported` rather than silently presented as an exact total. Provider billing
 statements remain authoritative. Child receipts are informational data in scratch,
 not an accounting or security boundary.
+
+## Double mode
+
+`/double` toggles a second opinion for direct turns. With Double on, each
+turn opens with two concurrent first-pass analyses — instance A plans
+directly, instance B stress-tests — both from the same model, provider, and
+configuration over the same session context, then reconciles them into one
+unified plan that seeds the normal single-stream loop:
+
+```
+independent A ─┐
+               ├─ compare → reconcile → one plan → normal turn → one answer
+independent B ─┘
+```
+
+The first passes propose tool actions in text but never execute: every state
+change still happens exactly once, in the main loop. If one stream fails, the
+turn continues with the survivor; if both fail, it continues as a plain
+single turn. Token, request, and cost accounting cover every stream, and
+`/session` counts double passes. Goal work already plans via brief and audit,
+so goals stay single-stream. The toggle persists in the session until
+changed; the prompt shows `·2×` while it is on.
 
 ## The five tools
 

@@ -1,6 +1,7 @@
 // PocketHarness tests - agent prompt stability, frozen prefix, resume.
 #include "mini.h"
 
+#include <mutex>
 #include <stdexcept>
 
 #include "../src/agent.h"
@@ -1613,5 +1614,333 @@ TEST(agent_Decision_Transcript_Bounds_Json_Escaped_Anchors_And_Answer) {
     CHECK(agent.runTurn("ORIGINAL_HEAD " + std::string(6000, '\2') + " ORIGINAL_TAIL").empty());
     CHECK(agent.runTurn("LATEST_HEAD " + std::string(6000, '\"') + " LATEST_TAIL").empty());
     CHECK(decisions == 2 && bounded && finalEndsSeen && anchorsSeen);
+    return "";
+}
+
+// --- Double mode (/double): two-stream first pass + reconcile ---
+
+namespace {
+bool isDoubleA(const ChatRequest& req) {
+    return !req.messages.empty() &&
+           req.messages.back().content.find("You are instance A of two") != std::string::npos;
+}
+bool isDoubleB(const ChatRequest& req) {
+    return !req.messages.empty() &&
+           req.messages.back().content.find("You are instance B of two") != std::string::npos;
+}
+bool isDoubleReconcile(const ChatRequest& req) {
+    return req.messages.size() == 1 &&
+           startsWith(req.messages[0].content, "Instance A analysis:");
+}
+struct DoubleProbe {
+    std::mutex mu;
+    std::vector<ChatRequest> dualA, dualB, reconciles, mains;
+    std::string failA, failB, failReconcile;
+    bool streamCalls = false;  // dual responses carry tool calls (must be ignored)
+};
+Result<ChatResponse> doubleMock(DoubleProbe& p, const ChatRequest& req, const ChatCallbacks& cb) {
+    auto usage = [&](ChatResponse& r, long in, long out, double cost) {
+        r.inTokens = in;
+        r.outTokens = out;
+        r.cost = cost;
+        if (cb.onUsage) cb.onUsage(r);
+    };
+    if (isDoubleA(req) || isDoubleB(req)) {
+        bool a = isDoubleA(req);
+        {
+            std::lock_guard<std::mutex> lk(p.mu);
+            (a ? p.dualA : p.dualB).push_back(req);
+        }
+        const std::string& fail = a ? p.failA : p.failB;
+        if (!fail.empty()) return Result<ChatResponse>::Err(fail);
+        std::string text =
+            a ? "ANALYSIS-A understanding plan risks assumptions" : "ANALYSIS-B skeptical alternative risks";
+        if (cb.onToken) cb.onToken(text);
+        ChatResponse r;
+        r.text = text;
+        if (p.streamCalls) r.calls = {{a ? "ax" : "bx", "bash", "{}"}};
+        usage(r, 100, 20, 0.001);
+        return Result<ChatResponse>::Ok(r);
+    }
+    if (isDoubleReconcile(req)) {
+        std::lock_guard<std::mutex> lk(p.mu);
+        p.reconciles.push_back(req);
+        if (!p.failReconcile.empty()) return Result<ChatResponse>::Err(p.failReconcile);
+        if (cb.onToken) cb.onToken("UNIFIED-BRIEF plan actions risks");
+        ChatResponse r;
+        r.text = "UNIFIED-BRIEF plan actions risks";
+        usage(r, 200, 30, 0.002);
+        return Result<ChatResponse>::Ok(r);
+    }
+    size_t n;
+    {
+        std::lock_guard<std::mutex> lk(p.mu);
+        p.mains.push_back(req);
+        n = p.mains.size();
+    }
+    ChatResponse r;
+    if (n == 1) {
+        r.calls = {{"m1", "read", "{}"}};  // main-loop tools still run under double
+    } else {
+        r.text = "FINAL-ANSWER";
+        if (cb.onToken) cb.onToken(r.text);
+    }
+    usage(r, 150, 10, 0.001);
+    return Result<ChatResponse>::Ok(r);
+}
+bool historyHas(const Agent& agent, const std::string& role, const std::string& needle) {
+    for (const auto& m : agent.messages())
+        if (m.role == role && m.content.find(needle) != std::string::npos) return true;
+    return false;
+}
+bool historyCallHas(const Agent& agent, const std::string& id) {
+    for (const auto& m : agent.messages())
+        for (const auto& tc : m.toolCalls)
+            if (tc.id == id) return true;
+    return false;
+}
+}  // namespace
+
+TEST(agent_Double_Two_Streams_Reconcile_Into_One_Brief) {
+    std::string home = makeTempDir("pocket-double");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    DoubleProbe probe;
+    probe.streamCalls = true;  // dual calls must never reach the tool loop
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    std::vector<std::string> notices;
+    opts.onNotice = [&](const std::string& n) { notices.push_back(n); };
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks& cb) { return doubleMock(probe, req, cb); };
+    Agent agent(opts);
+    CHECK(agent.setDouble(true).empty());
+    CHECK(agent.doubleEnabled());
+    CHECK(agent.runTurn("fix the bug").empty());
+    CHECK_EQ(probe.dualA.size(), (size_t)1);
+    CHECK_EQ(probe.dualB.size(), (size_t)1);
+    CHECK_EQ(probe.reconciles.size(), (size_t)1);
+    CHECK_EQ(probe.mains.size(), (size_t)2);
+    // Same model, provider, and config on both streams: never substituted.
+    CHECK_EQ(probe.dualA[0].model.spec, opts.model.spec);
+    CHECK_EQ(probe.dualB[0].model.spec, opts.model.spec);
+    CHECK_EQ(probe.dualA[0].model.provider.name, opts.model.provider.name);
+    CHECK_EQ(probe.dualB[0].model.provider.name, opts.model.provider.name);
+    CHECK_EQ(probe.dualA[0].thinking, std::string("off"));
+    CHECK_EQ(probe.dualB[0].thinking, std::string("off"));
+    CHECK_EQ(probe.reconciles[0].model.spec, opts.model.spec);
+    // Proposals only: no tools offered to the first pass, full tools after.
+    CHECK(probe.dualA[0].tools.empty() && probe.dualB[0].tools.empty());
+    CHECK(!probe.mains[0].tools.empty());
+    // Independence: identical shared prefix, divergent tails, no cross-feed.
+    CHECK_EQ(probe.dualA[0].system, probe.dualB[0].system);
+    CHECK_EQ(probe.dualA[0].messages.size(), probe.dualB[0].messages.size());
+    for (size_t i = 0; i + 1 < probe.dualA[0].messages.size(); ++i) {
+        CHECK_EQ(probe.dualA[0].messages[i].role, probe.dualB[0].messages[i].role);
+        CHECK_EQ(probe.dualA[0].messages[i].content, probe.dualB[0].messages[i].content);
+    }
+    CHECK(probe.dualA[0].messages.back().content != probe.dualB[0].messages.back().content);
+    std::string wireB = json::stringify(buildOpenAiBody(probe.dualB[0]));
+    CHECK(wireB.find("ANALYSIS-A") == std::string::npos);
+    // One authoritative result: the brief seeds history, the turn answers once.
+    CHECK(historyHas(agent, "user", "[double] Unified plan"));
+    CHECK(historyHas(agent, "user", "UNIFIED-BRIEF"));
+    CHECK(historyHas(agent, "assistant", "FINAL-ANSWER"));
+    CHECK_EQ(agent.stats().turns, 1);
+    // The dual tool calls never executed: only the main-loop call counted.
+    CHECK_EQ(agent.stats().toolCalls, 1);
+    CHECK(!historyCallHas(agent, "ax") && !historyCallHas(agent, "bx"));
+    CHECK(historyCallHas(agent, "m1"));
+    // Exact accounting across both streams plus reconcile plus main loop.
+    CHECK_EQ(agent.stats().doubles, 1);
+    CHECK_EQ(agent.stats().inTokens, 700L);
+    CHECK_EQ(agent.stats().outTokens, 90L);
+    CHECK(agent.stats().costSeen && agent.stats().cost > 0.005 && agent.stats().cost < 0.007);
+    std::string notes;
+    for (const auto& n : notices) notes += n + "\n";
+    CHECK(notes.find("Double: 2×") != std::string::npos);
+    CHECK(notes.find("Double A + B ready") != std::string::npos);
+    CHECK(notes.find("reconciling into one plan") != std::string::npos);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Double_Survivor_Continues_Without_Reconcile) {
+    std::string home = makeTempDir("pocket-double-surv");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    DoubleProbe probe;
+    probe.failB = "HTTP 503 blown";
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    std::vector<std::string> notices;
+    opts.onNotice = [&](const std::string& n) { notices.push_back(n); };
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks& cb) { return doubleMock(probe, req, cb); };
+    Agent agent(opts);
+    CHECK(agent.setDouble(true).empty());
+    CHECK(agent.runTurn("fix the bug").empty());
+    CHECK_EQ(probe.dualA.size(), (size_t)1);
+    CHECK_EQ(probe.dualB.size(), (size_t)1);
+    CHECK(probe.reconciles.empty());  // no reconcile call for a lone survivor
+    CHECK(historyHas(agent, "user", "[double] Plan from a single analysis"));
+    CHECK(historyHas(agent, "user", "ANALYSIS-A"));
+    CHECK(historyHas(agent, "assistant", "FINAL-ANSWER"));
+    std::string notes;
+    for (const auto& n : notices) notes += n + "\n";
+    CHECK(notes.find("continuing with A alone") != std::string::npos);
+    CHECK_EQ(agent.stats().doubles, 1);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Double_Both_Fail_Falls_Back_To_Single) {
+    std::string home = makeTempDir("pocket-double-fail");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    DoubleProbe probe;
+    probe.failA = "boom";
+    probe.failB = "bust";
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    std::vector<std::string> notices;
+    opts.onNotice = [&](const std::string& n) { notices.push_back(n); };
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks& cb) { return doubleMock(probe, req, cb); };
+    Agent agent(opts);
+    CHECK(agent.setDouble(true).empty());
+    CHECK(agent.runTurn("fix the bug").empty());
+    CHECK(probe.reconciles.empty());
+    CHECK(!historyHas(agent, "user", "[double]"));  // no brief, plain single turn
+    CHECK(historyHas(agent, "assistant", "FINAL-ANSWER"));
+    std::string notes;
+    for (const auto& n : notices) notes += n + "\n";
+    CHECK(notes.find("continuing as a single stream") != std::string::npos);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Double_Reconcile_Failure_Uses_Fuller_Analysis) {
+    std::string home = makeTempDir("pocket-double-rec");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    DoubleProbe probe;
+    probe.failReconcile = "HTTP 429 limited";
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    std::vector<std::string> notices;
+    opts.onNotice = [&](const std::string& n) { notices.push_back(n); };
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks& cb) { return doubleMock(probe, req, cb); };
+    Agent agent(opts);
+    CHECK(agent.setDouble(true).empty());
+    CHECK(agent.runTurn("fix the bug").empty());
+    CHECK_EQ(probe.reconciles.size(), (size_t)1);
+    CHECK(historyHas(agent, "user", "[double] Plan from one Double analysis"));
+    CHECK(historyHas(agent, "user", "ANALYSIS-A"));  // the longer mock analysis wins
+    CHECK(historyHas(agent, "assistant", "FINAL-ANSWER"));
+    std::string notes;
+    for (const auto& n : notices) notes += n + "\n";
+    CHECK(notes.find("using the fuller analysis") != std::string::npos);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Double_Cancel_Abandons_Pass) {
+    std::string home = makeTempDir("pocket-double-cancel");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    DoubleProbe probe;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    std::atomic<bool> cancel{true};  // pre-cancelled: the pass never starts
+    opts.cancel = &cancel;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks& cb) { return doubleMock(probe, req, cb); };
+    Agent agent(opts);
+    CHECK(agent.setDouble(true).empty());
+    CHECK_EQ(agent.runTurn("fix the bug"), std::string("cancelled"));
+    CHECK_EQ(agent.stats().doubles, 0);
+    CHECK(probe.dualA.empty() && probe.dualB.empty());
+    // A stray "cancelled" string with a clear atomic is an ordinary failure.
+    cancel.store(false);
+    DoubleProbe probe2;
+    probe2.failB = "cancelled";
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks& cb) { return doubleMock(probe2, req, cb); };
+    Agent agent2(opts);
+    CHECK(agent2.setDouble(true).empty());
+    CHECK(agent2.runTurn("fix the bug").empty());
+    CHECK(historyHas(agent2, "user", "ANALYSIS-A"));
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Double_Toggle_Persists_Across_Resume) {
+    std::string home = makeTempDir("pocket-double-meta");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    Agent a1(opts);
+    CHECK(!a1.doubleEnabled());
+    CHECK(a1.setDouble(true).empty());
+    CHECK(sessionLoadMeta(id.value).value.doubleEnabled);
+    Agent a2(opts);
+    CHECK(a2.restore(id.value).ok);
+    CHECK(a2.doubleEnabled());
+    CHECK(a2.setDouble(false).empty());
+    Agent a3(opts);
+    CHECK(a3.restore(id.value).ok);
+    CHECK(!a3.doubleEnabled());
+    CHECK(!sessionLoadMeta(id.value).value.doubleEnabled);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Double_Skipped_For_Goal_Turns) {
+    std::string home = makeTempDir("pocket-double-goal");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    int duals = 0, work = 0;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (!req.messages.empty() && req.messages.back().content.find("You are instance") != std::string::npos) {
+            ++duals;
+            r.text = "unexpected twin";
+            return Result<ChatResponse>::Ok(r);
+        }
+        if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish it";
+        else if (req.system.find("audit") != std::string::npos) r.text = "DONE";
+        else {
+            ++work;
+            r.text = "Completed and verified.";
+        }
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    CHECK(agent.setDouble(true).empty());
+    CHECK(agent.runGoal("finish it").empty());
+    CHECK(agent.goalStatus() == GoalStatus::Completed);
+    CHECK(work > 0 && duals == 0);
+    CHECK_EQ(agent.stats().doubles, 0);
+    rmRf(home);
     return "";
 }

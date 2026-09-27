@@ -326,6 +326,75 @@ TEST(tui_Escape_Holds_Queue_And_Preserves_Draft) {
     return "";
 }
 
+TEST(tui_Working_Footer_Shows_Liveness_And_Elapsed) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("first\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    CHECK(t.waitFor("working · queued 0"));  // static bullet under POCKET_NO_ANIM
+    CHECK(t.waitFor("working 1s", 4000));    // elapsed ticks while gated
+    t.finishFirst();
+    CHECK(t.waitFor("REPLY:\"first\""));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Double_Toggle_Status_And_Usage) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("/double\r"));
+    CHECK(t.waitFor("Double mode: ON"));
+    CHECK(t.waitFor("2× "));
+    CHECK(t.send("/double status\r"));
+    CHECK(t.waitFor("Double mode: ON"));
+    CHECK(t.send("/session\r"));
+    CHECK(t.waitFor("double: ON (2×)"));
+    CHECK(t.send("/double off\r"));
+    CHECK(t.waitFor("Double mode: OFF"));
+    CHECK(t.send("/double bogus\r"));
+    CHECK(t.waitFor("usage: /double"));
+    CHECK(t.send("/double\r"));
+    CHECK(t.waitFor("Double mode: ON"));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Double_Turn_Shows_States_And_Unified_Reply) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("/double\r"));
+    CHECK(t.waitFor("Double mode: ON"));
+    CHECK(t.send("hi\r"));
+    CHECK(t.waitFor("◆ pocket 2×"));
+    CHECK(t.waitFor("Double: 2×"));
+    CHECK(t.waitFor("Double A + B ready"));
+    CHECK(t.waitFor("reconciling into one plan"));
+    CHECK(t.waitFor("REPLY:"));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Cancelled_Turn_Does_Not_Hold_Next_Goal_Turn) {
+    TuiFixture t;
+    CHECK(t.ready());
+    CHECK(t.send("first\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    CHECK(t.send("\033"));
+    CHECK(t.waitFor("(paused;"));
+    size_t mark = t.output.size();
+    // A /goal turn (unlike plain input) does not pass the idle-loop release,
+    // so a stale hold would mislabel its whole footer "paused".
+    CHECK(t.send("/goal hold\r"));
+    CHECK(t.waitFor("GOAL_RUNNING"));
+    std::string tail = t.output.substr(mark);
+    CHECK(tail.find("working · queued 0") != std::string::npos);
+    CHECK(tail.find("paused") == std::string::npos);
+    t.finishFirst();
+    CHECK(t.waitFor("goal met"));
+    CHECK(t.quit());
+    return "";
+}
+
 TEST(tui_Busy_Paste_Decoder_Survives_Turn_End) {
     TuiFixture t;
     CHECK(t.ready());
@@ -883,6 +952,27 @@ TEST(tui_FmtK) {
     CHECK(fmtK(200000) == "200k");
     CHECK(fmtK(1500000) == "1.5M");
     CHECK(fmtK(-5) == "0");
+    CHECK(fmtK(999949) == "999.9k");
+    CHECK(fmtK(999950) == "1.0M");  // %.1f would print "1000.0k"
+    CHECK(fmtK(999999) == "1.0M");
+    return "";
+}
+
+TEST(tui_BusyLine) {
+    unsetenv("POCKET_NO_ANIM");
+    CHECK(busyLine(1000, 0, 2, true, "Enter queue · Esc pause") ==
+          "paused · queued 2 · Enter queue · Esc pause");
+    CHECK(busyLine(0, 0, 0, false, "Enter queue · Esc pause") ==
+          "⠋ working · queued 0 · Enter queue · Esc pause");
+    CHECK(busyLine(150, 0, 0, false, "h") == "⠙ working · queued 0 · h");
+    CHECK(busyLine(1000, 0, 0, false, "h") == "⠋ working 1s · queued 0 · h");
+    CHECK(busyLine(12500, 500, 3, false, "approval: y/N") ==
+          "⠋ working 12s · queued 3 · approval: y/N");
+    CHECK(busyLine(0, 5000, 0, false, "h") == "⠋ working · queued 0 · h");
+    setenv("POCKET_NO_ANIM", "1", 1);
+    CHECK(busyLine(150, 0, 0, false, "h") == "• working · queued 0 · h");
+    CHECK(busyLine(2000, 0, 0, false, "h") == "• working 2s · queued 0 · h");
+    unsetenv("POCKET_NO_ANIM");
     return "";
 }
 

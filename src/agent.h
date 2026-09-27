@@ -128,6 +128,7 @@ struct AgentStats {
     bool costIncomplete = false; // some metered attempts could not be priced
     int nudges = 0, reviews = 0, fallbacks = 0, deduped = 0;
     long childSessions = 0;
+    int doubles = 0;  // /double dual-analysis passes executed
 };
 
 inline constexpr size_t kCacheWindow = 20;
@@ -178,6 +179,12 @@ class Agent {
         stats_.lastPrompt = -1;
         lastEstimate_ = 0;
     }
+    // Double mode (/double): each direct turn opens with two concurrent
+    // independent first-pass analyses by the current model, reconciled into
+    // one unified plan that seeds the normal single-stream loop. Persists in
+    // the session sidecar; error text or "".
+    std::string setDouble(bool on);
+    bool doubleEnabled() const { return double_; }
     void setCallbacks(std::function<void(std::string_view)> tok,
                       std::function<void(const std::string&)> notice,
                       std::function<void(std::string_view)> reasoning = {}) {
@@ -202,6 +209,10 @@ class Agent {
 
   private:
     std::string runTurnImpl(const std::string& userText, bool continuation = false);
+    // Two-stream first pass + reconcile; pushes the unified brief as a
+    // harness user message. "" on success (including graceful degradation
+    // to a single stream), "cancelled", or a persistence error.
+    std::string runDoublePass();
     void recordOutcome(const std::string& scope, const std::string& reason, const std::string& detail);
     Result<ChatResponse> requestOnce();
     Result<ChatResponse> sideRequest(const ResolvedModel& m, const std::string& system,
@@ -243,6 +254,7 @@ class Agent {
     std::function<bool()> goalYield_;
     bool goalYielded_ = false;
     std::string turnStopReason_;
+    bool double_ = false;
     std::string lastStopReason_, lastStopDetail_;
     int64_t lastStoppedAtMs_ = 0;
     long compactAttemptTokens_ = -1;

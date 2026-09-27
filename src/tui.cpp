@@ -245,7 +245,7 @@ std::string gotoRc(int r, int c = 1) {
 }
 
 const char* kCommands[] = {"/models", "/model", "/goal", "/queue", "/thinking", "/compact", "/undo", "/skills",
-                            "/session", "/brain", "/catalog", "/security", "/help", "/quit", nullptr};
+                            "/session", "/brain", "/catalog", "/security", "/double", "/help", "/quit", nullptr};
 
 struct Editor {
     std::vector<std::string> lines{""};
@@ -864,10 +864,30 @@ TuiInputLayout layoutTuiInput(const std::vector<std::string>& lines, size_t row,
     return out;
 }
 
+std::string busyLine(int64_t now, int64_t start, size_t queued, bool held,
+                     const std::string& hint) {
+    std::string q = "queued " + std::to_string(queued);
+    if (held) return "paused · " + q + " · " + hint;
+    int64_t el = now - start;
+    if (el < 0) el = 0;
+    std::string frame;
+    if (getenv("POCKET_NO_ANIM")) {
+        frame = "•";  // motion off: the bullet + elapsed still show liveness
+    } else {
+        static const char* kSpin[] = {"⠋", "⠙", "⠹", "⠸", "⠼",
+                                      "⠴", "⠦", "⠧", "⠇", "⠏"};
+        frame = kSpin[(size_t)((el / 100) % 10)];
+    }
+    std::string out = frame + " working";
+    if (el >= 1000) out += " " + std::to_string(el / 1000) + "s";
+    return out + " · " + q + " · " + hint;
+}
+
 std::string fmtK(long n) {
     if (n < 0) n = 0;
     if (n < 1000) return std::to_string(n);
     if (n < 1000000) {
+        if (n >= 999950) return "1.0M";  // %.1f would print "1000.0k"
         if (n % 1000 == 0) return std::to_string(n / 1000) + "k";
         char b[32];
         snprintf(b, sizeof(b), "%.1fk", n / 1000.0);
@@ -1210,6 +1230,7 @@ std::string promptFor(TuiOpts& opts, Agent& agent) {
     std::string p = std::string(col(C_BOLD)) + "pocket" + col(C_RESET) + col(C_DIM) + " [" +
                     sanitizeTerminal(shortModel(opts.model.spec)) + "·" +
                     sanitizeTerminal(opts.thinking) + "·" + std::to_string(pct) + "%" +
+                    (agent.doubleEnabled() ? "·2×" : "") +
                     (opts.unsafe ? "·UNSAFE" : "") + (opts.allowNet ? "·NET" : "") + "] " +
                     sanitizeTerminal(baseName(opts.workspace)) +
                     (opts.sessionId.empty() ? "" : " · session " + sanitizeTerminal(opts.sessionId)) + "> " + col(C_RESET);
@@ -1518,6 +1539,10 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
     };
     Editor& ed = *bar->ed;
     StreamRenderer rend;
+    // A held flag with nothing held is stale (Esc on an empty queue): drop
+    // it so this turn's footer reports "working", not "paused". A held
+    // non-empty queue is real and stays held.
+    if (queue.messages.empty()) queue.held = false;
     bool finished = false, interrupted = false, approvalPending = false;
     bool clearRequested = false, pauseRequested = false;
     std::atomic<bool> queuedReady{!queue.held && !queue.messages.empty()};
@@ -1526,15 +1551,16 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
     std::string goalStatus = goalDescription(agent);
     if (goal || resume) goalStatus = "goal: active · " + (resume ? agent.goal() : input) + "\n";
     auto originalKpi = bar->kpi;
+    int64_t turnStart = nowMs();
     bar->kpi = [&](int) {
-        return status + "\n" + (queue.held ? "paused" : "working") + " · queued " + std::to_string(queue.messages.size()) +
-               (approvalPending ? " · approval: y/N" : queue.picker ? " · picker waiting · Esc pause" : " · Enter queue · Esc pause");
+        std::string hint = approvalPending ? "approval: y/N" : queue.picker ? "picker waiting · Esc pause" : "Enter queue · Esc pause";
+        return status + "\n" + busyLine(nowMs(), turnStart, queue.messages.size(), queue.held, hint);
     };
     bar->fixedInputH = 3;
     bar->fixedFooterH = (int)bar->statusRows().size();
     bar->draw();
     bar->toTranscript();
-    writeAll(STDOUT_FILENO, col("\033[38;5;37m") + std::string(goal || resume ? "◎ goal" : "◆ pocket") + col(C_RESET) + "\n");
+    writeAll(STDOUT_FILENO, col("\033[38;5;37m") + std::string(goal || resume ? "◎ goal" : agent.doubleEnabled() ? "◆ pocket 2×" : "◆ pocket") + col(C_RESET) + "\n");
     if (bar->active) writeAll(STDOUT_FILENO, "\0337");
     bar->draw();
     auto draw = [&] {
@@ -1625,6 +1651,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
     });
     bool thinkingHead = false;
     std::optional<Event> waitingApproval;
+    int64_t lastSpin = 0;
     auto pump = [&] {
         if (!approvalPending && queue.expirePickerEscape(interrupt)) draw();
         std::deque<Event> batch;
@@ -1663,7 +1690,14 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
             waitingApproval.reset();
             draw();
         }
-        if (!batch.empty()) draw();
+        // Redraw periodically even with no events so the footer spinner and
+        // elapsed time advance while the model or a tool is silently busy.
+        // Unpinned terminals have no footer: spare them the extra redraws.
+        int64_t now = nowMs();
+        if (!batch.empty() || (bar->active && now - lastSpin >= 120)) {
+            lastSpin = now;
+            draw();
+        }
         return !finished;
     };
     EditControl control;
@@ -2080,6 +2114,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             "  /brain            learned quirks, provider health, judges, overseer stats\n"
             "  /catalog          refresh the live model catalog now\n"
             "  /thinking [level] auto/off/none/minimal/low/medium/high/xhigh/max\n"
+            "  /double [on|off]  two independent first passes, reconciled into one plan\n"
             "  /compact          summarize older context now\n"
             "  /skills [query]   list or search Markdown skills\n"
             "  /session          show session info and token usage\n"
@@ -2271,6 +2306,19 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         else say("usage: /thinking auto|off|none|minimal|low|medium|high|xhigh|max\n");
         return true;
     }
+    if (cmd == "double") {
+        std::string a = toLower(args);
+        bool on;
+        if (a.empty()) on = !agent.doubleEnabled();
+        else if (a == "on") on = true;
+        else if (a == "off") on = false;
+        else if (a == "status") on = agent.doubleEnabled();
+        else { say("usage: /double [on|off|status]\n"); return true; }
+        std::string err = agent.setDouble(on);
+        if (!err.empty()) { say("error: " + err + "\n"); return true; }
+        say(std::string("Double mode: ") + (on ? "ON\n2× " + opts.model.spec + "\n" : "OFF\n"));
+        return true;
+    }
     if (cmd == "compact") {
         InputGate gate(g_approval ? g_approval->in : nullptr);
         std::string err = agent.compactNow();
@@ -2296,7 +2344,8 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             opts.workspace + "\n" + "messages: " +
             std::to_string(agent.messageCount()) + " · turns: " + std::to_string(st.turns) +
             " · tool calls: " + std::to_string(st.toolCalls) +
-            " · compactions: " + std::to_string(st.compactions) + "\n" + "context: ~" +
+            " · compactions: " + std::to_string(st.compactions) +
+            " · double passes: " + std::to_string(st.doubles) + "\n" + "context: ~" +
             std::to_string(agent.contextUsed()) + " / " + std::to_string(agent.contextMax()) +
             " tokens" + " · usage in/out: " + std::to_string(st.inTokens) + "/" +
             std::to_string(st.outTokens) + "\n");
@@ -2305,7 +2354,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             say("last stop: " + meta.value.lastStopReason +
                 (meta.value.lastStopDetail.empty() ? "" : " · " + meta.value.lastStopDetail) + "\n");
         say("provider: " + opts.model.provider.name + " · model: " + opts.model.model +
-            " · thinking: " + opts.thinking + "\n");
+            " · thinking: " + opts.thinking + (agent.doubleEnabled() ? " · double: ON (2×)" : " · double: off") + "\n");
         say("gen: " + tpsText(st) + " avg · child sessions: " + std::to_string(st.childSessions) + "\n");
         for (const auto& peer : sessionList(30, opts.workspace))
             if (peer.active && peer.id != opts.sessionId)

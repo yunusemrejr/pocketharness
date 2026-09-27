@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.0
+
+- Add Double mode (`/double`, `/double on|off|status`): each direct turn
+  opens with two concurrent independent first-pass analyses by the current
+  model — same provider and configuration, same session context — reconciled
+  by one bounded call into a single unified plan that seeds the normal
+  single-stream loop. First passes propose tool actions in text but never
+  execute; every state change still happens exactly once. A failed stream
+  degrades to its survivor, or to a plain single turn when both fail.
+  Token, request, cost, and cache accounting cover every stream; `/session`
+  counts double passes. Goals stay single-stream. The toggle persists per
+  session; the prompt shows `·2×` while on.
+- Show a live spinner with elapsed time in the TUI status line while a turn
+  runs, so silent models and long tools never look frozen. Honors
+  `POCKET_NO_ANIM` with a static bullet.
+- Clear a stale held-queue flag when a turn starts with nothing queued, so a
+  cancelled turn no longer mislabels the next goal turn's footer "paused".
+- Fix `fmtK` printing "1000.0k" at 999,950+ tokens; it now rolls to "1.0M".
+
 ## 0.5.5
 
 - The recursive-rm guard now judges each `rm` invocation by its own flags

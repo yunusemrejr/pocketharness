@@ -69,6 +69,7 @@ TEST(session_Meta_Roundtrip) {
     m.costIncomplete = true;
     m.genTokens = 28;
     m.rolesSet = true;
+    m.doubleEnabled = true;
     m.roles["decision"] = "local:jev";
     CHECK(sessionSaveMeta(id.value, m).ok);
     auto back = sessionLoadMeta(id.value);
@@ -85,6 +86,7 @@ TEST(session_Meta_Roundtrip) {
     CHECK_EQ(back.value.sideCost, 0.125);
     CHECK_EQ(back.value.childSessions, 2L);
     CHECK(back.value.costEstimated && back.value.rolesSet);
+    CHECK(back.value.doubleEnabled);
     CHECK(back.value.costIncomplete);
     CHECK_EQ(back.value.genTokens, 28L);
     CHECK_EQ(back.value.roles.at("decision"), std::string("local:jev"));
