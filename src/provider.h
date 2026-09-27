@@ -65,6 +65,7 @@ struct ChatResponse {
     long cacheHit = -1;   // cached/reused input tokens
     long cacheMiss = -1;  // uncached input tokens (DeepSeek prompt_cache_miss)
     double cost = -1;     // reported request cost, if any (OpenRouter)
+    std::string servedModel;  // actual model id the provider reports ("" = unreported)
     json::Value replay{};
     std::string error, stopReason;
 };
@@ -114,6 +115,7 @@ struct OpenAiStreamAcc {
     long inTokens = -1, outTokens = -1;
     long cacheHit = -1, cacheMiss = -1;
     double cost = -1;
+    std::string model;  // first reported chunk model id ("" = unreported)
     void feed(const json::Value& payload);
     ChatResponse finish();
 };
@@ -132,6 +134,7 @@ struct AnthropicStreamAcc {
     long inTokens = -1, outTokens = -1;
     long cacheHit = -1, cacheMiss = -1;
     double cost = -1;
+    std::string model;  // message_start model id ("" = unreported)
     void feed(const json::Value& payload);
     ChatResponse finish();
 };
@@ -145,6 +148,7 @@ struct CodexStreamAcc {
     json::Array items;  // reasoning items for replay
     long inTokens = -1, outTokens = -1, cacheHit = -1, cacheMiss = -1;
     double cost = -1;
+    std::string model;  // completed-response model id ("" = unreported)
     void feed(const json::Value& payload);
     ChatResponse finish();
 };

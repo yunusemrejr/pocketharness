@@ -126,6 +126,7 @@ struct SessionMeta {
     int64_t lastStoppedAtMs = 0;
     std::string originalRequest, latestRequest;  // bounded verbatim constraints retained across summaries
     bool doubleEnabled = false;  // /double: two-stream first pass + reconcile
+    long doubles = 0;  // twin first-pass executions (launched streams, any outcome)
 };
 Result<SessionMeta> sessionLoadMeta(const std::string& id);  // missing => Ok(empty)
 VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m);

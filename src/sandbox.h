@@ -106,6 +106,15 @@ struct GuardResult {
 };
 GuardResult classifyCommand(const std::string& cmd, const std::string& workspace, bool allowNet);
 
+// Read-only prover for /double evidence passes: the strict inverse of the
+// guard above. True only for a SINGLE simple command that is mechanically
+// provable side-effect free: no pipes, redirection, lists, substitution, or
+// backgrounding; argv[0] must be a bare name from a fixed binary allowlist,
+// with per-binary denylists for flags that can execute or write (find
+// -exec/-delete, git non-read subcommands/-c/--output, rg --pre, fd --exec).
+// Anything else is rejected with a self-explaining *why. Pure, unit-tested.
+bool isReadOnlyBash(const std::string& cmd, std::string* why = nullptr);
+
 // Depth guard for recursive pocket instances.
 inline constexpr int kMaxPocketDepth = 5;
 

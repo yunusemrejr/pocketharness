@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <set>
 
 #ifndef SYS_openat2
 #define SYS_openat2 437
@@ -1393,6 +1394,80 @@ GuardResult classifyCommand(const std::string& cmd, const std::string& workspace
         return r;
     }
     return r;  // Allow
+}
+
+bool isReadOnlyBash(const std::string& cmd, std::string* why) {
+    auto deny = [&](const std::string& reason) { if (why) *why = reason; return false; };
+    std::string c = trim(cmd);
+    if (c.empty()) return deny("empty command");
+    if (c.find('\0') != std::string::npos) return deny("NUL byte in command");
+    // One simple command: no lists, pipes, redirection, substitution,
+    // grouping, or backgrounding. Pipes are excluded on purpose: `a | b`
+    // would need both sides proven, and single commands cover the evidence
+    // surface (ls/find/grep/git status/diff/log).
+    if (c.find_first_of(";|&()<>\n$`") != std::string::npos)
+        return deny("one simple command only: no pipes, redirection, lists, substitution, or backgrounding");
+    // Quote-aware argv split. Bash still does the real parse, but quote
+    // removal here only deletes quote characters, so an allowlisted word
+    // cannot become another binary there (a mismatch fails lookup instead).
+    std::vector<std::string> argv;
+    std::string cur;
+    char quote = 0;
+    bool esc = false;
+    for (char ch : c) {
+        if (esc) { cur.push_back(ch); esc = false; continue; }
+        if (ch == '\\') { esc = true; continue; }
+        if (quote && ch == quote) { quote = 0; continue; }
+        if (!quote && (ch == '\'' || ch == '"')) { quote = ch; continue; }
+        if (!quote && (ch == ' ' || ch == '\t')) {
+            if (!cur.empty()) { argv.push_back(cur); cur.clear(); }
+            continue;
+        }
+        cur.push_back(ch);
+    }
+    if (esc || quote) return deny("unbalanced quote or trailing escape");
+    if (!cur.empty()) argv.push_back(cur);
+    if (argv.empty()) return deny("empty command");
+    // Bare binary name only: no paths (PATH lookup is already filtered to
+    // sandbox-safe roots) and no expansions that could swap argv[0]
+    // (a `*` first word would execute whatever filename sorts first).
+    const std::string& bin = argv[0];
+    if (bin.find('/') != std::string::npos || bin.find_first_of("*?[{~") != std::string::npos)
+        return deny("command must be a bare binary name (no paths or expansions)");
+    static const std::set<std::string> kBins = {"basename", "cat",  "diff",   "dirname", "du",
+                                                "fd",       "file", "find",   "git",     "grep",
+                                                "head",     "ls",   "pwd",    "realpath", "rg",
+                                                "stat",     "tail", "tree",   "wc"};
+    if (!kBins.count(bin)) return deny("'" + bin + "' is not in the read-only command allowlist");
+    auto hasArg = [&](const char* a) {
+        return std::find(argv.begin() + 1, argv.end(), a) != argv.end();
+    };
+    if (bin == "find")
+        for (const char* bad : {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprintf"})
+            if (hasArg(bad)) return deny("find '" + std::string(bad) + "' can execute or write; unavailable read-only");
+    if (bin == "fd")
+        for (const char* bad : {"-x", "--exec", "--exec-batch"})
+            if (hasArg(bad)) return deny("fd '" + std::string(bad) + "' executes commands; unavailable read-only");
+    if (bin == "rg")
+        for (size_t k = 1; k < argv.size(); ++k)
+            if (argv[k] == "--pre" || argv[k] == "--pre-glob" || startsWith(argv[k], "--pre=") ||
+                startsWith(argv[k], "--pre-glob="))
+                return deny("rg '" + argv[k] + "' runs a preprocessor; unavailable read-only");
+    if (bin == "git") {
+        static const std::set<std::string> kGit = {"blame", "cat-file", "describe", "diff", "grep",
+                                                   "log", "ls-files", "ls-tree", "rev-parse", "show", "status"};
+        std::string sub;
+        for (size_t k = 1; k < argv.size(); ++k) {
+            if (argv[k] == "-c" || argv[k] == "--config-env" || startsWith(argv[k], "--config-env="))
+                return deny("git -c/--config-env can inject executable config; unavailable read-only");
+            if (argv[k] == "--output" || startsWith(argv[k], "--output=") || argv[k] == "-o")
+                return deny("git --output writes files; unavailable read-only");
+            if (sub.empty() && !startsWith(argv[k], "-")) sub = argv[k];
+        }
+        if (sub.empty()) return deny("git needs an explicit read-only subcommand");
+        if (!kGit.count(sub)) return deny("git '" + sub + "' is not provably read-only");
+    }
+    return true;
 }
 
 }  // namespace pocket

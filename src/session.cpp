@@ -515,6 +515,7 @@ Result<SessionMeta> sessionLoadMeta(const std::string& id) {
     m.originalRequest = v.value.at("original_request").asStr();
     m.latestRequest = v.value.at("latest_request").asStr();
     m.doubleEnabled = v.value.at("double_enabled").asBool(false);
+    m.doubles = v.value.at("doubles").asInt(0);
     for (const auto& [role, model] : v.value.at("roles").asObj())
         if (model.isStr()) m.roles[role] = model.asStr();
     return Result<SessionMeta>::Ok(m);
@@ -561,6 +562,7 @@ VoidResult sessionSaveMeta(const std::string& id, const SessionMeta& m) {
     o["original_request"] = m.originalRequest;
     o["latest_request"] = m.latestRequest;
     o["double_enabled"] = json::Value(m.doubleEnabled);
+    o["doubles"] = json::Value(m.doubles);
     json::Object roles;
     for (const auto& [role, model] : m.roles) roles[role] = model;
     o["roles"] = json::Value(std::move(roles));

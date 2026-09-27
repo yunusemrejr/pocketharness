@@ -337,6 +337,7 @@ void CodexStreamAcc::feed(const json::Value& p) {
     } else if (type == "response.completed" || type == "response.incomplete") {
         done = type == "response.completed";
         const auto& r = p.at("response");
+        if (model.empty()) model = r.at("model").asStr();
         if (!done) error = "codex response incomplete: " + r.at("incomplete_details").at("reason").asStr();
         const auto& u = r.at("usage");
         inTokens = u.at("input_tokens").asInt(-1);
@@ -359,6 +360,7 @@ ChatResponse CodexStreamAcc::finish() {
     r.outTokens = outTokens;
     r.cacheHit = cacheHit;
     r.cacheMiss = cacheMiss;
+    r.servedModel = model;
     r.error = error;
     r.replay = json::Object{{"items", items}};
     return r;
@@ -425,6 +427,7 @@ std::vector<std::string> sseSplit(std::string_view chunk, std::string& carry) {
 
 void OpenAiStreamAcc::feed(const json::Value& p) {
     readUsage(p.at("usage"), inTokens, outTokens, cacheHit, cacheMiss, cost);
+    if (model.empty()) model = p.at("model").asStr();  // first chunk wins; "" stays unverified
     if (p.has("error")) {
         error = p.at("error").at("message").asStr();
         if (error.empty()) error = "provider stream error";
@@ -488,6 +491,7 @@ ChatResponse OpenAiStreamAcc::finish() {
     r.cacheHit = cacheHit;
     r.cacheMiss = cacheMiss;
     r.cost = cost;
+    r.servedModel = model;
     r.error = error;
     r.stopReason = stopReason;
     r.replay = json::Object{};
@@ -550,6 +554,7 @@ void AnthropicStreamAcc::feed(const json::Value& p) {
             value.asObj()["signature"] = value.at("signature").asStr() + d.at("signature").asStr();
         }
     } else if (type == "message_start" || type == "message_delta") {
+        if (type == "message_start" && model.empty()) model = p.at("message").at("model").asStr();
         const auto& u = type == "message_start" ? p.at("message").at("usage") : p.at("usage");
         for (const auto& [key, val] : u.asObj()) usage.asObj()[key] = val;
         readUsage(usage, inTokens, outTokens, cacheHit, cacheMiss, cost);
@@ -566,6 +571,7 @@ ChatResponse AnthropicStreamAcc::finish() {
     r.cacheHit = cacheHit;
     r.cacheMiss = cacheMiss;
     r.cost = cost;
+    r.servedModel = model;
     r.error = error;
     r.stopReason = stopReason;
     json::Array thinking;
@@ -612,6 +618,7 @@ Result<ChatResponse> parseOpenAiResponse(const json::Value& v) {
         }
     }
     readUsage(v.at("usage"), r.inTokens, r.outTokens, r.cacheHit, r.cacheMiss, r.cost);
+    r.servedModel = v.at("model").asStr();
     return Result<ChatResponse>::Ok(std::move(r));
 }
 
@@ -639,6 +646,7 @@ Result<ChatResponse> parseAnthropicResponse(const json::Value& v) {
     }
     const auto& u = v.at("usage");
     readUsage(u, r.inTokens, r.outTokens, r.cacheHit, r.cacheMiss, r.cost);
+    r.servedModel = v.at("model").asStr();
     r.replay = json::Object{{"thinking", thinking}};
     return Result<ChatResponse>::Ok(std::move(r));
 }
@@ -1095,6 +1103,7 @@ Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks
                     usage.cacheHit = acc.cacheHit;
                     usage.cacheMiss = acc.cacheMiss;
                     usage.cost = acc.cost;
+                    usage.servedModel = acc.model;
                 };
                 if (isOpenAi) copy(oacc);
                 else if (isCodex) copy(cacc);
@@ -1106,6 +1115,7 @@ Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks
             if (plain.ok) {
                 readUsage(plain.value.at("usage"), usage.inTokens, usage.outTokens,
                           usage.cacheHit, usage.cacheMiss, usage.cost);
+                if (usage.servedModel.empty()) usage.servedModel = plain.value.at("model").asStr();
                 if (isCodex)
                     readUsage(plain.value.at("response").at("usage"), usage.inTokens, usage.outTokens,
                               usage.cacheHit, usage.cacheMiss, usage.cost);

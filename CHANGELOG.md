@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Harden Double mode while keeping its shape (two concurrent same-model
+  first passes, one reconciliation, one unified plan, normal parent loop).
+  First passes can now gather evidence with read-only tools (`read` plus a
+  strictly allowlisted single-command `bash`: no pipes, redirection,
+  composition, or writes); every stream gets at most one retry on transient
+  provider failures; each phase runs under a real deadline that cancels
+  slow streams instead of joining forever. Reconciliation uses bounded
+  derived thinking (never `off`) and sees per-analysis route marks:
+  provider-reported model ids are verified against the requested model,
+  with silent providers labeled unverified and substituted routes marked
+  degraded. A failed reconciliation no longer crowns the longer analysis —
+  both bounded views seed the parent with an instruction to compare and
+  commit — and lone survivors are labeled uncorroborated. `double passes`
+  is now precisely defined and persisted across resume; `/double` status
+  clarifies that `2×` means twin first-pass mode. 20 new tests cover
+  concurrency, leakage, routes, read-only enforcement, retry, deadline,
+  cancellation, degraded paths, accounting, and resume.
+
 ## 0.6.0
 
 - Add Double mode (`/double`, `/double on|off|status`): each direct turn

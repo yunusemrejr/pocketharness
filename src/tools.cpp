@@ -5,6 +5,7 @@
 #include <dirent.h>
 
 #include <cstdio>
+#include <cstring>
 #include <algorithm>
 #include <cmath>
 
@@ -45,6 +46,21 @@ std::vector<ToolDef> nativeToolDefs() {
          "(full instructions).",
          R"({"type":"object","properties":{"action":{"type":"string"},"query":{"type":"string"},"name":{"type":"string"}},"required":["action"]})"},
     };
+}
+
+std::vector<ToolDef> readOnlyToolDefs() {
+    std::vector<ToolDef> out;
+    for (const auto& d : nativeToolDefs()) {
+        if (d.name == "read") out.push_back(d);
+        else if (d.name == "bash")
+            out.push_back({"bash",
+                           "Run ONE simple read-only command (no pipes, redirection, lists, or "
+                           "substitution) to gather evidence: ls, find, grep, rg, git status/diff/log/show, "
+                           "cat, head, tail, wc, file, diff, tree, fd, stat, du. Writes, edits, installs, "
+                           "network use, and anything outside the allowlist are blocked.",
+                           d.paramsJson});
+    }
+    return out;
 }
 
 namespace {
@@ -253,7 +269,10 @@ ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
 
 ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
     ToolResult r;
-    if (env.cfg && !env.sandboxHome.empty()) {
+    // Read-only passes never spawn recursive pocket children (the allowlist
+    // has no pocket), so they skip config staging too — which also keeps two
+    // concurrent evidence workers from writing one shared staging dir.
+    if (!env.readOnly && env.cfg && !env.sandboxHome.empty()) {
         auto staged = stageChildConfig(*env.cfg, env.sandboxHome);
         if (!staged.ok) return {false, "cannot stage child settings: " + staged.error};
     }
@@ -270,6 +289,16 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
     o.argv = {"bash", "--noprofile", "--norc", "-o", "pipefail", "-c", cmd};
     o.env = buildChildEnv(env.cfg ? env.cfg->exposeEnv : std::vector<std::string>(), env.workspace,
                           env.sessionTmp, env.sandboxHome, env.auth);
+    if (env.readOnly) {
+        // Pinned pagers cannot execute, and git skips its index refresh
+        // writes. Stripped first: getenv reads the first match, so a stale
+        // duplicate must not shadow the pin.
+        for (const char* kv : {"PAGER=cat", "GIT_PAGER=cat", "GIT_OPTIONAL_LOCKS=0"}) {
+            std::string key(kv, (size_t)(strchr(kv, '=') - kv) + 1);
+            std::erase_if(o.env, [&](const std::string& e) { return startsWith(e, key); });
+            o.env.push_back(kv);
+        }
+    }
     o.workdir = env.workspace;
     o.timeoutMs = timeoutSec * 1000L;
     o.outLimit = env.cfg ? (size_t)env.cfg->outputLimitBytes : 262144;
@@ -320,6 +349,14 @@ ToolResult toolBash(ToolEnv& env, const json::Value& args) {
     }
     if (timeoutSec < 1) timeoutSec = 1;
     if (timeoutSec > 3600) timeoutSec = 3600;
+    if (env.readOnly) {
+        if (timeoutSec > 120) timeoutSec = 120;  // evidence gathering stays quick
+        std::string why;
+        if (!isReadOnlyBash(cmd, &why)) {
+            r.output = "blocked, read-only evidence pass: " + why;
+            return r;
+        }
+    }
 
     GuardResult g = classifyCommand(cmd, env.workspace, env.allowNet);
     if (g.verdict == Verdict::Deny) {
@@ -341,7 +378,9 @@ ToolResult toolBash(ToolEnv& env, const json::Value& args) {
         }
     }
 
-    if (env.cfg && env.cfg->hooks.count("pre_bash"))
+    // User hooks can run anything, so read-only passes skip them: the
+    // allowlist above is the whole policy, with no hook-shaped hole.
+    if (!env.readOnly && env.cfg && env.cfg->hooks.count("pre_bash"))
         for (const auto& hook : env.cfg->hooks.at("pre_bash")) {
             ToolResult h = runHook(env, hook, "cmd", cmd);
             if (!h.ok) return {false, "blocked by pre_bash hook: " + hook + "\n" + h.output.substr(0, 2000)};
@@ -438,6 +477,11 @@ ToolResult runTool(ToolEnv& env, const std::string& name, const std::string& arg
     }
     if (env.cancel && env.cancel->load()) return {false, "cancelled"};
     if (name != "skill" && !env.auth) return {false, "tool authority unavailable"};
+    // Read-only evidence passes (/double streams) can observe but never
+    // change state. This is the enforcement point: even a tool call the
+    // model was never offered is refused here, not just filtered upstream.
+    if (env.readOnly && name != "read" && name != "bash")
+        return {false, name + " is unavailable in a read-only evidence pass"};
     if ((name == "read" || name == "write" || name == "edit") && startsWith(args.at("path").asStr(), "$TMPDIR/")) {
         if (env.sessionTmp.empty()) return {false, "session scratch unavailable"};
         args.asObj()["path"] = env.sessionTmp + "/" + args.at("path").asStr().substr(8);

@@ -95,7 +95,15 @@ struct AgentOpts {
     // Cheap advisory check of a bounded recent tool trace. Never a completion
     // verdict or permission gate; empty means no change of direction suggested.
     std::function<std::string(const std::string& recentTools, double* cost)> progress;
+    // /double per-phase deadline in ms (first passes, then reconciliation).
+    // 0 selects the default. Unit tests use small values for prompt deadlines.
+    long doubleDeadlineMs = 0;
 };
+
+// Default /double deadline: generous for legitimate analyses (bounded to a
+// few thousand tokens each), finite against pathological providers. Expired
+// phases cancel their in-flight requests and degrade to the survivor path.
+inline constexpr long kDoubleDeadlineMs = 480000;
 
 // True for requests that deserve an expert brief (imperative work, not a
 // quick question). Pure, unit-tested.
@@ -128,7 +136,11 @@ struct AgentStats {
     bool costIncomplete = false; // some metered attempts could not be priced
     int nudges = 0, reviews = 0, fallbacks = 0, deduped = 0;
     long childSessions = 0;
-    int doubles = 0;  // /double dual-analysis passes executed
+    // /double twin first-pass executions: incremented once per pass whose
+    // streams were both launched, whatever the outcome (unified, survivor,
+    // or both-failed fallback). Never incremented when the pass is
+    // cancelled before or during the streams. Persisted in the sidecar.
+    int doubles = 0;
 };
 
 inline constexpr size_t kCacheWindow = 20;

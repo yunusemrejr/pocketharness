@@ -440,3 +440,46 @@ TEST(sandbox_Write_Preserves_Exec_Bit) {
     CHECK(!boxWrite(g_auth, "sub/", "x", 0644).ok);
     return "";
 }
+
+TEST(sandbox_ReadOnlyBash_Allows_Evidence_Surface) {
+    const char* ok[] = {
+        "ls", "ls -la", "ls sub", "ls *.cpp", "pwd", "cat sub/plain.txt", "head -5 sub/plain.txt",
+        "tail -3 sub/plain.txt", "wc -l sub/plain.txt", "file sub/plain.txt", "stat sub/plain.txt",
+        "du -sh sub", "realpath .", "basename a/b.txt", "dirname a/b.txt", "tree", "tree -L 2",
+        "find . -name x", "find sub -type f", "find . ! -name '*.o'", "grep -rn pat sub",
+        "grep 'two words' sub/plain.txt", "rg -l pat", "rg --hidden pat sub", "fd foo", "fd -t f bar",
+        "diff a b", "git status", "git status --short", "git diff", "git diff --stat HEAD",
+        "git log --oneline -5", "git show HEAD", "git ls-files", "git grep pat", "git rev-parse HEAD",
+        "git describe --tags", "git blame sub/plain.txt", "git ls-tree HEAD", "git cat-file -p HEAD",
+        "git --no-pager log -3", "\"ls\"", "'ls' -la", "grep -r \"foo\\.bar\" sub",
+    };
+    for (const char* c : ok) {
+        std::string why;
+        if (!isReadOnlyBash(c, &why)) return std::string("allowlisted rejected: ") + c + " (" + why + ")";
+    }
+    return "";
+}
+
+TEST(sandbox_ReadOnlyBash_Blocks_Mutations_And_Composition) {
+    const char* bad[] = {
+        "", "rm x", "rm -rf /", "ls; rm x", "ls && rm x", "ls || true", "ls | head", "ls | grep x",
+        "cat < f", "echo x > f", "echo x >> f", "a 2>&1", "make test", "vim f", "python -c x",
+        "ssh h", "curl u", "wget u", "sudo ls", "env ls", "time ls", "/bin/ls", "./ls", "FOO=1 ls",
+        "echo hi", "true", "sleep 1", "kill 1", "ps aux", "df -h", "du | sort", "*", "?.txt",
+        "find . -exec rm {} +", "find . -execdir cat {} ;", "find . -delete", "find . -ok rm {} ;",
+        "find . -fls /tmp/x", "fd -x rm", "fd --exec rm", "fd --exec-batch chmod",
+        "rg --pre evil", "rg --pre-glob '*.x' --pre y", "git commit", "git push", "git pull",
+        "git fetch", "git checkout x", "git switch m", "git restore f", "git reset --hard",
+        "git clean -fdx", "git stash", "git branch", "git branch -D x", "git tag v1", "git merge x",
+        "git rebase m", "git config a b", "git remote -v", "git add f", "git mv a b", "git rm f",
+        "git -c a=b status", "git --config-env=A status", "git diff --output=/tmp/x", "git diff -o /tmp/x",
+        "git", "git --exec-path", "ls `id`", "ls $(id)", "ls $HOME", "ls ${X}", "(ls)", "ls &",
+        "unbalanced 'quote", "trailing\\",
+    };
+    for (const char* c : bad) {
+        std::string why;
+        if (isReadOnlyBash(c, &why)) return std::string("dangerous allowed: ") + c;
+        if (why.empty()) return std::string("no reason for: ") + c;
+    }
+    return "";
+}

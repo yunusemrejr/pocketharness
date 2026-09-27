@@ -41,6 +41,7 @@ struct ToolEnv {
     bool unsafe = false;
     bool interactive = false;
     bool allowDestructive = false;  // non-interactive explicit override only
+    bool readOnly = false;  // /double evidence passes: read + proven-read-only bash only
     // Interactive approval for guard-flagged commands. Must be human-driven.
     std::function<bool(const std::string& cmd, const std::string& reason)> askApproval;
     std::atomic<bool>* cancel = nullptr;
@@ -63,6 +64,11 @@ struct ToolResult {
 
 // Schemas advertised to the provider (also used by /help and tests).
 std::vector<ToolDef> nativeToolDefs();
+
+// Schemas offered to /double first passes: read plus a read-only bash.
+// Not a sixth tool: the same two tools, advertised with their evidence
+// limits and enforced by ToolEnv::readOnly inside runTool.
+std::vector<ToolDef> readOnlyToolDefs();
 
 // Dispatch one tool call. argsJson must be a JSON object (tolerates "").
 ToolResult runTool(ToolEnv& env, const std::string& name, const std::string& argsJson);

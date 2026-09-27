@@ -392,3 +392,29 @@ TEST(provider_Stream_Error_Preserves_Reported_Usage) {
     CHECK(result.error == "failed" && result.inTokens == 24 && result.outTokens == 12 && result.cost == 0.125);
     return "";
 }
+
+TEST(provider_ServedModel_Captured_Per_Protocol) {
+    // OpenAI: top-level chunk model, first wins.
+    OpenAiStreamAcc oacc;
+    oacc.feed(json::parse(R"({"model":"gpt-x","choices":[{"delta":{"content":"Hi"}}]})").value);
+    oacc.feed(json::parse(R"({"model":"gpt-y","choices":[{"delta":{},"finish_reason":"stop"}]})").value);
+    CHECK_EQ(oacc.finish().servedModel, std::string("gpt-x"));
+    OpenAiStreamAcc silent;
+    silent.feed(json::parse(R"({"choices":[{"delta":{"content":"Hi"}}]})").value);
+    CHECK(silent.finish().servedModel.empty());  // unreported stays unverified
+    // Anthropic: message_start carries the model.
+    AnthropicStreamAcc aacc;
+    aacc.feed(json::parse(R"({"type":"message_start","message":{"model":"claude-z","usage":{}}})").value);
+    aacc.feed(json::parse(R"({"type":"message_stop"})").value);
+    CHECK_EQ(aacc.finish().servedModel, std::string("claude-z"));
+    // Codex: the completed response carries the model.
+    CodexStreamAcc cacc;
+    cacc.feed(json::parse(R"({"type":"response.completed","response":{"model":"codex-w","usage":{}}})").value);
+    CHECK_EQ(cacc.finish().servedModel, std::string("codex-w"));
+    // Non-streaming parsers report it too.
+    auto po = parseOpenAiResponse(json::parse(R"({"model":"gpt-x","choices":[{"message":{"content":"Hi"}}]})").value);
+    CHECK(po.ok && po.value.servedModel == "gpt-x");
+    auto pa = parseAnthropicResponse(json::parse(R"({"model":"claude-z","content":[]})").value);
+    CHECK(pa.ok && pa.value.servedModel == "claude-z");
+    return "";
+}

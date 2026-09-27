@@ -300,3 +300,28 @@ TEST(tools_Child_Receipt_FIFO_Is_Refused_Without_Blocking) {
     CHECK_EQ(collectChildUsage(f.env).count, 0L);
     return "";
 }
+
+TEST(tools_ReadOnly_Blocks_Mutations_Allows_Evidence) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(boxWrite(f.auth, "note.txt", "hello", 0644).ok);
+    f.env.readOnly = true;
+    // Mutations refused at the enforcement point, files untouched.
+    CHECK(!runTool(f.env, "write", R"({"path":"evil.txt","content":"x"})").ok);
+    CHECK(!runTool(f.env, "edit", R"({"path":"note.txt","old_text":"hello","new_text":"bye"})").ok);
+    CHECK(!runTool(f.env, "skill", R"({"action":"list"})").ok);
+    CHECK(!runTool(f.env, "bash", R"({"command":"rm -f note.txt"})").ok);
+    CHECK(!runTool(f.env, "bash", R"({"command":"echo x > note.txt"})").ok);
+    CHECK(!runTool(f.env, "bash", R"({"command":"ls | head"})").ok);
+    CHECK(!boxExists(f.auth, "evil.txt").value);
+    CHECK_EQ(boxRead(f.auth, "note.txt", 100).value, std::string("hello"));
+    // Evidence surface works: read plus proven-read-only bash.
+    auto rd = runTool(f.env, "read", R"({"path":"note.txt"})");
+    CHECK(rd.ok && rd.output.find("hello") != std::string::npos);
+    auto ls = runTool(f.env, "bash", R"({"command":"ls"})");
+    CHECK(ls.ok && ls.output.find("note.txt") != std::string::npos);
+    auto defs = readOnlyToolDefs();
+    CHECK_EQ(defs.size(), (size_t)2);
+    CHECK(defs[0].name == "read" && defs[1].name == "bash");
+    return "";
+}

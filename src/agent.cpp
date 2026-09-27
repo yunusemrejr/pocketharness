@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <sstream>
 #include <exception>
+#include <chrono>
 #include <map>
 #include <set>
 #include <thread>
@@ -183,6 +184,7 @@ VoidResult Agent::restore(const std::string& sessionId) {
     stats_.costEstimated = m.costEstimated;
     stats_.costIncomplete = m.costIncomplete;
     stats_.childSessions = m.childSessions;
+    stats_.doubles = (int)m.doubles;
     double_ = m.doubleEnabled;
     auto loaded = sessionLoad(sessionId);
     if (!loaded.ok) return VoidResult::Err(loaded.error);
@@ -197,7 +199,8 @@ VoidResult Agent::restore(const std::string& sessionId) {
             // Old sessions predate explicit request anchors. Keep their real
             // directions, skipping harness-only continuation annotations.
             if (m.originalRequest.empty() && !startsWith(ev.text, "[harness]") &&
-                !startsWith(ev.text, "[overseer") && !startsWith(ev.text, "[workspace activity")) {
+                !startsWith(ev.text, "[overseer") && !startsWith(ev.text, "[double]") &&
+                !startsWith(ev.text, "[workspace activity")) {
                 if (originalRequest_.empty()) originalRequest_ = ev.text.substr(0, 65536);
                 latestRequest_ = ev.text.substr(0, 65536);
             }
@@ -329,6 +332,7 @@ void Agent::saveStats() {
     m.originalRequest = originalRequest_;
     m.latestRequest = latestRequest_;
     m.doubleEnabled = double_;
+    m.doubles = stats_.doubles;
     auto saved = sessionSaveMeta(opts_.sessionId, m);
     if (!saved.ok) persistenceError_ = saved.error;
     if (!opts_.parentUsageDir.empty()) {
@@ -542,6 +546,17 @@ std::string validateHistory(const std::vector<ChatMessage>& msgs) {
     return pending.empty() ? "" : "unanswered tool call '" + *pending.begin() + "'";
 }
 
+// Plausibly transient provider failures: timeouts, rate limits, temporary
+// 5xx, transport breakage. Shared by the main-loop fallback role and the
+// /double stream retry; deterministic payload/config errors never qualify.
+bool isTransientProviderError(const std::string& err) {
+    return err != "cancelled" && (startsWith(err, "HTTP 5") || startsWith(err, "HTTP 429") ||
+            err.find("timed out") != std::string::npos || startsWith(err, "curl") ||
+            err.find("empty response") != std::string::npos ||
+            err.find("ended before completion") != std::string::npos ||
+            err.find("Could not resolve") != std::string::npos);
+}
+
 Result<ChatResponse> Agent::requestOnce() {
     std::string bad = validateHistory(messages_);
     if (!bad.empty()) return Result<ChatResponse>::Err("corrupt conversation history: " + bad);
@@ -570,11 +585,7 @@ Result<ChatResponse> Agent::requestOnce() {
     auto r = opts_.request(req, cb);
     // Fallback role: a provider that stays down after its own retries hands
     // this request to the fallback model. Payload errors (4xx) never switch.
-    bool transient = !r.ok && r.error != "cancelled" && (startsWith(r.error, "HTTP 5") ||
-                     startsWith(r.error, "HTTP 429") || r.error.find("timed out") != std::string::npos ||
-                     startsWith(r.error, "curl") || r.error.find("empty response") != std::string::npos ||
-                     r.error.find("ended before completion") != std::string::npos ||
-                     r.error.find("Could not resolve") != std::string::npos);
+    bool transient = !r.ok && isTransientProviderError(r.error);
     const ResolvedModel* used = &opts_.model;
     if (transient && !opts_.fallback.empty() && opts_.fallback[0].spec != opts_.model.spec) {
         if (contextUsed() >= opts_.fallback[0].context)
@@ -1173,8 +1184,9 @@ const char* kDoubleLensA =
     "[double] You are instance A of two independent first-pass analyses of this conversation's latest "
     "request. Instance B is analyzing the same request right now in a separate stream: you cannot see its "
     "output and it cannot see yours, so work fully independently and do NOT hedge toward an imagined "
-    "consensus — a distinct view is more useful than premature agreement. Analyze the latest user request "
-    "against the full conversation above and write a compact brief with exactly these sections:\n"
+    "consensus — a distinct view is more useful than premature agreement. Solve constructively: find the "
+    "most direct sound approach and justify it with evidence. Analyze the latest user request against the "
+    "full conversation above and write a compact brief with exactly these sections:\n"
     "1. Understanding — what is actually being asked (one or two sentences).\n"
     "2. Plan — the concrete steps you would take, in order.\n"
     "3. Proposed actions — specific tool operations (reads, searches, edits, commands), one per line.\n"
@@ -1185,10 +1197,11 @@ const char* kDoubleLensB =
     "[double] You are instance B of two independent first-pass analyses of this conversation's latest "
     "request. Instance A is analyzing the same request right now in a separate stream: you cannot see its "
     "output and it cannot see yours, so work fully independently and do NOT hedge toward an imagined "
-    "consensus — a distinct view is more useful than premature agreement. Lean skeptical: stress-test the "
-    "request, surface alternative interpretations, and name what a hasty first pass would miss. Analyze the "
-    "latest user request against the full conversation above and write a compact brief with exactly these "
-    "sections:\n"
+    "consensus — a distinct view is more useful than premature agreement. Be the skeptic: stress-test the "
+    "request and hunt specifically for hidden assumptions, failure modes, alternative approaches, edge "
+    "cases, and overlooked constraints. Disagree with the obvious plan wherever the evidence supports it, "
+    "and name what a hasty first pass would miss. Analyze the latest user request against the full "
+    "conversation above and write a compact brief with exactly these sections:\n"
     "1. Understanding — what is actually being asked (one or two sentences).\n"
     "2. Plan — the concrete steps you would take, in order.\n"
     "3. Proposed actions — specific tool operations (reads, searches, edits, commands), one per line.\n"
@@ -1198,9 +1211,64 @@ const char* kDoubleLensB =
 const char* kDoubleReconcileSystem =
     "You reconcile two independent first-pass analyses (A and B) of one user request into a single unified "
     "plan. Identify agreements, contradictions, missing considerations, stronger evidence, weaker assumptions, "
-    "and tool-use differences. Then commit to ONE coherent plan of action. Output ONLY the unified brief with "
-    "these sections: Plan, First actions, Risks to verify, Open disagreements (write 'none' when empty). Keep "
-    "it under ~300 words. Never invent tool results; name what must be looked up.";
+    "and tool-use differences. A [route ...] tag marks how each analysis was served: treat substituted or "
+    "unverified analyses as degraded evidence, not as ground truth. Then commit to ONE coherent plan of "
+    "action. Output ONLY the unified brief with these sections: Plan, First actions, Risks to verify, Open "
+    "disagreements (write 'none' when empty). Keep it under ~300 words. Never invent tool results; name "
+    "what must be looked up.";
+// Appended verbatim to both lenses when read-only evidence tools are
+// offered, so the tails stay divergent only in stance, never in surface.
+const char* kDoubleToolsPara =
+    "\nYou have read-only investigation tools: `read` for files, `bash` for single read-only commands "
+    "(ls, find, grep, git status/diff/log, ...). Use them to ground claims in evidence before concluding; "
+    "writes, edits, installs, and network use are unavailable. Proposed actions you did not verify must "
+    "say so.";
+
+// Evidence-loop bounds per first-pass stream: enough rounds to read a few
+// files and run a few searches, never an unbounded agent loop.
+inline constexpr int kDoubleToolRounds = 4;
+inline constexpr int kDoubleToolCalls = 16;
+inline constexpr size_t kDoubleBatchCap = 8;
+// Each analysis injected into the parent on reconcile failure is bounded;
+// the full texts already sit in the session transcript for transparency.
+inline constexpr size_t kDoubleSeedCap = 4000;
+
+// Reconciliation thinking derived from the parent configuration: enough
+// reasoning to compare evidence and commit to one plan, capped below the
+// most expensive tiers. Never "off": synthesis is the step that must not
+// be crippled, even when the parent streams run cheap.
+std::string doubleReconcileThinking(const std::string& parent) {
+    if (parent == "medium") return "medium";
+    if (parent == "minimal" || parent == "low") return "low";
+    if (parent == "off" || parent == "none") return "low";
+    return "medium";  // high/xhigh/max/auto/unknown: bounded synthesis
+}
+
+// Route verification of one Double phase against the requested wire id:
+// exact match verifies, "" is unverified (provider stayed silent),
+// anything else is a router substitution. Substituted results stay
+// usable but degraded; unverified results stay usable but unclaimed.
+struct RouteMark {
+    std::string served;
+    bool verified = false;
+    bool unknown = true;
+};
+RouteMark checkDoubleRoute(const std::vector<ChatResponse>& usages, const Result<ChatResponse>& result,
+                           const std::string& want) {
+    RouteMark m;
+    for (auto it = usages.rbegin(); it != usages.rend(); ++it)
+        if (!it->servedModel.empty()) { m.served = it->servedModel; break; }
+    if (m.served.empty() && result.ok) m.served = result.value.servedModel;
+    if (m.served.empty()) return m;
+    m.unknown = false;
+    m.verified = (m.served == want);
+    return m;
+}
+std::string routeTag(const RouteMark& m) {
+    if (m.unknown) return "route unverified";
+    if (m.verified) return "route verified";
+    return "route substituted by " + m.served + " (degraded)";
+}
 }  // namespace
 
 std::string Agent::setDouble(bool on) {
@@ -1219,69 +1287,198 @@ std::string Agent::runDoublePass() {
     if (contextUsed() + completionBudget() > contextMax()) return "";  // the loop reports the budget
     auto note = [&](const std::string& s) { if (opts_.onNotice) opts_.onNotice(s); };
     note("Double: 2× " + opts_.model.spec + " analyzing in parallel");
+    // Read-only evidence tools ride along only when the parent has a tool
+    // environment to clone; tool-less parents keep the context-only pass.
+    std::vector<ToolDef> evidenceTools;
+    ToolEnv evidenceTmpl;
+    bool hasEvidence = opts_.tools != nullptr;
+    if (hasEvidence) {
+        evidenceTools = readOnlyToolDefs();
+        evidenceTmpl = *opts_.tools;
+        evidenceTmpl.readOnly = true;
+        // sessionTmp stays: the child sandbox requires a scratch dir even
+        // though the read-only allowlist cannot write to it.
+        evidenceTmpl.undo.clear();
+        evidenceTmpl.changedFiles.clear();
+        evidenceTmpl.viewImages.clear();
+        evidenceTmpl.childUsage.clear();
+        evidenceTmpl.sideCost = 0;
+        evidenceTmpl.bashRuns = 0;
+        evidenceTmpl.interactive = false;
+        evidenceTmpl.allowDestructive = false;
+        evidenceTmpl.askApproval = nullptr;
+        evidenceTmpl.onEvent = nullptr;
+        evidenceTmpl.onToolDone = nullptr;
+    }
     ChatRequest base;
-    base.model = opts_.model;  // same model, provider, and config: never substituted
+    base.model = opts_.model;  // same model, provider, and config for A, B, and reconcile
     base.system = system_;     // frozen prefix: byte-identical for both streams
     base.messages = messages_;
-    base.tools = {};  // proposals only: a first pass may suggest, never execute
+    base.tools = evidenceTools;
     base.thinking = opts_.thinking;
     base.stream = true;
     base.maxTokens = std::max(512L, std::min(completionBudget(), 2048L));
     base.sessionTag = orSessionId_;
+    std::string tailText[2] = {kDoubleLensA, kDoubleLensB};
+    if (hasEvidence) {
+        tailText[0] += kDoubleToolsPara;
+        tailText[1] += kDoubleToolsPara;
+    }
     struct Stream {
         std::string text;
         Result<ChatResponse> result = Result<ChatResponse>::Err("not run");
         std::vector<ChatResponse> usages;  // every attempt: replayed for exact billing
         std::vector<std::string> notes;
         long elapsedMs = 0;
+        int toolCalls = 0, reads = 0, bashes = 0;
     };
     Stream streams[2];
-    const char* tails[2] = {kDoubleLensA, kDoubleLensB};
-    // Workers touch only opts_.request (thread-safe: per-attempt staging,
-    // guarded brain) plus their own locals. Usage, stats, notices, and
-    // history all stay on the calling thread after the join.
+    // Thread contract: workers share only immutable snapshots (base, tails,
+    // evidence template, request function) plus two atomics (phase cancel,
+    // finished count). chatRequest itself is safe concurrently: per-attempt
+    // staging dirs, mutex-guarded brain/health/cache state, and no other
+    // shared mutable statics. Usage, stats, notices, and history aggregate
+    // on the calling thread after the join.
+    auto requestFn = opts_.request;
+    bool retryBudget = contextUsed() + completionBudget() <= contextMax();
+    std::atomic<bool> streamsCancel{false};
+    std::atomic<int> streamsDone{0};
+    auto runStream = [&](int i) {
+        Stream& s = streams[i];
+        ToolEnv tenv = evidenceTmpl;  // private clone: nothing shared leaks back
+        tenv.cancel = &streamsCancel;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            if (streamsCancel.load()) { s.result = Result<ChatResponse>::Err("cancelled"); return; }
+            std::vector<ChatMessage> hist = base.messages;
+            hist.push_back(ChatMessage{"user", tailText[i], {}, ""});
+            std::string text;
+            Result<ChatResponse> last = Result<ChatResponse>::Err("not run");
+            bool settled = false;
+            for (int round = 0; round < kDoubleToolRounds && s.toolCalls < kDoubleToolCalls; ++round) {
+                if (streamsCancel.load()) { last = Result<ChatResponse>::Err("cancelled"); break; }
+                ChatRequest req = base;
+                req.messages = hist;
+                ChatCallbacks cb;
+                cb.cancel = &streamsCancel;
+                std::string chunk;
+                cb.onToken = [&](std::string_view tok) { chunk.append(tok.data(), tok.size()); };
+                cb.onUsage = [&](const ChatResponse& u) { s.usages.push_back(u); };
+                cb.onNotice = [&](const std::string& n) { s.notes.push_back(n); };
+                int64_t t0 = nowMs();
+                Result<ChatResponse> r;
+                try {
+                    r = requestFn(req, cb);
+                } catch (const std::exception& e) {
+                    r = Result<ChatResponse>::Err(e.what());
+                } catch (...) {
+                    r = Result<ChatResponse>::Err("unexpected double-stream failure");
+                }
+                s.elapsedMs += nowMs() - t0;
+                if (!r.ok) { last = r; break; }
+                last = r;
+                if (!chunk.empty()) text = chunk;
+                else if (!r.value.text.empty()) text = r.value.text;
+                if (r.value.calls.empty()) { settled = true; break; }
+                if (!hasEvidence) { settled = true; break; }  // never offered: never executed
+                hist.push_back(ChatMessage{"assistant", chunk.empty() ? r.value.text : chunk, r.value.calls, ""});
+                size_t n = std::min(r.value.calls.size(), kDoubleBatchCap);
+                if (r.value.calls.size() > n) s.notes.push_back("tool batch capped");
+                for (size_t k = 0; k < n && s.toolCalls < kDoubleToolCalls; ++k) {
+                    const auto& tc = r.value.calls[k];
+                    ToolResult tr;
+                    if (tc.name == "read" || tc.name == "bash") tr = runTool(tenv, tc.name, tc.argsJson);
+                    else tr = {false, tc.name + " is unavailable in a read-only evidence pass"};
+                    ++s.toolCalls;
+                    if (tc.name == "read") ++s.reads;
+                    else if (tc.name == "bash") ++s.bashes;
+                    hist.push_back(ChatMessage{"tool", capToolResult(tr.output), {}, tc.id});
+                }
+            }
+            if (last.ok) {
+                if (trim(text).empty()) {
+                    last = Result<ChatResponse>::Err("empty analysis");
+                } else {
+                    if (!settled) s.notes.push_back("evidence budget spent; using partial analysis");
+                    s.result = last;
+                    s.text = text;
+                    return;
+                }
+            }
+            // One retry for plausibly transient provider failures; quality
+            // failures ("empty analysis") and deterministic errors stop here.
+            bool again = attempt == 0 && !last.ok && isTransientProviderError(last.error) && retryBudget &&
+                         !streamsCancel.load();
+            if (again) {
+                s.notes.push_back("retrying once after: " + last.error.substr(0, 120));
+                continue;
+            }
+            s.result = last;
+            return;
+        }
+    };
+    long deadlineMs = opts_.doubleDeadlineMs > 0 ? opts_.doubleDeadlineMs : kDoubleDeadlineMs;
+    // Caller-thread monitor: mirrors user cancellation into the phase
+    // atomic and fires the deadline the same way. Workers always terminate
+    // (in-flight requests abort on cancel), so every join below returns and
+    // no thread is ever detached or orphaned.
+    auto waitPhase = [&](std::atomic<int>& finished, int want, std::atomic<bool>& cancel, const char* what) {
+        int64_t t0 = nowMs();
+        bool expired = false;
+        while (finished.load() < want) {
+            if (opts_.cancel && opts_.cancel->load()) cancel.store(true);
+            if (!expired && nowMs() - t0 >= deadlineMs) {
+                expired = true;
+                cancel.store(true);
+                note(std::string("Double: ") + what + " deadline exceeded; cancelling slow stream(s)");
+            }
+            if (finished.load() >= want) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    };
     std::thread workers[2];
     for (int i = 0; i < 2; ++i) {
         workers[i] = std::thread([&, i] {
-            ChatRequest req = base;
-            req.messages.push_back(ChatMessage{"user", tails[i], {}, ""});
-            ChatCallbacks cb;
-            cb.cancel = opts_.cancel;
-            cb.onToken = [&](std::string_view tok) { streams[i].text.append(tok.data(), tok.size()); };
-            cb.onUsage = [&](const ChatResponse& u) { streams[i].usages.push_back(u); };
-            cb.onNotice = [&](const std::string& n) { streams[i].notes.push_back(n); };
-            int64_t t0 = nowMs();
             try {
-                streams[i].result = opts_.request(req, cb);
-            } catch (const std::exception& e) {
-                streams[i].result = Result<ChatResponse>::Err(e.what());
+                runStream(i);
             } catch (...) {
                 streams[i].result = Result<ChatResponse>::Err("unexpected double-stream failure");
             }
-            streams[i].elapsedMs = nowMs() - t0;
+            streamsDone.fetch_add(1);
         });
     }
+    waitPhase(streamsDone, 2, streamsCancel, "first-pass");
     workers[0].join();
     workers[1].join();
     if (opts_.cancel && opts_.cancel->load()) return "cancelled";
     ++stats_.doubles;
     for (int i = 0; i < 2; ++i) {
-        for (const auto& u : streams[i].usages) recordResponse(u, 0, &opts_.model);
+        bool usageSeen = false;
+        for (const auto& u : streams[i].usages) {
+            usageSeen = true;
+            recordResponse(u, 0, &opts_.model);
+        }
+        // Injected request functions (unit tests) may report usage only in
+        // the returned value; the fallback keeps them billed exactly once.
+        if (!usageSeen && streams[i].result.ok) recordResponse(streams[i].result.value, 0, &opts_.model);
         stats_.genMs += streams[i].elapsedMs;
         for (const auto& n : streams[i].notes)
             note(std::string("Double ") + (i ? "B" : "A") + ": " + n);
+        if (streams[i].toolCalls > 0)
+            note("Double " + std::string(i ? "B" : "A") + ": evidence (" +
+                 std::to_string(streams[i].reads) + " reads, " + std::to_string(streams[i].bashes) + " commands)");
     }
     auto tokCount = [&](const Stream& s) -> long {
         for (auto it = s.usages.rbegin(); it != s.usages.rend(); ++it)
             if (it->outTokens >= 0) return it->outTokens;
         return estTokens(s.text);
     };
-    bool ok[2];
-    for (int i = 0; i < 2; ++i) {
-        ok[i] = streams[i].result.ok && !trim(streams[i].text).empty();
-        if (streams[i].result.ok && trim(streams[i].text).empty())
-            streams[i].result = Result<ChatResponse>::Err("empty analysis");
-    }
+    RouteMark routes[2] = {checkDoubleRoute(streams[0].usages, streams[0].result, opts_.model.model),
+                           checkDoubleRoute(streams[1].usages, streams[1].result, opts_.model.model)};
+    for (int i = 0; i < 2; ++i)
+        if (!routes[i].unknown && !routes[i].verified)
+            note("Double " + std::string(i ? "B" : "A") + " served by " + routes[i].served + " instead of " +
+                 opts_.model.model + " (route substituted; degraded)");
+    bool ok[2] = {streams[0].result.ok, streams[1].result.ok};
     if (!ok[0] && !ok[1]) {
         note("Double: both analyses failed (A: " + streams[0].result.error.substr(0, 160) + "; B: " +
              streams[1].result.error.substr(0, 160) + "); continuing as a single stream");
@@ -1292,63 +1489,117 @@ std::string Agent::runDoublePass() {
         // turn directly, and the degraded state stays visible.
         int surv = ok[0] ? 0 : 1, failed = ok[0] ? 1 : 0;
         note("Double " + std::string(failed ? "B" : "A") + " failed (" +
-             streams[failed].result.error.substr(0, 160) + "); continuing with " +
-             std::string(surv ? "B" : "A") + " alone");
+             streams[failed].result.error.substr(0, 160) + "); continuing with uncorroborated " +
+             std::string(surv ? "B" : "A") + " alone (no cross-check)");
         appendSession(SessionEvent{"system", "[double " + std::string(surv ? "B" : "A") + "]\n" +
                              streams[surv].text.substr(0, 8000), "", "", "", true});
         if (!persistenceError_.empty()) return "session persistence failed: " + persistenceError_;
-        pushUser("[double] Plan from a single analysis (the parallel Double stream failed: " +
-                 streams[failed].result.error.substr(0, 160) +
-                 "; this plan had no cross-check):\n" + streams[surv].text);
+        pushUser("[double] Plan from an uncorroborated single analysis (the parallel Double stream failed: " +
+                 streams[failed].result.error.substr(0, 160) + "; this plan had no cross-check; survivor " +
+                 routeTag(routes[surv]) + "):\n" + streams[surv].text);
         return persistenceError_.empty() ? "" : "session persistence failed: " + persistenceError_;
     }
+    std::string degraded;
+    for (int i = 0; i < 2; ++i)
+        if (!routes[i].verified) degraded += (degraded.empty() ? " (" : "; ") + std::string(i ? "B " : "A ") +
+                                              routeTag(routes[i]);
+    if (!degraded.empty()) degraded += ")";
     note("Double A + B ready (" + std::to_string(tokCount(streams[0])) + " + " +
-         std::to_string(tokCount(streams[1])) + " tokens); reconciling into one plan");
+         std::to_string(tokCount(streams[1])) + " tokens" + degraded + "); reconciling into one plan");
     appendSession(SessionEvent{"system", "[double A]\n" + streams[0].text.substr(0, 8000), "", "", "", true});
     appendSession(SessionEvent{"system", "[double B]\n" + streams[1].text.substr(0, 8000), "", "", "", true});
     if (!persistenceError_.empty()) return "session persistence failed: " + persistenceError_;
-    // Lightweight reconcile by the same model: one bounded call, streamed
-    // live as the unified action. No debate rounds.
-    ChatRequest req;
-    req.model = opts_.model;
-    req.system = kDoubleReconcileSystem;
-    req.messages = {ChatMessage{"user", "Instance A analysis:\n" + streams[0].text.substr(0, 6000) +
-                            "\n\nInstance B analysis:\n" + streams[1].text.substr(0, 6000) +
-                            "\n\nReconcile these into one unified plan now.", {}, ""}};
-    req.tools = {};
-    req.thinking = "off";
-    req.stream = true;
-    req.maxTokens = std::max(256L, std::min(completionBudget(), 1024L));
-    req.sessionTag = orSessionId_;
-    ChatCallbacks cb;
-    cb.cancel = opts_.cancel;
-    std::string brief;
-    cb.onToken = [&](std::string_view tok) {
-        brief.append(tok.data(), tok.size());
-        if (opts_.onToken) opts_.onToken(tok);
+    // Reconciliation by the same model in its own worker: one bounded call
+    // with derived thinking, monitored under the same deadline. Tokens
+    // stream live; usage and notices aggregate here after the join.
+    struct Reco {
+        std::string brief;
+        Result<ChatResponse> result = Result<ChatResponse>::Err("not run");
+        std::vector<ChatResponse> usages;
+        std::vector<std::string> notes;
+        long elapsedMs = 0;
     };
-    cb.onReasoning = opts_.onReasoning;
-    cb.onNotice = opts_.onNotice;
-    bool usageSeen = false;
-    cb.onUsage = [&](const ChatResponse& u) { usageSeen = true; recordResponse(u, 0, &opts_.model); };
-    int64_t t0 = nowMs();
-    auto r = opts_.request(req, cb);
-    stats_.genMs += nowMs() - t0;
+    Reco reco;
+    std::atomic<bool> recoCancel{false};
+    std::atomic<int> recoDone{0};
+    std::thread recoWorker([&] {
+        try {
+            ChatRequest req;
+            req.model = opts_.model;
+            req.system = kDoubleReconcileSystem;
+            req.messages = {ChatMessage{"user", "Instance A analysis [" + routeTag(routes[0]) + "]:\n" +
+                                                    streams[0].text.substr(0, 6000) + "\n\nInstance B analysis [" +
+                                                    routeTag(routes[1]) + "]:\n" + streams[1].text.substr(0, 6000) +
+                                                    "\n\nReconcile these into one unified plan now.",
+                                        {}, ""}};
+            req.tools = {};
+            req.thinking = doubleReconcileThinking(opts_.thinking);
+            req.stream = true;
+            req.maxTokens = std::max(256L, std::min(completionBudget(), 1024L));
+            req.sessionTag = orSessionId_;
+            ChatCallbacks cb;
+            cb.cancel = &recoCancel;
+            cb.onToken = [&](std::string_view tok) {
+                reco.brief.append(tok.data(), tok.size());
+                if (opts_.onToken) opts_.onToken(tok);
+            };
+            cb.onReasoning = opts_.onReasoning;
+            cb.onUsage = [&](const ChatResponse& u) { reco.usages.push_back(u); };
+            cb.onNotice = [&](const std::string& n) { reco.notes.push_back(n); };
+            int64_t t0 = nowMs();
+            try {
+                reco.result = requestFn(req, cb);
+            } catch (const std::exception& e) {
+                reco.result = Result<ChatResponse>::Err(e.what());
+            } catch (...) {
+                reco.result = Result<ChatResponse>::Err("unexpected double-reconcile failure");
+            }
+            reco.elapsedMs = nowMs() - t0;
+        } catch (...) {
+            reco.result = Result<ChatResponse>::Err("unexpected double-reconcile failure");
+        }
+        recoDone.fetch_add(1);
+    });
+    waitPhase(recoDone, 1, recoCancel, "reconciliation");
+    recoWorker.join();
     if (opts_.cancel && opts_.cancel->load()) return "cancelled";
-    if (r.ok && !usageSeen) recordResponse(r.value, 0, &opts_.model);
-    if (r.ok && !trim(brief).empty()) {
-        pushUser("[double] Unified plan from two independent analyses by " + opts_.model.spec +
-                 " (reconciled; verify against tools, do not treat as ground truth):\n" + brief);
+    bool recoUsageSeen = false;
+    for (const auto& u : reco.usages) {
+        recoUsageSeen = true;
+        recordResponse(u, 0, &opts_.model);
+    }
+    if (!recoUsageSeen && reco.result.ok) recordResponse(reco.result.value, 0, &opts_.model);
+    stats_.genMs += reco.elapsedMs;
+    for (const auto& n : reco.notes) note("Double reconcile: " + n);
+    RouteMark recoRoute = checkDoubleRoute(reco.usages, reco.result, opts_.model.model);
+    if (!recoRoute.unknown && !recoRoute.verified)
+        note("Double reconcile served by " + recoRoute.served + " instead of " + opts_.model.model +
+             " (route substituted; degraded)");
+    if (reco.result.ok && !trim(reco.brief).empty()) {
+        std::string served = recoRoute.verified ? "" : " (" + routeTag(recoRoute) + ")";
+        pushUser("[double] Unified plan from two independent analyses by " + opts_.model.spec + served +
+                 " (reconciled; verify against tools, do not treat as ground truth):\n" + reco.brief);
+        note("Double: unified plan ready");
         return persistenceError_.empty() ? "" : "session persistence failed: " + persistenceError_;
     }
-    if (!r.ok)
-        note("Double: reconcile failed (" + r.error.substr(0, 160) + "); using the fuller analysis as the plan");
+    // Reconciliation failed: never crown an analysis by length. Both bounded
+    // views seed the parent with an explicit instruction to compare them and
+    // commit; the full texts stay in the session transcript.
+    if (!reco.result.ok)
+        note("Double: reconcile failed (" + reco.result.error.substr(0, 160) + "); both analyses preserved below");
     else
-        note("Double: reconcile returned no plan; using the fuller analysis");
-    const std::string& fuller =
-        streams[0].text.size() >= streams[1].text.size() ? streams[0].text : streams[1].text;
-    pushUser("[double] Plan from one Double analysis (reconciliation produced nothing usable; the other "
-             "analysis is in the session transcript):\n" + fuller);
+        note("Double: reconcile returned no plan; both analyses preserved below");
+    auto seed = [](const std::string& s) {
+        return s.size() > kDoubleSeedCap
+                   ? s.substr(0, kDoubleSeedCap) + "\n[... truncated; fuller text is in the session transcript ...]"
+                   : s;
+    };
+    pushUser("[double] Reconciliation produced no unified plan; compare these two independent analyses of the "
+             "same request and commit to ONE plan of action before using tools:\n\n--- Analysis A [" +
+             routeTag(routes[0]) + "] ---\n" + seed(streams[0].text) + "\n\n--- Analysis B [" + routeTag(routes[1]) +
+             "] ---\n" + seed(streams[1].text) +
+             "\n\nInstruction: weigh their evidence, resolve contradictions, and commit to one path. Verify "
+             "against tools; do not treat either analysis as ground truth.");
     return persistenceError_.empty() ? "" : "session persistence failed: " + persistenceError_;
 }
 

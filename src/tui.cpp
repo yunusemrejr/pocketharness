@@ -2114,7 +2114,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             "  /brain            learned quirks, provider health, judges, overseer stats\n"
             "  /catalog          refresh the live model catalog now\n"
             "  /thinking [level] auto/off/none/minimal/low/medium/high/xhigh/max\n"
-            "  /double [on|off]  two independent first passes, reconciled into one plan\n"
+            "  /double [on|off]  twin first-pass analyses (2× mode), reconciled into one plan\n"
             "  /compact          summarize older context now\n"
             "  /skills [query]   list or search Markdown skills\n"
             "  /session          show session info and token usage\n"
@@ -2316,7 +2316,8 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         else { say("usage: /double [on|off|status]\n"); return true; }
         std::string err = agent.setDouble(on);
         if (!err.empty()) { say("error: " + err + "\n"); return true; }
-        say(std::string("Double mode: ") + (on ? "ON\n2× " + opts.model.spec + "\n" : "OFF\n"));
+        say(std::string("Double mode: ") +
+            (on ? "ON\n2× " + opts.model.spec + " (twin first-pass mode; total cost varies)\n" : "OFF\n"));
         return true;
     }
     if (cmd == "compact") {
