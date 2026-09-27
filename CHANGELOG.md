@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.4
+
+- Goal audits no longer kill autonomous goals. An auditor that hits its
+  output limit is retried once with a larger budget, a failing fast auditor
+  falls back to the main model, and an unavailable or unclear audit resumes
+  work (bounded by the cycle budget) instead of pausing with
+  "goal audit failed" or "no valid DONE/CONTINUE verdict".
+- Parse audit verdicts tolerant of markdown and labels (`**Verdict:** DONE`)
+  without letting prose such as "not done" certify completion.
+- Goal round-limit checkpoints no longer log the same stop line twice.
+
 ## 0.5.3
 
 - Add deterministic local HTML frame and MP4 export through `kit frame/video`.

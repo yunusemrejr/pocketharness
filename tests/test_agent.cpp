@@ -813,7 +813,7 @@ TEST(agent_Goal_Audit_Cancellation_Wins_And_Resumes_Audit_Only) {
     return "";
 }
 
-TEST(agent_Goal_Audit_Error_And_Invalid_Verdict_Pause) {
+TEST(agent_Goal_Audit_Error_And_Unclear_Verdict_Keep_Working) {
     AgentOpts opts;
     opts.model = resolveModel(defaultConfig(), "glm").value;
     int work = 0, audits = 0;
@@ -822,19 +822,16 @@ TEST(agent_Goal_Audit_Error_And_Invalid_Verdict_Pause) {
         if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish";
         else if (req.system.find("audit") != std::string::npos) {
             ++audits;
-            if (audits == 1) return Result<ChatResponse>::Err("provider unavailable");
-            r.text = audits == 2 ? "maybe done" : "DONE";
+            if (audits == 1) return Result<ChatResponse>::Err("provider output limit reached");
+            r.text = audits == 2 ? "maybe done" : audits == 3 ? "The goal is not done yet.\n- tests" : "**Verdict:** DONE";
         } else { ++work; r.text = "Completed and verified."; }
         return Result<ChatResponse>::Ok(r);
     };
     Agent a(opts);
-    CHECK(a.runGoal("finish it").find("audit failed") != std::string::npos);
-    CHECK(a.goalPaused());
-    CHECK(a.resumeGoal().find("no valid") != std::string::npos);
-    CHECK(a.goalPaused());
-    CHECK(a.resumeGoal().empty());
-    CHECK_EQ(work, 1);
-    CHECK_EQ(audits, 3);
+    CHECK(a.runGoal("finish it").empty());
+    CHECK(a.goalStatus() == GoalStatus::Completed);
+    CHECK_EQ(work, 3);    // the output-limit error is retried once with a larger budget
+    CHECK_EQ(audits, 4);
     return "";
 }
 

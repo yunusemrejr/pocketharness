@@ -10,6 +10,7 @@
 
 #include <utility>
 #include <algorithm>
+#include <sstream>
 #include <exception>
 #include <map>
 #include <set>
@@ -610,6 +611,16 @@ Result<ChatResponse> Agent::sideRequest(const ResolvedModel& m, const std::strin
     cb.onUsage = [&](const ChatResponse& usage) { usageSeen = true; recordResponse(usage, 0, &m, true); };
     int64_t t0 = nowMs();
     auto r = opts_.request(req, cb);
+    // Models that reason despite thinking=off can spend a small budget
+    // before answering; one retry with a larger budget beats failing a goal.
+    long larger = std::min(req.maxTokens * 4, std::max(256L, m.context / 4));
+    if (!r.ok && r.error.find("output limit reached") != std::string::npos && larger > req.maxTokens &&
+        !(opts_.cancel && opts_.cancel->load())) {
+        req.maxTokens = larger;
+        usageSeen = false;
+        t0 = nowMs();
+        r = opts_.request(req, cb);
+    }
     if (r.ok && !usageSeen) recordResponse(r.value, nowMs() - t0, &m, true);
     return r;
 }
@@ -1101,6 +1112,28 @@ std::string Agent::makeBrief(const std::string& request) {
 }
 
 namespace {
+// Verdict from the first decisive word of the leading lines, tolerating
+// markdown and labels ("**Verdict:** CONTINUE"). Anything else reads as
+// "continue": an unclear audit never certifies completion.
+std::string auditVerdict(const std::string& verdict) {
+    std::istringstream in(toLower(verdict));
+    std::string line;
+    for (int n = 0; n < 4 && std::getline(in, line); ++n) {
+        std::string word;
+        for (size_t i = 0; i <= line.size(); ++i) {
+            char c = i < line.size() ? line[i] : ' ';
+            if (c >= 'a' && c <= 'z') { word += c; continue; }
+            if (word.empty() || word == "verdict" || word == "status" || word == "final" || word == "answer") {
+                word.clear();
+                continue;
+            }
+            if (word == "done" || word == "continue") return word;
+            break;  // prose line: its first word decides nothing
+        }
+    }
+    return "continue";
+}
+
 std::string outcomeReason(const std::string& error) {
     if (error.empty()) return "completed";
     if (error == "cancelled") return "cancelled";
@@ -1518,7 +1551,7 @@ std::string Agent::continueGoal(int maxCycles) {
                 // budget bounds continuation, and completion still needs audit.
                 goalNext_ = continuation() + "\n[Work checkpoint] Continue the remaining work from the saved history; "
                     "use the verified results already obtained and change approach for unresolved failures.";
-                recordOutcome("goal", "progress_checkpoint", err);
+                recordOutcome("goal", "progress_checkpoint", "goal checkpoint: continuing from saved work");
                 if (goalYield_ && goalYield_()) return finishGoal("", false, "yielded");
                 if (opts_.onNotice && cycle + 1 < maxCycles)
                     opts_.onNotice("goal progress checkpoint: continuing from saved work");
@@ -1533,24 +1566,35 @@ std::string Agent::continueGoal(int maxCycles) {
         if (goalYield_ && goalYield_()) return finishGoal("", false, "yielded");
         // A small decision model can suggest a change of strategy, but may
         // never certify completion. The evidence auditor checks the full goal.
-        auto r = sideRequest(auditor,
-                             "You audit an autonomous agent. Decide if the GOAL is fully achieved, judging only by "
-                             "evidence in the transcript digest (commands run, results, changes). First line: DONE or "
-                             "CONTINUE. If CONTINUE, list precisely what remains.",
-                             "GOAL: " + goal_ + "\n" + goalBrief_ + "\n\nDIGEST:\n" + goalProgress_, 800);
+        const std::string auditSys =
+            "You audit an autonomous agent. Decide if the GOAL is fully achieved, judging only by "
+            "evidence in the transcript digest (commands run, results, changes). First line: DONE or "
+            "CONTINUE. If CONTINUE, list what remains in at most 8 short bullets.";
+        const std::string auditIn = "GOAL: " + goal_ + "\n" + goalBrief_ + "\n\nDIGEST:\n" + goalProgress_;
+        auto r = sideRequest(auditor, auditSys, auditIn, 2000);
+        if (!r.ok && !cancelled() && auditor.spec != opts_.model.spec) r = sideRequest(opts_.model, auditSys, auditIn, 2000);
         if (cancelled()) return finishGoal("cancelled");
         if (goalYield_ && goalYield_()) return finishGoal("", false, "yielded");
-        if (!r.ok) return finishGoal("goal audit failed: " + r.error);
+        if (!r.ok) {
+            // An unavailable auditor cannot certify completion, but it must
+            // not stop working either; the cycle budget bounds this path.
+            if (opts_.onNotice) opts_.onNotice("goal audit unavailable (" + r.error + "); continuing work");
+            goalPhase_ = "work";
+            goalNext_ = continuation() + "\n[goal audit unavailable] Re-verify the acceptance criteria with fresh "
+                        "evidence, finish any remaining work, then stop.";
+            saveStats();
+            continue;
+        }
         std::string verdict = trim(r.value.text);
-        std::string first = toLower(trim(verdict.substr(0, verdict.find('\n'))));
+        std::string first = auditVerdict(verdict);
         if (first == "done") {
             std::string error = finishGoal("", true);
             if (error.empty() && goalStatus_ == GoalStatus::Completed && opts_.onNotice)
                 opts_.onNotice("goal met (audited after " + std::to_string(cycle + 1) + " cycle(s))");
             return error;
         }
-        if (first != "continue" && !startsWith(first, "continue:"))
-            return finishGoal("goal audit returned no valid DONE/CONTINUE verdict; goal paused");
+        // An unparseable verdict never certifies completion, but it is no
+        // reason to stop autonomous work either: the cycle budget bounds it.
         goalPhase_ = "work";
         goalNext_ = continuation() + "\n[goal audit] Remaining work:\n" + verdict.substr(0, 3000);
         saveStats();

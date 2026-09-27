@@ -258,7 +258,7 @@ TEST(cli_Resume_Followup_Continues_Paused_Goal) {
     opts.argv = {opts.exe, "--allow-root", workspace, "-g", "Complete the fixture goal"};
     opts.timeoutMs = 15000;
     auto first = spawn(opts);
-    if (!first.ok || first.exitCode != 1) return "goal should pause on invalid audit:\n" + first.err;
+    if (!first.ok || first.exitCode != 1) return "goal should pause after unconfirmed audits:\n" + first.err;
     auto sessions = sessionList(10, workspace);
     CHECK_EQ(sessions.size(), size_t(1));
     auto paused = sessionLoadMeta(sessions[0].id);
@@ -272,8 +272,8 @@ TEST(cli_Resume_Followup_Continues_Paused_Goal) {
     CHECK(completed.ok && completed.value.goalStatus == "completed");
     CHECK_EQ(completed.value.goal, std::string("Complete the fixture goal"));
     CHECK(server.sawFollowup);
-    CHECK_EQ(server.work, 2);
-    CHECK_EQ(server.audits, 2);
+    CHECK_EQ(server.work, 13);  // 12 unconfirmed cycles, then the follow-up
+    CHECK_EQ(server.audits, 13);
     rmRf(dir);
     return "";
 }
