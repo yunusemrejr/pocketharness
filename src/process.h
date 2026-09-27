@@ -45,6 +45,10 @@ struct SpawnResult {
 
 // Run a child synchronously. Never invokes a shell.
 SpawnResult spawn(const SpawnOpts& opts);
+// Stop every process group this session spawned that is still alive (tool
+// background servers included): TERM, up to graceMs, then KILL. Uses only
+// async-signal-safe calls, so fatal-signal handlers may call it.
+void killSessionProcesses(long graceMs = 1000);
 
 // Resolve PATH in the child's environment and working directory, before fork.
 std::string whichExe(const std::string& name, const std::string& workdir = "",

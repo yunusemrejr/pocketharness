@@ -34,6 +34,14 @@ namespace {
 std::atomic<bool> printCancel{false};
 static_assert(std::atomic<bool>::is_always_lock_free);
 void cancelPrint(int) { printCancel.store(true); }
+// Any fatal exit (terminal closed, kill) takes this session's processes and,
+// when no other session uses it, the local model down with it.
+void onExitSignal(int sig) {
+    killSessionProcesses(300);
+    judgeShutdownOnSignal();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 
 int positiveOption(const std::string& text, int max) {
     if (text.empty() || text.size() > 9 || text.find_first_not_of("0123456789") != std::string::npos) return 0;
@@ -599,6 +607,13 @@ int pocketMain(int argc, char** argv) {
     ao.sessionId = sessionId;
     if (depth > 0 && getenv("TMPDIR")) ao.parentUsageDir = getenv("TMPDIR");
     Agent agent(ao);
+    judgeWarm(cfg);  // registers as a local-LM user; warms only when needed
+    for (int sig : {SIGHUP, SIGTERM, SIGQUIT}) {
+        struct sigaction sa{};
+        sa.sa_handler = onExitSignal;
+        sigemptyset(&sa.sa_mask);
+        sigaction(sig, &sa, nullptr);
+    }
     if (resume) {
         auto r = agent.restore(sessionId);
         if (!r.ok) { fprintf(stderr, "pocket: cannot resume: %s\n", r.error.c_str()); return 1; }
@@ -629,6 +644,8 @@ int pocketMain(int argc, char** argv) {
         sigemptyset(&sa.sa_mask);
         sigaction(SIGINT, &sa, &oldInt);
         sigaction(SIGTERM, &sa, &oldTerm);
+        struct sigaction oldHup{};
+        sigaction(SIGHUP, &sa, &oldHup);  // a closed terminal cancels cleanly too
         tools.cancel = &printCancel;
         agent.setCancel(&printCancel);
         bool errTty = isatty(STDERR_FILENO);
@@ -658,6 +675,7 @@ int pocketMain(int argc, char** argv) {
                           agent.goalPaused() ? agent.resumeGoal(prompt) : agent.runTurn(prompt);
         sigaction(SIGINT, &oldInt, nullptr);
         sigaction(SIGTERM, &oldTerm, nullptr);
+        sigaction(SIGHUP, &oldHup, nullptr);
         printf("\n");
         const AgentStats& st = agent.stats();
         if (st.cacheSeen) {
@@ -746,6 +764,7 @@ int pocketMain(int argc, char** argv) {
         fprintf(stderr, "pocket: %s\n", sanitizeTerminal(usageError).c_str());
         rc = 1;
     }
+    killSessionProcesses();
     judgeShutdown();
     authorityClose(auth);
     if (rc == kTuiResume && !nextSession.empty()) {

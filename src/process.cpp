@@ -15,6 +15,57 @@
 
 namespace pocket {
 
+namespace {
+// Process groups this session started that may still hold members (a tool's
+// backgrounded server outlives its call). Lock-free slots: the fatal-signal
+// path reads them.
+constexpr int kGroupSlots = 256;
+std::atomic<pid_t> g_groups[kGroupSlots];
+
+bool groupAlive(pid_t pg) { return kill(-pg, 0) == 0 || errno != ESRCH; }
+
+void trackGroup(pid_t pg) {
+    for (auto& slot : g_groups) {  // prune dead groups first: pgids get reused
+        pid_t old = slot.load();
+        if (old > 0 && !groupAlive(old)) slot.compare_exchange_strong(old, 0);
+    }
+    for (auto& slot : g_groups) {
+        pid_t empty = 0;
+        if (slot.compare_exchange_strong(empty, pg)) return;
+    }
+}
+
+void untrackGroup(pid_t pg) {
+    for (auto& slot : g_groups) {
+        pid_t cur = pg;
+        if (slot.compare_exchange_strong(cur, 0)) return;
+    }
+}
+}  // namespace
+
+void killSessionProcesses(long graceMs) {
+    bool any = false;
+    for (auto& slot : g_groups) {
+        pid_t pg = slot.load();
+        if (pg > 0 && kill(-pg, SIGTERM) == 0) { kill(-pg, SIGCONT); any = true; }
+    }
+    if (!any) return;
+    for (long waited = 0; waited < graceMs; waited += 25) {
+        bool alive = false;
+        for (auto& slot : g_groups) {
+            pid_t pg = slot.load();
+            if (pg > 0 && groupAlive(pg)) alive = true;
+        }
+        if (!alive) break;
+        struct timespec ts{0, 25 * 1000 * 1000};
+        nanosleep(&ts, nullptr);
+    }
+    for (auto& slot : g_groups) {
+        pid_t pg = slot.exchange(0);
+        if (pg > 0) kill(-pg, SIGKILL);
+    }
+}
+
 std::string whichExe(const std::string& name, const std::string& workdir,
                      const std::vector<std::string>& env) {
     if (name.find('/') != std::string::npos) return name;
@@ -117,6 +168,7 @@ SpawnResult spawn(const SpawnOpts& opts) {
     // this, kill(-pid) below could fire before the child's setpgid and hit
     // our own process group. Errors are harmless (child may have exited).
     setpgid(pid, pid);
+    trackGroup(pid);
     int exitFd = -1;
 #ifdef SYS_pidfd_open
     exitFd = (int)syscall(SYS_pidfd_open, pid, 0);  // wake on exit without polling EOF pipes
@@ -250,6 +302,9 @@ SpawnResult spawn(const SpawnOpts& opts) {
         while (sigtimedwait(&pipeSet, nullptr, &zero) >= 0) {}
     }
     pthread_sigmask(SIG_SETMASK, &oldMask, nullptr);
+    // A group whose members all exited is done; one with a live background
+    // member stays tracked so session exit can stop it.
+    if (reaped && !groupAlive(pid)) untrackGroup(pid);
     if (!reaped) return r;
     if (WIFEXITED(status)) {
         r.exitCode = WEXITSTATUS(status);

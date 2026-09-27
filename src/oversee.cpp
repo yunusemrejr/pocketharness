@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <string.h>
 #include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -31,6 +32,16 @@ namespace {
 std::mutex g_judgeMu;  // short-lived metadata only; never held during inference
 std::timed_mutex g_localMu;
 std::map<int, pid_t> g_serverPids;  // only children started by this process
+std::map<int, int64_t> g_serverSpawned;  // spawn time: a model load gets a bounded grace period
+
+// Shared ownership of a local llama-server across PocketHarness sessions:
+// every session with a local LM configured holds LOCK_SH on judge-PORT.users
+// for its lifetime (the kernel drops it even on SIGKILL). The exiting session
+// stops the server only when it can take LOCK_EX, i.e. no live session is
+// left. Paths are prebuilt so the fatal-signal path stays async-signal-safe.
+int g_usersFd = -1;
+char g_usersPath[1024], g_pidPath[1024], g_portArg[32];
+size_t g_portArgLen = 0;
 std::map<std::string, int64_t> g_pausedUntil;
 std::map<std::string, double> g_judgeCache;
 std::map<std::string, std::map<std::string, double>> g_decideCache;
@@ -164,6 +175,81 @@ struct LocalLease {
     ~LocalLease() { if (fd >= 0) close(fd); }
 };
 
+void releaseLocalServer();
+
+void registerLocalUser(const Config& cfg) {
+    if (cfg.localLm.model.empty() || !ensureDir(stateDir(), 0700).ok) return;
+    std::string base = stateDir() + "/judge-" + std::to_string(cfg.localLm.port);
+    if (base.size() + 8 >= sizeof g_usersPath) return;
+    if (g_usersFd >= 0) {
+        if (base + ".users" == g_usersPath) return;  // already a user of this server
+        releaseLocalServer();  // switched servers: leave the old one properly
+    }
+    snprintf(g_usersPath, sizeof g_usersPath, "%s.users", base.c_str());
+    snprintf(g_pidPath, sizeof g_pidPath, "%s.pid", base.c_str());
+    // Matches "--port\0N\0" in /proc/PID/cmdline: guards against pid reuse.
+    int n = snprintf(g_portArg, sizeof g_portArg, "--port%c%d%c", 0, cfg.localLm.port, 0);
+    g_portArgLen = n > 0 ? (size_t)n : 0;
+    int fd = open(g_usersPath, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return;
+    // A session shutting the server down holds LOCK_EX briefly; wait it out.
+    for (int64_t end = nowMs() + 2000; nowMs() < end;) {
+        if (flock(fd, LOCK_SH | LOCK_NB) == 0) { g_usersFd = fd; return; }
+        if (errno != EWOULDBLOCK && errno != EINTR) break;
+        struct timespec ts{0, 25 * 1000 * 1000};
+        nanosleep(&ts, nullptr);
+    }
+    close(fd);
+}
+
+// Async-signal-safe: open/flock/read/kill/nanosleep/unlink only.
+void releaseLocalServer() {
+    if (g_usersFd < 0) return;
+    int fd = open(g_usersPath, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    close(g_usersFd);  // drops our share
+    g_usersFd = -1;
+    if (fd < 0) return;
+    // Our own sub-agents may still be exiting (they were just signalled):
+    // give them a moment before concluding another session holds a share.
+    bool last = false;
+    for (int i = 0; i < 20 && !(last = flock(fd, LOCK_EX | LOCK_NB) == 0); ++i) {
+        struct timespec ts{0, 25 * 1000 * 1000};
+        nanosleep(&ts, nullptr);
+    }
+    if (!last) { close(fd); return; }  // other sessions still use it
+    pid_t pid = 0;
+    int pf = open(g_pidPath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (pf >= 0) {
+        char b[32];
+        ssize_t n = read(pf, b, sizeof b - 1);
+        close(pf);
+        for (ssize_t i = 0; i < n && b[i] >= '0' && b[i] <= '9'; ++i) pid = pid * 10 + (b[i] - '0');
+    }
+    bool ours = false;  // the pid must still be a server on this port
+    if (pid > 1 && g_portArgLen) {
+        char path[64], buf[8192];
+        snprintf(path, sizeof path, "/proc/%d/cmdline", (int)pid);
+        int cf = open(path, O_RDONLY | O_CLOEXEC);
+        if (cf >= 0) {
+            ssize_t n = read(cf, buf, sizeof buf);
+            close(cf);
+            for (ssize_t i = 0; !ours && n > 0 && i + (ssize_t)g_portArgLen <= n; ++i)
+                ours = memcmp(buf + i, g_portArg, g_portArgLen) == 0;
+        }
+    }
+    if (ours) {
+        kill(pid, SIGTERM);
+        for (int i = 0; i < 40; ++i) {  // up to 1s, then force
+            if (waitpid(pid, nullptr, WNOHANG) == pid || (kill(pid, 0) != 0 && errno == ESRCH)) { ours = false; break; }
+            struct timespec ts{0, 25 * 1000 * 1000};
+            nanosleep(&ts, nullptr);
+        }
+        if (ours) kill(pid, SIGKILL);
+    }
+    if (pid > 0) unlink(g_pidPath);
+    close(fd);
+}
+
 bool ensureLocalServer(const Config& cfg, int64_t deadline, std::atomic<bool>* cancel) {
     const auto& l = cfg.localLm;
     auto it = g_serverPids.find(l.port);
@@ -199,6 +285,9 @@ bool ensureLocalServer(const Config& cfg, int64_t deadline, std::atomic<bool>* c
             _exit(127);
         }
         g_serverPids[l.port] = pid;
+        g_serverSpawned[l.port] = nowMs();
+        // Any session may be the last one out: record the pid for it.
+        (void)atomicWriteFile(stateDir() + "/judge-" + std::to_string(l.port) + ".pid", std::to_string(pid) + "\n");
     }
     while (!cancelled(cancel) && nowMs() < deadline) {
         struct timespec ts{0, 50 * 1000 * 1000};
@@ -220,6 +309,7 @@ std::string clipped(const std::string& text, size_t bytes) {
 double localJudge(const Config& cfg, const std::string& question, const std::string& text,
                   int64_t deadline, std::atomic<bool>* cancel, LocalActivity& progress,
                   bool opportunistic = false) {
+    registerLocalUser(cfg);
     const std::string config = judgeConfigKey(cfg), pauseKey = "local:" + config;
     const std::string ck = json::stringify(json::Array{config, question, text, progress.progressCheck});
     if (cancelled(cancel)) return -1;
@@ -248,8 +338,12 @@ double localJudge(const Config& cfg, const std::string& question, const std::str
     LocalLease lease(cfg.localLm.port, lockDeadline, cancel);
     if (lease.fd < 0) return progress.fail("shared server busy or unavailable");
     if (opportunistic ? !portOpen(cfg.localLm.port) : !ensureLocalServer(cfg, deadline, cancel)) {
-        if (!opportunistic && !cancelled(cancel)) pauseJudge(pauseKey, 60000);
-        return progress.fail("server not ready");
+        // A server still loading its model is not a failure worth a cooldown:
+        // the next decision will find it ready.
+        bool loading = g_serverPids.count(cfg.localLm.port) > 0 &&
+                       nowMs() - g_serverSpawned[cfg.localLm.port] < 180000;
+        if (!opportunistic && !loading && !cancelled(cancel)) pauseJudge(pauseKey, 60000);
+        return progress.fail(loading ? "local model still loading" : "server not ready");
     }
     if (cancelled(cancel) || nowMs() >= deadline) return progress.fail("time budget exhausted");
     size_t bytes = (size_t)std::clamp((long)cfg.localLm.ctx, 512L, 6000L);
@@ -555,24 +649,21 @@ std::string judgeStatus(const Config& cfg) {
     return s;
 }
 
+void judgeWarm(const Config& cfg) {
+    registerLocalUser(cfg);
+    if (cfg.localLm.model.empty() || remoteAvailable(cfg) || portOpen(cfg.localLm.port)) return;
+    std::unique_lock<std::timed_mutex> lk(g_localMu, std::try_to_lock);
+    if (!lk.owns_lock()) return;
+    LocalLease lease(cfg.localLm.port, nowMs() + 200, nullptr);
+    if (lease.fd >= 0) ensureLocalServer(cfg, nowMs(), nullptr);  // past deadline: spawn only
+}
+
+void judgeShutdownOnSignal() { releaseLocalServer(); }
+
 void judgeShutdown() {
     std::lock_guard<std::timed_mutex> lk(g_localMu);
-    for (const auto& [port, pid] : g_serverPids) {
-        // A different session may be borrowing our server. Never tear it down
-        // during its request; on contention leave the shared daemon running.
-        LocalLease lease(port, nowMs() + 1500, nullptr);
-        if (lease.fd < 0 || waitpid(pid, nullptr, WNOHANG) != 0) continue;
-        kill(pid, SIGTERM);
-        int64_t deadline = nowMs() + 1000;
-        while (nowMs() < deadline && waitpid(pid, nullptr, WNOHANG) == 0) {
-            struct timespec ts{0, 25 * 1000 * 1000};
-            nanosleep(&ts, nullptr);
-        }
-        if (waitpid(pid, nullptr, WNOHANG) == 0) {
-            kill(pid, SIGKILL);
-            while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
-        }
-    }
+    releaseLocalServer();
+    for (const auto& [port, pid] : g_serverPids) waitpid(pid, nullptr, WNOHANG);  // reap if stopped
     g_serverPids.clear();
 }
 
@@ -627,8 +718,11 @@ std::string awarenessBlock(const std::string& ws, const Config& cfg, bool allowN
     s += std::string("- tool network: ") + (allowNet ? "on" : "OFF (offline: never retry network commands)") + "\n";
     s += std::string("- destructive commands: ") +
          (interactive ? "a human approves them" : "blocked (non-interactive)") + "\n";
-    s += "- at most " + std::to_string(maxRounds) + " tool rounds per work checkpoint; autonomous work may continue "
-         "within its bounded checkpoint budget when new evidence shows progress; repeated identical calls are stopped\n";
+    // Framing matters: models told "at most N rounds" ration scope. The chunk
+    // size is a harness checkpoint, not a budget for the task.
+    s += "- work is checkpointed every " + std::to_string(maxRounds) + " tool rounds and goals resume automatically "
+         "after each checkpoint while progress continues: never cut scope or skip acceptance criteria to fit it; "
+         "repeated identical calls are stopped\n";
     s += "- every write/edit is quality-scanned; ";
     s += cfg.review ? "an overseer reviews changed work before a turn ends\n" : "reviews are off\n";
     s += "Superpowers: `pocket kit` via bash — web, search, dom, shot, frame, video, img, svg, spring, wav, sfx, audio, slop, "

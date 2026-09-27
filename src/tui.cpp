@@ -22,6 +22,7 @@
 #include "brain.h"
 #include "catalog.h"
 #include "oversee.h"
+#include "process.h"
 #include "skills.h"
 
 namespace pocket {
@@ -80,6 +81,10 @@ TermGuard* g_term = nullptr;
 void onFatalSignal(int sig) {
     writeAll(STDOUT_FILENO, "\033[r\033[?2004l");  // undo region + paste mode
     if (g_term) g_term->leave();
+    // Closing the terminal (SIGHUP) must not orphan tool processes or a
+    // local model nobody else uses.
+    killSessionProcesses(300);
+    judgeShutdownOnSignal();
     signal(sig, SIG_DFL);
     raise(sig);
 }

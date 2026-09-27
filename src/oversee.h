@@ -69,7 +69,14 @@ std::map<std::string, double> decide(const Config& cfg, const json::Value& state
                                      const std::function<void(const std::string&)>& activity = {});
 bool decideAvailable(const Config& cfg);
 std::string judgeStatus(const Config& cfg);  // which judges are live
-void judgeShutdown();                        // stop a llama-server this process started
+// Start the configured local llama-server in the background (never waits)
+// when the remote judges are unavailable, so the first local decision does
+// not spend its whole budget on a cold model load.
+void judgeWarm(const Config& cfg);
+// Leave the shared local llama-server: it is stopped only when no other
+// live PocketHarness session still uses it (per-port users lock).
+void judgeShutdown();
+void judgeShutdownOnSignal();  // async-signal-safe variant for fatal signals
 
 // P(yes) from a llama.cpp /completion body with n_probs (top_logprobs or
 // probs shapes); -1 when yes/no are absent. Pure, unit-tested.

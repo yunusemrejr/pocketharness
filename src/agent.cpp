@@ -2001,7 +2001,9 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
                 pushUser("[progress check] " + hint.substr(0, 1600));
             }
         }
-        if (opts_.maxRounds >= 4 && round + 3 == opts_.maxRounds)
+        // A goal continues past the chunk boundary on its own; warning it would
+        // only make the model trim scope or write a premature status report.
+        if (opts_.maxRounds >= 4 && round + 3 == opts_.maxRounds && goalStatus_ != GoalStatus::Active)
             pushUser("[harness checkpoint] Two tool rounds remain in this work chunk. Consolidate verified progress and "
                      "identify the precise remaining work. Finish only if the task is verified; otherwise continue "
                      "with the next concrete action. Do not end with an incomplete status report or repeat completed work.");

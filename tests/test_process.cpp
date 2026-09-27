@@ -239,3 +239,21 @@ TEST(process_Linger_Detaches_Background_Holders) {
     CHECK(nowMs() - start < 3000);
     return "";
 }
+
+TEST(process_Session_Exit_Stops_Background_Groups) {
+    SpawnOpts opts;
+    opts.exe = "/bin/sh";
+    opts.argv = {"sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $!"};
+    opts.timeoutMs = 20000;
+    auto result = spawn(opts);
+    pid_t bg = (pid_t)std::atol(result.out.c_str());
+    CHECK(result.ok && bg > 1 && kill(bg, 0) == 0);  // outlived its call
+    killSessionProcesses(1000);
+    bool gone = false;
+    for (int i = 0; i < 80 && !gone; ++i) {
+        gone = kill(bg, 0) != 0;
+        if (!gone) usleep(25000);
+    }
+    CHECK(gone);
+    return "";
+}

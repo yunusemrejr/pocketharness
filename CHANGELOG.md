@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.1
+
+- Session exit cleans up after itself. Quitting, closing the
+  terminal (SIGHUP), SIGTERM and SIGQUIT now stop every process group the
+  session started, including backgrounded servers left by `bash` calls
+  (TERM, a short grace, then KILL), so nothing keeps eating RAM or CPU.
+- The local llama.cpp judge is shared safely between sessions: each live
+  session holds a shared lock on `judge-PORT.users`, and the server is
+  stopped only by the last session to leave (verified against its pid file
+  and `/proc/PID/cmdline`). A session no longer kills a local model another
+  PocketHarness session is still using.
+- Local LM: sessions register early and, when no remote judge is
+  available, start the configured model in the background at startup, so
+  the first judgement does not pay the cold start. A model that is still
+  loading is reported as such instead of triggering a 60s cooldown.
+- Long goals: round checkpoints are framed as automatic resumes, not a
+  hard limit, and the "two rounds remain" push is skipped while a goal is
+  active, so the model stops cutting scope to fit a budget.
+
 ## 0.7.0
 
 - Recover from provider hiccups automatically. "Provider returned error",

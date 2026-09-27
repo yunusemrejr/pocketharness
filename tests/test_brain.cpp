@@ -2,7 +2,10 @@
 #include "mini.h"
 
 #include <cmath>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "../src/agent.h"
 #include "../src/brain.h"
@@ -352,5 +355,60 @@ TEST(oversee_Parses_Whitespace_Prefix_And_Rejects_Invalid_Probabilities) {
         {"token":"yes","prob":-1},{"token":"no","prob":2}]}]})") < 0);
     CHECK(parseYesProbability(R"({"completion_probabilities":[{"token":"<think>"},
         {"token":"yes","probs":[{"tok_str":"yes","prob":1}]}]})") < 0);
+    return "";
+}
+
+TEST(oversee_Local_Server_Stops_Only_When_Last_Session_Leaves) {
+    const char* oldHome = getenv("HOME");
+    std::string saved = oldHome ? oldHome : "";
+    char tmpl[] = "/tmp/pocket-judge-XXXXXX";
+    std::string home = mkdtemp(tmpl);
+    // Restores HOME and never leaks the fake server, whichever CHECK fails.
+    struct Cleanup {
+        std::string home, saved;
+        bool hadHome;
+        pid_t server = -1;
+        ~Cleanup() {
+            if (server > 0 && kill(server, SIGKILL) == 0) waitpid(server, nullptr, 0);
+            if (hadHome) setenv("HOME", saved.c_str(), 1); else unsetenv("HOME");
+            (void)!std::system(("rm -rf " + home).c_str());
+        }
+    } cleanup{home, saved, oldHome != nullptr};
+    setenv("HOME", home.c_str(), 1);
+    Config cfg;
+    cfg.jev = false;  // stay local: no remote judge, no network
+    cfg.localLm.model = home + "/none.gguf";  // configured but absent: never spawns
+    cfg.localLm.port = 18999;
+    CHECK(ensureDir(stateDir(), 0700).ok);
+    // A pocket-started server (by some session) recorded in the pid file.
+    pid_t server = fork();
+    if (server == 0) {
+        execl("/bin/sh", "sh", "-c", "while :; do sleep 1; done", "--port", "18999", (char*)nullptr);
+        _exit(127);
+    }
+    cleanup.server = server;
+    std::string pidFile = stateDir() + "/judge-18999.pid";
+    CHECK(atomicWriteFile(pidFile, std::to_string(server) + "\n").ok);
+    usleep(100000);  // let exec land so /proc/PID/cmdline names the port
+    judgeWarm(cfg);  // this session registers as a user
+    // Another live session holds its own share of the same server.
+    int other = open((stateDir() + "/judge-18999.users").c_str(), O_RDWR | O_CLOEXEC);
+    CHECK(other >= 0);
+    if (flock(other, LOCK_SH | LOCK_NB) != 0) { close(other); CHECK(false); }
+    judgeShutdown();
+    CHECK(waitpid(server, nullptr, WNOHANG) == 0);  // still serving the other session
+    judgeWarm(cfg);   // a fresh session in this process
+    close(other);     // the other session exits
+    judgeShutdown();  // last one out stops it
+    int status = 0;
+    bool stopped = false;
+    for (int i = 0; i < 80 && !stopped; ++i) {
+        pid_t r = waitpid(server, &status, WNOHANG);  // -1: already reaped by the release
+        stopped = r == server || (r < 0 && errno == ECHILD);
+        if (!stopped) usleep(25000);
+    }
+    CHECK(stopped);
+    CHECK(access(pidFile.c_str(), F_OK) != 0);
+    if (stopped) cleanup.server = -1;
     return "";
 }
