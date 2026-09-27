@@ -215,10 +215,11 @@ ToolResult toolWrite(ToolEnv& env, const json::Value& args) {
 
 ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
     const std::string& path = args.at("path").asStr();
-    json::Array edits = args.has("edits") ? args.at("edits").asArr() : json::Array{args};
+    // Models often mix both forms (edits plus a top-level pair, or edits:[]);
+    // the top-level pair is then simply one more step.
+    json::Array edits = args.has("edits") ? args.at("edits").asArr() : json::Array{};
+    if (!args.has("edits") || args.has("old_text") || args.has("new_text")) edits.push_back(args);
     if (edits.empty() || edits.size() > 64) return {false, "edit: need 1..64 replacements"};
-    if (args.has("edits") && (args.has("old_text") || args.has("new_text")))
-        return {false, "edit: use edits OR old_text/new_text"};
     auto lock = sessionWorkspaceLock(env.workspace, env.cancel);
     if (!lock.ok) return {false, lock.error};
     struct Lease { int fd; ~Lease() { close(fd); } } lease{lock.value};

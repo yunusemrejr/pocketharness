@@ -392,8 +392,9 @@ bool resolveModelPath(const std::vector<std::string>& roots, const std::string& 
         }
         (void)dummy;
         if (bestIdx < 0) {
-            err = "path escapes allowed roots: " + p +
-                  " (pocket --allow-read/--allow-write <root> permits more)";
+            err = "path escapes allowed roots: " + p + (startsWith(p, "/tmp/") ?
+                  " (use $TMPDIR/" + p.substr(5) + " for private scratch)" :
+                  " (pocket --allow-read/--allow-write <root> permits more)");
             return false;
         }
         out.rootIdx = bestIdx;
@@ -1181,6 +1182,55 @@ bool mentionsDot(const std::string& cmd) {
     return false;
 }
 
+// Argument lists of each rm command in a shell line, split at command
+// separators and with simple quotes removed. Leading wrappers (sudo, env,
+// VAR=value, command, xargs...) are skipped. Crude by design: the kernel
+// sandbox is the real boundary; this only catches obvious accidents.
+std::vector<std::vector<std::string>> rmInvocations(const std::string& cmd) {
+    std::vector<std::vector<std::string>> out;
+    std::vector<std::string> words;
+    std::string word;
+    bool quoted = false;
+    char quote = 0;
+    auto endWord = [&] {
+        if (!word.empty() || quoted) words.push_back(word);
+        word.clear();
+        quoted = false;
+    };
+    auto endSegment = [&] {
+        endWord();
+        size_t i = 0;
+        static const char* kWrap[] = {"sudo", "env", "command", "exec", "nice", "nohup", "time", "xargs", "then",
+                                      "do", "else", "!", nullptr};
+        while (i < words.size()) {
+            bool wrap = words[i].find('=') != std::string::npos && words[i][0] != '-';
+            for (const char** p = kWrap; *p && !wrap; ++p) wrap = words[i] == *p;
+            if (!wrap) break;
+            ++i;
+        }
+        if (i < words.size()) {
+            const std::string& w = words[i];
+            size_t slash = w.rfind('/');
+            std::string base = slash == std::string::npos ? w : w.substr(slash + 1);
+            if (base == "rm" || base == "\\rm")
+                out.emplace_back(words.begin() + (long)i + 1, words.end());
+        }
+        words.clear();
+    };
+    for (char ch : cmd) {
+        if (quote) {
+            if (ch == quote) quote = 0; else word += ch;
+            continue;
+        }
+        if (ch == '\'' || ch == '"') { quote = ch; quoted = true; continue; }
+        if (ch == ' ' || ch == '\t') { endWord(); continue; }
+        if (strchr(";&|\n(){}`", ch)) { endSegment(); continue; }
+        word += ch;
+    }
+    endSegment();
+    return out;
+}
+
 }  // namespace
 
 GuardResult classifyCommand(const std::string& cmd, const std::string& workspace, bool allowNet) {
@@ -1268,51 +1318,56 @@ GuardResult classifyCommand(const std::string& cmd, const std::string& workspace
         r.reason = "broad recursive chmod/chown needs approval";
         return r;
     }
-    // rm -r[f]: the classic. Ask when the target looks broad; Deny when it
-    // clearly points outside the workspace at a system/home root.
-    if (hasWord(c, "rm") && (hasFlag(c, 'r', "--recursive") || hasFlag(c, 'R', "--recursive"))) {
-        bool force = hasFlag(c, 'f', "--force");
-        if (c.find("--no-preserve-root") != std::string::npos) {
-            r.verdict = Verdict::Deny;
-            r.reason = "rm --no-preserve-root blocked";
-            return r;
-        }
-        // Absolute targets outside the workspace: deny outright.
-        // (Inside-workspace absolute paths are fine and common.)
-        for (size_t i = 0; i < c.size(); ++i) {
-            if (c[i] == '/' && (i == 0 || strchr(" \t'\";=|&(", c[i - 1]))) {
-                size_t e = i;
-                while (e < c.size() && !strchr(" \t'\";|&()", c[e])) ++e;
-                std::string tok = c.substr(i, e - i);
-                if (tok == "/" || tok == "/*") {
+    // rm -r[f]: the classic. Judged per rm invocation (its own flags and
+    // targets), so paths and flags elsewhere in the line never leak in.
+    for (const auto& args : rmInvocations(c)) {
+        bool recursive = false, force = false, options = true;
+        std::vector<std::string> targets;
+        for (const auto& a : args) {
+            if (options && a == "--") { options = false; continue; }
+            if (options && startsWith(a, "--")) {
+                if (a == "--no-preserve-root") {
                     r.verdict = Verdict::Deny;
-                    r.reason = "recursive rm of filesystem root blocked";
+                    r.reason = "rm --no-preserve-root blocked";
                     return r;
                 }
-                if (!workspace.empty() && !startsWith(tok, workspace + "/") && tok != workspace &&
-                    tok.find('*') == std::string::npos) {
-                    // Absolute path outside workspace with rm -r: deny.
-                    r.verdict = Verdict::Deny;
-                    r.reason = "recursive rm outside the workspace blocked: " + tok;
-                    return r;
-                }
+                recursive = recursive || a == "--recursive";
+                force = force || a == "--force";
+            } else if (options && a.size() > 1 && a[0] == '-') {
+                recursive = recursive || a.find_first_of("rR") != std::string::npos;
+                force = force || a.find('f') != std::string::npos;
+            } else {
+                targets.push_back(a);
             }
         }
-        if (c.find_first_of("$`") != std::string::npos) {
-            r.verdict = Verdict::Ask;
-            r.reason = "recursive rm with a computed target needs approval";
-            return r;
-        }
-        if (force && (mentionsRootish(c) || mentionsDot(c) || c.find(" *") != std::string::npos ||
-                      c.find("/*") != std::string::npos)) {
-            r.verdict = Verdict::Ask;
-            r.reason = "broad 'rm -rf' needs approval";
-            return r;
-        }
-        if (!force && (mentionsDot(c) || mentionsRootish(c))) {
-            r.verdict = Verdict::Ask;
-            r.reason = "broad recursive rm needs approval";
-            return r;
+        if (!recursive) continue;
+        for (const auto& t : targets) {
+            if (t == "/" || t == "/*") {
+                r.verdict = Verdict::Deny;
+                r.reason = "recursive rm of filesystem root blocked";
+                return r;
+            }
+            // Session scratch is private and already confined by the sandbox.
+            bool scratch = (startsWith(t, "$TMPDIR/") || startsWith(t, "${TMPDIR}/")) &&
+                           t.find("..") == std::string::npos && t.size() > t.find('/') + 1;
+            if (scratch) continue;
+            if (t[0] == '/' && !workspace.empty() && !startsWith(t, workspace + "/") && t != workspace &&
+                t.find('*') == std::string::npos) {
+                r.verdict = Verdict::Deny;
+                r.reason = "recursive rm outside the workspace blocked: " + t;
+                return r;
+            }
+            if (t.find_first_of("$`") != std::string::npos) {
+                r.verdict = Verdict::Ask;
+                r.reason = "recursive rm with a computed target needs approval (use $TMPDIR/name for scratch)";
+                return r;
+            }
+            if (mentionsDot(t) || mentionsRootish(t) || (force && t.find('*') != std::string::npos &&
+                                                         (t == "*" || startsWith(t, "/")))) {
+                r.verdict = Verdict::Ask;
+                r.reason = force ? "broad 'rm -rf' needs approval" : "broad recursive rm needs approval";
+                return r;
+            }
         }
     }
     // git destructive ops.

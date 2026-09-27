@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.5
+
+- The recursive-rm guard now judges each `rm` invocation by its own flags
+  and targets. Previously any `rm` plus any `-r` anywhere in a command line
+  (e.g. `grep -r ...; rm -f x`) made every absolute path in the line, URL
+  fragments included, look like an rm target and blocked the whole command.
+  `rm -rf "$TMPDIR/name"` scratch cleanup is allowed.
+- `edit` accepts mixed forms: a top-level `old_text`/`new_text` beside an
+  `edits` array (even an empty one) is applied as one more step instead of
+  failing the call.
+- Writes to `/tmp/...` outside allowed roots now say to use `$TMPDIR/...`.
+
 ## 0.5.4
 
 - Goal audits no longer kill autonomous goals. An auditor that hits its

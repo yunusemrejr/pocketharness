@@ -176,6 +176,12 @@ TEST(tools_Batched_Edit_Is_Atomic) {
     r = runTool(f.env, "edit", R"({"path":"a","edits":[{"old_text":"alpha","new_text":"A"},{"old_text":"beta","new_text":"B"}]})");
     CHECK(r.ok);
     CHECK_EQ(boxRead(f.auth, "a", 100).value, std::string("A B"));
+    // Mixed forms: the top-level pair is one more step, even beside edits:[].
+    r = runTool(f.env, "edit", R"({"path":"a","edits":[{"old_text":"A","new_text":"a"}],"old_text":"B","new_text":"b"})");
+    CHECK(r.ok);
+    r = runTool(f.env, "edit", R"({"path":"a","edits":[],"old_text":"a b","new_text":"A B","expected_matches":1})");
+    CHECK(r.ok);
+    CHECK_EQ(boxRead(f.auth, "a", 100).value, std::string("A B"));
     // A wrong type must not silently become an empty replacement or empty file.
     CHECK(!runTool(f.env, "write", R"({"path":"a","content":null})").ok);
     CHECK(!runTool(f.env, "edit", R"({"path":"a","old_text":"A","new_text":false})").ok);

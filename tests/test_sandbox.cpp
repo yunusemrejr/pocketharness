@@ -221,6 +221,17 @@ TEST(sandbox_Guard) {
         {"rm -rf ../sibling", Verdict::Ask},
         {"rm -rf /tmp/x", Verdict::Deny},  // outside workspace
         {"rm -rf --no-preserve-root x", Verdict::Deny},
+        {"sudo rm -rf /etc", Verdict::Deny},
+        {"cd /ws && rm -fr '/'", Verdict::Deny},
+        {"x=1; /bin/rm -r -f /opt/y", Verdict::Deny},
+        {"rm -rf \"$P\"", Verdict::Ask},
+        {"rm -rf $(pwd)", Verdict::Ask},
+        // Flags and paths outside the rm invocation never count as its targets.
+        {"grep -r foo src; rm -f out.txt > /tmp/log", Verdict::Allow},
+        {"wait; rm -f public/_narr.html\nconvert /tmp/a.png /tmp/b.png", Verdict::Allow},
+        {"chrome --run-all http://127.0.0.1/#/x; rm -f /ws/a", Verdict::Allow},
+        {"rm -rf \"$TMPDIR/px1\" build", Verdict::Allow},
+        {"rm -rf $TMPDIR/../x", Verdict::Ask},
         {"git reset --hard", Verdict::Ask},
         {"git clean -fdx", Verdict::Ask},
         {"git branch -D foo", Verdict::Ask},
