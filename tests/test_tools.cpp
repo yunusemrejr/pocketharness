@@ -212,8 +212,18 @@ TEST(tools_Pipelines_And_Command_Validation) {
     CHECK(f.ok);
     CHECK(!runTool(f.env, "bash", R"({"command":"false | cat"})").ok);
     CHECK(!runTool(f.env, "bash", R"({"command":"echo OK\u0000; echo HIDDEN"})").ok);
-    CHECK(!runTool(f.env, "bash", R"({"command":"echo OK","timeout":1.2})").ok);
-    CHECK(!runTool(f.env, "read", R"({"path":"a","limti":4})").ok);
+    // Lenient intake: a fractional timeout falls back to the default, unknown
+    // keys are ignored, aliases and numeric strings are accepted.
+    CHECK(runTool(f.env, "bash", R"({"command":"echo OK","timeout":1.2})").ok);
+    CHECK(runTool(f.env, "bash", R"({"cmd":"echo OK","timeout":"30","why":"x"})").ok);
+    CHECK(runTool(f.env, "write", R"({"file_path":"lenient.txt","content":"a b"})").ok);
+    CHECK(runTool(f.env, "edit", R"({"path":"lenient.txt","expected_matches":0,)"
+                                 R"("edits":[{"old_string":"a","new_string":"c","expected_matches":"1"}]})").ok);
+    CHECK(runTool(f.env, "read", R"({"path":"lenient.txt","limti":4})").output.find("c b") != std::string::npos);
+    CHECK(!runTool(f.env, "bash", R"({"command":["echo"]})").ok);
+    // The shell is not visible in argv: pkill -f must not kill itself.
+    auto self = runTool(f.env, "bash", R"({"command":"pkill -f zzq_no_such_proc_marker; echo alive"})");
+    CHECK(self.output.find("alive") != std::string::npos);
     for (const char* command : {"/bin/rm -rf /", "/sbin/mkfs.ext4 /dev/sda", "/usr/bin/curl https://x"})
         CHECK(classifyCommand(command, f.ws, false).verdict == Verdict::Deny);
     return "";

@@ -226,3 +226,16 @@ TEST(process_Parent_Death_Terminates_Child) {
     CHECK(started && closed);
     return "";
 }
+
+TEST(process_Linger_Detaches_Background_Holders) {
+    SpawnOpts opts;
+    opts.exe = "/bin/sh";
+    opts.argv = {"sh", "-c", "echo up; sleep 30 & exit 3"};
+    opts.timeoutMs = 20000;
+    opts.lingerMs = 200;
+    auto start = nowMs();
+    auto result = spawn(opts);
+    CHECK(result.detached && !result.timedOut && result.exitCode == 3 && result.out == "up\n");
+    CHECK(nowMs() - start < 3000);
+    return "";
+}

@@ -25,6 +25,9 @@ struct SpawnOpts {
     std::function<void(std::string_view, bool isErr)> onChunk;  // capped at outLimit per stream
     std::atomic<bool>* cancel = nullptr;   // set true to kill child
     long terminateGraceMs = 750;           // TERM cleanup before KILL; bounded to 0..5000
+    // After the leader exits, wait at most this long for inherited pipes to
+    // close (background children keep them open). -1 = wait for EOF.
+    long lingerMs = -1;
 };
 
 struct SpawnResult {
@@ -34,6 +37,7 @@ struct SpawnResult {
     bool timedOut = false;
     bool cancelled = false;
     bool truncated = false;  // output hit outLimit
+    bool detached = false;   // leader exited; background children still held the pipes
     std::string out;
     std::string err;
     std::string error;  // spawn/wait failure description

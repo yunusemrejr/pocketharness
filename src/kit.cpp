@@ -793,6 +793,31 @@ int kitSym(const std::vector<std::string>& a, bool refs) {
 int kitMain(int argc, char** argv) {
     std::string sub = argc > 1 ? argv[1] : "";
     std::vector<std::string> a(argv + std::min(argc, 2), argv + argc);
+    static const char* kHelp =
+        "pocket kit — native superpowers (run via bash)\n"
+        "  web URL [--raw]        fetch a page as readable text + numbered links\n"
+        "  search QUERY           web search (title, url, snippet)\n"
+        "  dom URL                JS-rendered page text via headless Chrome\n"
+        "  shot URL OUT.png [WxH] screenshot via headless Chrome (visual QA)\n"
+        "  frame HTML OUT.png     deterministic scene frame (--time, --size)\n"
+        "  video HTML OUT.mp4     render a scene (--duration, --fps, --size, --audio)\n"
+        "  sfx OUT.wav PRESET     native click/chime/laser/whoosh/impact/tone/noise\n"
+        "  img FILE...            image type + dimensions (png/jpeg/gif/webp/svg)\n"
+        "  svg FILE               SVG lint: structure, viewBox, ids, animation count\n"
+        "  spring [k] [c] [m]     physical spring -> CSS linear() easing + duration\n"
+        "  wav OUT \"C4:.25 R:.25\"  synthesize notes to WAV (--wave, --bpm, --gain)\n"
+        "  audio FILE.wav         loudness, peak, clipping, pitch, silence\n"
+        "  slop FILE...           placeholders, stubs, conflict markers, AI-tell prose\n"
+        "  find QUERY             ranked code search (BM25 over chunks; no index to maintain)\n"
+        "  sym NAME|.             definitions of NAME (\".\" = outline of every declaration)\n"
+        "  refs NAME              whole-word references to NAME\n"
+        "  probe [DIR]            host: OS, CPU, memory, disk, GPU, toolchain\n";
+    // `kit SUB --help` is a question, not a failure: print that line, exit 0.
+    if (!a.empty() && (a[0] == "--help" || a[0] == "-h")) {
+        for (const auto& line : splitLines(kHelp))
+            if (startsWith(line, "  " + sub + " ")) { printf("usage: pocket kit %s\n", trim(line).c_str()); return 0; }
+    }
+    if (sub == "--help" || sub == "-h") sub = "help";
     if (sub == "web") return kitWeb(a);
     if (sub == "search") return kitSearch(a);
     if (sub == "shot") return kitShot(a, false);
@@ -810,24 +835,7 @@ int kitMain(int argc, char** argv) {
     if (sub == "find") return kitFind(a);
     if (sub == "sym") return kitSym(a, false);
     if (sub == "refs") return kitSym(a, true);
-    printf("pocket kit — native superpowers (run via bash)\n"
-           "  web URL [--raw]        fetch a page as readable text + numbered links\n"
-           "  search QUERY           web search (title, url, snippet)\n"
-           "  dom URL                JS-rendered page text via headless Chrome\n"
-           "  shot URL OUT.png [WxH] screenshot via headless Chrome (visual QA)\n"
-           "  frame HTML OUT.png     deterministic scene frame (--time, --size)\n"
-           "  video HTML OUT.mp4     render a scene (--duration, --fps, --size, --audio)\n"
-           "  sfx OUT.wav PRESET     native click/chime/laser/whoosh/impact/tone/noise\n"
-           "  img FILE...            image type + dimensions (png/jpeg/gif/webp/svg)\n"
-           "  svg FILE               SVG lint: structure, viewBox, ids, animation count\n"
-           "  spring [k] [c] [m]     physical spring -> CSS linear() easing + duration\n"
-           "  wav OUT \"C4:.25 R:.25\"  synthesize notes to WAV (--wave, --bpm, --gain)\n"
-           "  audio FILE.wav         loudness, peak, clipping, pitch, silence\n"
-           "  slop FILE...           placeholders, stubs, conflict markers, AI-tell prose\n"
-           "  find QUERY             ranked code search (BM25 over chunks; no index to maintain)\n"
-           "  sym NAME|.             definitions of NAME (\".\" = outline of every declaration)\n"
-           "  refs NAME              whole-word references to NAME\n"
-           "  probe [DIR]            host: OS, CPU, memory, disk, GPU, toolchain\n");
+    printf("%s", kHelp);
     return sub.empty() || sub == "help" ? 0 : 2;
 }
 

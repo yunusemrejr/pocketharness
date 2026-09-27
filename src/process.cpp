@@ -141,6 +141,7 @@ SpawnResult spawn(const SpawnOpts& opts) {
     char buf[65536];
     int status = 0;
     bool reaped = false;
+    int64_t reapedAt = -1;
 
     auto elapsed = [&]() { return nowMs() - start; };
     auto terminate = [&] {
@@ -224,6 +225,7 @@ SpawnResult spawn(const SpawnOpts& opts) {
             pid_t w = waitpid(pid, &status, WNOHANG);
             if (w == pid) {
                 reaped = true;
+                reapedAt = nowMs();
             } else if (w < 0 && errno != EINTR) {
                 r.error = "waitpid failed";
                 break;
@@ -232,6 +234,11 @@ SpawnResult spawn(const SpawnOpts& opts) {
         if (reaped && terminateAt >= 0) {
             if (killed) break;  // escaped descendants cannot hold pipes open forever
             if (pout[0] < 0 && perr[0] < 0 && kill(-pid, 0) != 0 && errno == ESRCH) break;
+        }
+        if (reaped && terminateAt < 0 && opts.lingerMs >= 0 && (pout[0] >= 0 || perr[0] >= 0) &&
+            nowMs() - reapedAt >= opts.lingerMs) {
+            r.detached = true;  // a backgrounded server must not pin the call until timeout
+            break;
         }
     }
     if (pin[1] >= 0) close(pin[1]);

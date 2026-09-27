@@ -117,18 +117,25 @@ TEST(transport_Partial_And_Error_Streams_Fail_Closed) {
     CHECK(ensureDir(stateDir(), 0700).ok);
     LocalServer server({
         http("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write\",\"arguments\":\"{}\"}}]}}]}\n\n"),
-        http("data: {\"error\":{\"message\":\"overloaded\"}}\n\n"),
+        http("data: {\"error\":{\"message\":\"Provider returned error\"}}\n\n"),
+        http("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"),
         http("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\n"),
-        http("")});
+        http("data: {\"error\":{\"message\":\"invalid model id\"}}\n\n")});
     CHECK(!server.url.empty());
     auto req = requestFor(server);
-    for (int i = 0; i < 4; ++i) {
-        auto r = chatRequest(req, {});
+    // Truncated tool stream and an in-band upstream error, both before any
+    // visible token: retried transparently, and the third answer succeeds.
+    auto r = chatRequest(req, {});
+    CHECK(r.ok && r.value.text == "ok");
+    // Visible output and deterministic in-band errors are never retried:
+    // each fails on its own single request.
+    for (int i = 0; i < 2; ++i) {
+        r = chatRequest(req, {});
         CHECK(!r.ok);
-        if (i == 1) CHECK(r.error.find("overloaded") != std::string::npos);
+        if (i == 1) CHECK(r.error.find("invalid model") != std::string::npos);
     }
     server.join();
-    CHECK_EQ(server.requests.size(), (size_t)4);  // no hidden retries of malformed 200s
+    CHECK_EQ(server.requests.size(), (size_t)5);
     rmRf(dir);
     return "";
 }

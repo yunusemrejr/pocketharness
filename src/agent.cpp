@@ -554,8 +554,29 @@ bool isTransientProviderError(const std::string& err) {
             err.find("timed out") != std::string::npos || startsWith(err, "curl") ||
             err.find("empty response") != std::string::npos ||
             err.find("ended before completion") != std::string::npos ||
-            err.find("Could not resolve") != std::string::npos);
+            err.find("Could not resolve") != std::string::npos || isTransientProviderMessage(err));
 }
+
+namespace {
+// A 4xx that says the model cannot take image input (text-only local
+// models, some routes): the request is resent with images as text notes.
+bool isVisionRejection(const std::string& err) {
+    std::string e = toLower(err);
+    return startsWith(e, "http 4") && e.find("image") != std::string::npos &&
+           (e.find("support") != std::string::npos || e.find("vision") != std::string::npos ||
+            e.find("multimodal") != std::string::npos || e.find("not allowed") != std::string::npos);
+}
+bool stripImages(std::vector<ChatMessage>& msgs) {
+    bool any = false;
+    for (auto& m : msgs) {
+        if (m.images.empty()) continue;
+        m.content += "\n[" + std::to_string(m.images.size()) + " image(s) omitted: this model has no image input]";
+        m.images.clear();
+        any = true;
+    }
+    return any;
+}
+}  // namespace
 
 Result<ChatResponse> Agent::requestOnce() {
     std::string bad = validateHistory(messages_);
@@ -582,7 +603,19 @@ Result<ChatResponse> Agent::requestOnce() {
     };
     lastEstimate_ = estimateContext();
     int64_t t0 = nowMs();
-    auto r = opts_.request(req, cb);
+    auto blind = [&] { return std::find(blind_.begin(), blind_.end(), req.model.spec) != blind_.end(); };
+    auto send = [&] {
+        if (blind()) stripImages(req.messages);
+        auto res = opts_.request(req, cb);
+        if (!res.ok && isVisionRejection(res.error) && !blind() && stripImages(req.messages)) {
+            blind_.push_back(req.model.spec);
+            if (opts_.onNotice) opts_.onNotice(req.model.spec + " has no image input; resending without images");
+            usageSeen = false;
+            res = opts_.request(req, cb);
+        }
+        return res;
+    };
+    auto r = send();
     // Fallback role: a provider that stays down after its own retries hands
     // this request to the fallback model. Payload errors (4xx) never switch.
     bool transient = !r.ok && isTransientProviderError(r.error);
@@ -596,7 +629,19 @@ Result<ChatResponse> Agent::requestOnce() {
         used = &opts_.fallback[0];
         ++stats_.fallbacks;
         usageSeen = false;
-        r = opts_.request(req, cb);
+        r = send();
+    }
+    // Same-model recovery: errors that surfaced after streaming began (or
+    // outlived the provider's own retries) get two more calm attempts.
+    for (int again = 0; again < 2 && !r.ok && isTransientProviderError(r.error) &&
+                        r.error.find("empty response") == std::string::npos && !(opts_.cancel && opts_.cancel->load()); ++again) {
+        long ms = opts_.recoverDelayMs * (again ? 4 : 1);
+        if (opts_.onNotice)
+            opts_.onNotice("provider error (" + r.error.substr(0, 120) + "); recovering, retry in " +
+                           std::to_string(ms / 1000) + "s");
+        if (!sleepCancellable(ms, opts_.cancel)) return Result<ChatResponse>::Err("cancelled");
+        usageSeen = false;
+        r = send();
     }
     stats_.genMs += nowMs() - t0;
     if (!r.ok) return r;
@@ -606,7 +651,8 @@ Result<ChatResponse> Agent::requestOnce() {
 }
 
 Result<ChatResponse> Agent::sideRequest(const ResolvedModel& m, const std::string& system,
-                                        const std::string& user, long maxTokens) {
+                                        const std::string& user, long maxTokens,
+                                        std::vector<ChatResponse>* deferred) {
     ChatRequest req;
     req.model = m;
     req.system = system;
@@ -622,7 +668,11 @@ Result<ChatResponse> Agent::sideRequest(const ResolvedModel& m, const std::strin
     ChatCallbacks cb;
     cb.cancel = opts_.cancel;
     bool usageSeen = false;
-    cb.onUsage = [&](const ChatResponse& usage) { usageSeen = true; recordResponse(usage, 0, &m, true); };
+    auto record = [&](const ChatResponse& u, long ms) {
+        if (deferred) deferred->push_back(u);
+        else recordResponse(u, ms, &m, true);
+    };
+    cb.onUsage = [&](const ChatResponse& usage) { usageSeen = true; record(usage, 0); };
     int64_t t0 = nowMs();
     auto r = opts_.request(req, cb);
     // Models that reason despite thinking=off can spend a small budget
@@ -635,7 +685,7 @@ Result<ChatResponse> Agent::sideRequest(const ResolvedModel& m, const std::strin
         t0 = nowMs();
         r = opts_.request(req, cb);
     }
-    if (r.ok && !usageSeen) recordResponse(r.value, nowMs() - t0, &m, true);
+    if (r.ok && !usageSeen) record(r.value, nowMs() - t0);
     return r;
 }
 
@@ -785,6 +835,25 @@ void Agent::pushUser(const std::string& text) {
     ChatMessage um{"user", text, {}, ""};
     um.images = std::move(pendingImages_);
     pendingImages_.clear();
+    if (!um.images.empty()) {
+        // Pixels are the costliest context and stale screenshots teach little.
+        // Past 12 attached images, older ones drop in one batch (down to the
+        // newest 4 incl. these), so the cached prefix breaks rarely, not per read.
+        size_t total = um.images.size();
+        for (const auto& m : messages_) total += m.images.size();
+        if (total > 12) {
+            size_t keep = um.images.size() >= 4 ? 0 : 4 - um.images.size();
+            for (size_t i = messages_.size(); i-- > 0;) {
+                auto& m = messages_[i];
+                if (m.images.empty()) continue;
+                if (keep >= m.images.size()) { keep -= m.images.size(); continue; }
+                size_t drop = m.images.size() - keep;
+                m.images.erase(m.images.begin(), m.images.begin() + (long)drop);
+                keep = 0;
+                m.content += "\n[" + std::to_string(drop) + " older image(s) dropped from context; read the file again to re-inspect]";
+            }
+        }
+    }
     messages_.push_back(std::move(um));
     appendSession(SessionEvent{"user", text, "", "", "", true});
 }
@@ -951,15 +1020,31 @@ std::string Agent::councilReview() {
         "Reply exactly LGTM if acceptable; otherwise a terse numbered list of defects with file names.";
     int objections = 0, answered = 0;
     std::string findings;
-    for (const auto& m : council) {
-        auto r = sideRequest(m, sys, digest, 1200);
+    // Reviewers run concurrently: the council costs one reviewer's latency,
+    // not the sum. Usage is recorded here after the join.
+    std::vector<Result<ChatResponse>> votes(council.size(), Result<ChatResponse>::Err("not run"));
+    std::vector<std::vector<ChatResponse>> usages(council.size());
+    std::vector<std::thread> pool;
+    for (size_t i = 0; i < council.size(); ++i)
+        pool.emplace_back([&, i] {
+            try {
+                votes[i] = sideRequest(council[i], sys, digest, 1200, &usages[i]);
+            } catch (...) {
+                votes[i] = Result<ChatResponse>::Err("reviewer failed");
+            }
+        });
+    for (auto& t : pool) t.join();
+    for (size_t i = 0; i < council.size(); ++i) {
+        for (const auto& u : usages[i]) recordResponse(u, 0, &council[i], true);
+        const auto& r = votes[i];
         if (!r.ok) continue;
-        ++answered;
         std::string t = trim(r.value.text);
-        if (t.empty()) { --answered; continue; }
-        if (toLower(t) == "lgtm") continue;
+        if (t.empty()) continue;
+        ++answered;
+        std::string lt = toLower(t);
+        if (startsWith(lt, "lgtm") && lt.size() < 48) continue;  // "LGTM." / "LGTM - looks fine"
         ++objections;
-        findings += (council.size() > 1 ? "(" + m.spec + ")\n" : "") + t.substr(0, 3000) + "\n";
+        findings += (council.size() > 1 ? "(" + council[i].spec + ")\n" : "") + t.substr(0, 3000) + "\n";
     }
     ++stats_.reviews;
     if (opts_.onNotice)
@@ -1090,7 +1175,7 @@ void Agent::readWorkspaceUpdates() {
 // The planning council: interpret the request the way the best domain
 // expert would, decide the open questions from evidence, and fix
 // acceptance criteria that the reviewers and goal audits later enforce.
-std::string Agent::makeBrief(const std::string& request) {
+std::string Agent::makeBrief(const std::string& request, std::vector<ChatResponse>* deferred) {
     ResolvedModel m = opts_.fast.empty() ? opts_.model : opts_.fast[0];
     std::string snapshot;
     if (opts_.tools) {
@@ -1119,9 +1204,9 @@ std::string Agent::makeBrief(const std::string& request) {
         "ACCEPTANCE: 3-7 checkable criteria.\n"
         "AVOID: the generic, average outcome for this request.",
         "REQUEST:\n" + request.substr(0, 6000) + "\n\nPROJECT:\n" + snapshot + "\nWISDOM:\n" + wisdomFor(request, 5000),
-        900);
+        900, deferred);
     if (!r.ok || trim(r.value.text).empty()) return "";
-    if (opts_.onNotice) opts_.onNotice("brief: request interpreted by " + m.spec);
+    if (!deferred && opts_.onNotice) opts_.onNotice("brief: request interpreted by " + m.spec);
     return "[brief — the harness's expert interpretation; the request above wins on conflict]\n" + trim(r.value.text);
 }
 
@@ -1331,6 +1416,7 @@ std::string Agent::runDoublePass() {
         std::vector<std::string> notes;
         long elapsedMs = 0;
         int toolCalls = 0, reads = 0, bashes = 0;
+        std::vector<std::string> evidence;  // successful reads/commands, for the digest
     };
     Stream streams[2];
     // Thread contract: workers share only immutable snapshots (base, tails,
@@ -1343,6 +1429,7 @@ std::string Agent::runDoublePass() {
     bool retryBudget = contextUsed() + completionBudget() <= contextMax();
     std::atomic<bool> streamsCancel{false};
     std::atomic<int> streamsDone{0};
+    std::atomic<int> streamsOk{0};
     auto runStream = [&](int i) {
         Stream& s = streams[i];
         ToolEnv tenv = evidenceTmpl;  // private clone: nothing shared leaks back
@@ -1354,8 +1441,14 @@ std::string Agent::runDoublePass() {
             std::string text;
             Result<ChatResponse> last = Result<ChatResponse>::Err("not run");
             bool settled = false;
-            for (int round = 0; round < kDoubleToolRounds && s.toolCalls < kDoubleToolCalls; ++round) {
+            // One extra conclusion round: once the evidence budget is spent the
+            // stream is told to write its brief instead of ending mid-search.
+            for (int round = 0; round <= kDoubleToolRounds; ++round) {
                 if (streamsCancel.load()) { last = Result<ChatResponse>::Err("cancelled"); break; }
+                bool final = round == kDoubleToolRounds || s.toolCalls >= kDoubleToolCalls;
+                if (final && round > 0)
+                    hist.push_back(ChatMessage{"user", "[double] Evidence budget spent: no more tool calls. "
+                                                       "Write the final brief now.", {}, ""});
                 ChatRequest req = base;
                 req.messages = hist;
                 ChatCallbacks cb;
@@ -1380,6 +1473,7 @@ std::string Agent::runDoublePass() {
                 else if (!r.value.text.empty()) text = r.value.text;
                 if (r.value.calls.empty()) { settled = true; break; }
                 if (!hasEvidence) { settled = true; break; }  // never offered: never executed
+                if (final) break;
                 hist.push_back(ChatMessage{"assistant", chunk.empty() ? r.value.text : chunk, r.value.calls, ""});
                 size_t n = std::min(r.value.calls.size(), kDoubleBatchCap);
                 if (r.value.calls.size() > n) s.notes.push_back("tool batch capped");
@@ -1391,6 +1485,12 @@ std::string Agent::runDoublePass() {
                     ++s.toolCalls;
                     if (tc.name == "read") ++s.reads;
                     else if (tc.name == "bash") ++s.bashes;
+                    if (tr.ok && (tc.name == "read" || tc.name == "bash")) {
+                        auto a = json::parse(tc.argsJson);
+                        const char* key = tc.name == "read" ? "path" : "command";
+                        std::string k = a.ok && a.value.at(key).isStr() ? a.value.at(key).asStr() : "";
+                        if (!k.empty()) s.evidence.push_back(tc.name + " " + k.substr(0, 160));
+                    }
                     hist.push_back(ChatMessage{"tool", capToolResult(tr.output), {}, tc.id});
                 }
             }
@@ -1420,16 +1520,28 @@ std::string Agent::runDoublePass() {
     // Caller-thread monitor: mirrors user cancellation into the phase
     // atomic and fires the deadline the same way. Workers always terminate
     // (in-flight requests abort on cancel), so every join below returns and
-    // no thread is ever detached or orphaned.
-    auto waitPhase = [&](std::atomic<int>& finished, int want, std::atomic<bool>& cancel, const char* what) {
-        int64_t t0 = nowMs();
+    // no thread is ever detached or orphaned. With `okCount`, a stream still
+    // running well after its twin succeeded is cut off (straggler): the
+    // survivor path beats waiting out the full deadline.
+    auto waitPhase = [&](std::atomic<int>& finished, int want, std::atomic<bool>& cancel, const char* what,
+                         std::atomic<int>* okCount = nullptr) {
+        int64_t t0 = nowMs(), firstOk = -1;
         bool expired = false;
         while (finished.load() < want) {
+            int64_t now = nowMs();
             if (opts_.cancel && opts_.cancel->load()) cancel.store(true);
-            if (!expired && nowMs() - t0 >= deadlineMs) {
+            if (!expired && now - t0 >= deadlineMs) {
                 expired = true;
                 cancel.store(true);
                 note(std::string("Double: ") + what + " deadline exceeded; cancelling slow stream(s)");
+            }
+            if (okCount && firstOk < 0 && okCount->load() > 0) firstOk = now;
+            if (!expired && firstOk >= 0 &&
+                now - firstOk >= std::max(std::min(deadlineMs / 4, 90000L), firstOk - t0)) {
+                expired = true;
+                cancel.store(true);
+                note("Double: second stream straggling " + std::to_string((now - firstOk) / 1000) +
+                     "s behind; continuing with the finished analysis");
             }
             if (finished.load() >= want) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(25));
@@ -1443,10 +1555,11 @@ std::string Agent::runDoublePass() {
             } catch (...) {
                 streams[i].result = Result<ChatResponse>::Err("unexpected double-stream failure");
             }
+            if (streams[i].result.ok) streamsOk.fetch_add(1);
             streamsDone.fetch_add(1);
         });
     }
-    waitPhase(streamsDone, 2, streamsCancel, "first-pass");
+    waitPhase(streamsDone, 2, streamsCancel, "first-pass", &streamsOk);
     workers[0].join();
     workers[1].join();
     if (opts_.cancel && opts_.cancel->load()) return "cancelled";
@@ -1466,6 +1579,20 @@ std::string Agent::runDoublePass() {
         if (streams[i].toolCalls > 0)
             note("Double " + std::string(i ? "B" : "A") + ": evidence (" +
                  std::to_string(streams[i].reads) + " reads, " + std::to_string(streams[i].bashes) + " commands)");
+    }
+    // What the evidence passes already inspected (outputs are not carried
+    // over): lets the main loop skip redundant exploration and re-read only
+    // what it needs.
+    std::string digest;
+    {
+        std::set<std::string> seen;
+        int kept = 0;
+        for (const auto& s : streams)
+            for (const auto& e : s.evidence)
+                if (kept < 24 && seen.insert(e).second) { digest += "\n- " + e; ++kept; }
+        if (!digest.empty())
+            digest = "\n\nAlready inspected by the analyses (outputs not in context; re-run only what you need):" +
+                     digest;
     }
     auto tokCount = [&](const Stream& s) -> long {
         for (auto it = s.usages.rbegin(); it != s.usages.rend(); ++it)
@@ -1496,7 +1623,7 @@ std::string Agent::runDoublePass() {
         if (!persistenceError_.empty()) return "session persistence failed: " + persistenceError_;
         pushUser("[double] Plan from an uncorroborated single analysis (the parallel Double stream failed: " +
                  streams[failed].result.error.substr(0, 160) + "; this plan had no cross-check; survivor " +
-                 routeTag(routes[surv]) + "):\n" + streams[surv].text);
+                 routeTag(routes[surv]) + "):\n" + streams[surv].text + digest);
         return persistenceError_.empty() ? "" : "session persistence failed: " + persistenceError_;
     }
     std::string degraded;
@@ -1578,7 +1705,7 @@ std::string Agent::runDoublePass() {
     if (reco.result.ok && !trim(reco.brief).empty()) {
         std::string served = recoRoute.verified ? "" : " (" + routeTag(recoRoute) + ")";
         pushUser("[double] Unified plan from two independent analyses by " + opts_.model.spec + served +
-                 " (reconciled; verify against tools, do not treat as ground truth):\n" + reco.brief);
+                 " (reconciled; verify against tools, do not treat as ground truth):\n" + reco.brief + digest);
         note("Double: unified plan ready");
         return persistenceError_.empty() ? "" : "session persistence failed: " + persistenceError_;
     }
@@ -1599,7 +1726,8 @@ std::string Agent::runDoublePass() {
              routeTag(routes[0]) + "] ---\n" + seed(streams[0].text) + "\n\n--- Analysis B [" + routeTag(routes[1]) +
              "] ---\n" + seed(streams[1].text) +
              "\n\nInstruction: weigh their evidence, resolve contradictions, and commit to one path. Verify "
-             "against tools; do not treat either analysis as ground truth.");
+             "against tools; do not treat either analysis as ground truth." +
+             digest);
     return persistenceError_.empty() ? "" : "session persistence failed: " + persistenceError_;
 }
 
@@ -1672,16 +1800,41 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
         if (opts_.tools) opts_.tools->changedFiles.clear();
     }
     std::string text = userText;
-    if (!continuation && opts_.brief && goalStatus_ != GoalStatus::Active && needsBrief(userText)) {
-        std::string b = makeBrief(userText);
-        if (!b.empty()) text += "\n\n" + b;
-    }
+    // The brief (fast model) and the skill hint (decisions API) are
+    // independent: the brief runs on a worker without callbacks while the
+    // hint runs here, so the turn waits for the slower one, not the sum.
+    std::string brief;
+    std::vector<ChatResponse> briefUsage;
+    std::thread briefWorker;
+    if (!continuation && opts_.brief && goalStatus_ != GoalStatus::Active && needsBrief(userText))
+        briefWorker = std::thread([&] {
+            try {
+                brief = makeBrief(userText, &briefUsage);
+            } catch (...) {
+                brief.clear();
+            }
+        });
+    std::string hint;
     if (!continuation && opts_.hint) {
         double cost = 0;
-        std::string h = opts_.hint(userText, &cost);
+        try {
+            hint = opts_.hint(userText, &cost);
+        } catch (...) {
+            if (briefWorker.joinable()) briefWorker.join();  // never unwind past a live thread
+            throw;
+        }
         if (cost > 0) { stats_.sideCost += cost; stats_.cost += cost; stats_.costSeen = true; }
-        if (!h.empty()) text += "\n\n" + h;
     }
+    if (briefWorker.joinable()) {
+        briefWorker.join();
+        const ResolvedModel& bm = opts_.fast.empty() ? opts_.model : opts_.fast[0];
+        for (const auto& u : briefUsage) recordResponse(u, 0, &bm, true);
+        if (!brief.empty()) {
+            if (opts_.onNotice) opts_.onNotice("brief: request interpreted by " + bm.spec);
+            text += "\n\n" + brief;
+        }
+    }
+    if (!hint.empty()) text += "\n\n" + hint;
     stats_.turns++;
     pushUser(text);
     // Double mode: two concurrent independent first passes plus one
@@ -1968,6 +2121,7 @@ std::string Agent::continueGoal(int maxCycles) {
         if (cancelled()) return finishGoal("cancelled");
     }
     ResolvedModel auditor = opts_.fast.empty() ? opts_.model : opts_.fast[0];
+    int providerStrikes = 0;
     for (int cycle = 0; cycle < maxCycles; ++cycle) {
         if (!persistenceError_.empty()) return finishGoal("session persistence failed: " + persistenceError_);
         if (cancelled()) return finishGoal("cancelled");
@@ -1991,6 +2145,18 @@ std::string Agent::continueGoal(int maxCycles) {
                 }
             }
             if (!err.empty()) {
+                // A provider outage that outlived every retry pauses only after
+                // a few cooled-down attempts; goals should ride out blips.
+                if (lastStopReason_ == "provider_error" && isTransientProviderError(err) && providerStrikes < 3 &&
+                    !cancelled()) {
+                    long ms = opts_.recoverDelayMs * 8 * ++providerStrikes;
+                    if (opts_.onNotice)
+                        opts_.onNotice("goal: provider unavailable (" + err.substr(0, 100) + "); resuming in " +
+                                       std::to_string(ms / 1000) + "s");
+                    if (!sleepCancellable(ms, opts_.cancel)) return finishGoal("cancelled");
+                    goalNext_ = continuation();
+                    continue;
+                }
                 if (lastStopReason_ != "round_limit") return finishGoal(err);
                 if (!turnMadeProgress_)
                     return finishGoal("goal paused: work chunk made no new successful observations; change approach before resuming",

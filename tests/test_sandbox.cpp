@@ -232,6 +232,18 @@ TEST(sandbox_Guard) {
         {"chrome --run-all http://127.0.0.1/#/x; rm -f /ws/a", Verdict::Allow},
         {"rm -rf \"$TMPDIR/px1\" build", Verdict::Allow},
         {"rm -rf $TMPDIR/../x", Verdict::Ask},
+        // mktemp-assigned variables are fresh scratch; others stay computed.
+        {"P=$(mktemp -d); touch \"$P/a\"; rm -rf \"$P\"", Verdict::Allow},
+        {"D=`mktemp -d`; rm -rf ${D}/sub", Verdict::Allow},
+        {"P=$(mktemp -d); rm -rf \"$Q\"", Verdict::Ask},
+        {"P=$(mktemp -d); rm -rf $P/../..", Verdict::Ask},
+        // Heredoc bodies are file data, unless they feed a shell.
+        {"cat > $TMPDIR/s.sh <<'EOF'\nrm -rf \"$PROF\" /etc\nEOF\nbash $TMPDIR/s.sh --dry", Verdict::Allow},
+        {"cat <<-EOF > x\n\trm -rf /\n\tEOF\necho done", Verdict::Allow},
+        {"bash <<EOF\nrm -rf /etc\nEOF", Verdict::Deny},
+        {"cat <<EOF | sh\nrm -rf /etc\nEOF", Verdict::Deny},
+        {"cat <<EOF > x\nhello\nEOF\nrm -rf /etc", Verdict::Deny},
+        {"grep x <<< \"$v\"; rm -rf /etc", Verdict::Deny},
         {"git reset --hard", Verdict::Ask},
         {"git clean -fdx", Verdict::Ask},
         {"git branch -D foo", Verdict::Ask},

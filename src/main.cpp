@@ -580,7 +580,10 @@ int pocketMain(int argc, char** argv) {
         auto p = decide(cfg, json::Object{{"task", text.substr(0, 2000)}}, qs, false, cost, tools.cancel, tools.onEvent);
         std::vector<std::string> keep;
         for (size_t i = 0; i < hits.size(); ++i)
-            if (p.empty() ? i == 0 : p["s" + std::to_string(i)] >= 0.7) keep.push_back(hits[i].name);
+            // Without a verdict, only a skill the request names (fuzzily) is offered:
+            // a bare BM25 word overlap is noise, not relevance.
+            if (p.empty() ? i == 0 && fuzzyScore(hits[i].name, text) >= 0.8 : p["s" + std::to_string(i)] >= 0.7)
+                keep.push_back(hits[i].name);
         if (keep.empty()) return "";
         return "[harness] Relevant skill" + std::string(keep.size() > 1 ? "s: " : ": ") + join(keep, ", ") +
                " — load with skill(action=load, name=...) before starting.";

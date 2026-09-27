@@ -88,6 +88,12 @@ struct ChatCallbacks {
 // our own timeout, cancellation, and empty/unparseable 200s.
 inline constexpr int kChatMaxAttempts = 4;  // 1 initial + 3 retries
 bool shouldRetryRequest(int httpCode, bool curlFailed, bool timedOut, bool emitted);
+// Gateway/upstream failure wording (OpenRouter "Provider returned error",
+// "overloaded", "upstream ...") that is worth another attempt even when the
+// HTTP status is 200 (in-stream error) or a gateway-specific code.
+bool isTransientProviderMessage(const std::string& msg);
+// Sleeps in short slices; false when cancel fired first.
+bool sleepCancellable(long ms, std::atomic<bool>* cancel);
 // Cooldown before attempt N (N>=1): 1s, 2s, 4s, ... capped at 30s.
 long retryDelayMs(int attempt);
 long retryAfterMs(const std::string& headers);  // numeric Retry-After, bounded to 60s

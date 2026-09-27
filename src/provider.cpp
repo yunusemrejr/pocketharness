@@ -684,6 +684,17 @@ bool shouldRetryRequest(int httpCode, bool curlFailed, bool timedOut, bool emitt
            httpCode == 504;
 }
 
+bool isTransientProviderMessage(const std::string& msg) {
+    std::string m = toLower(msg);
+    for (const char* k : {"provider returned error", "overloaded", "upstream", "temporarily unavailable",
+                          "service unavailable", "bad gateway", "gateway timeout", "rate limit", "rate-limit",
+                          "too many requests", "try again", "internal server error", "internal error",
+                          "server_error", "no endpoints", "capacity", "timed out", "timeout",
+                          "connection reset", "stream ended before completion"})
+        if (m.find(k) != std::string::npos) return true;
+    return false;
+}
+
 long retryDelayMs(int attempt) {
     if (attempt < 1) attempt = 1;
     if (attempt >= 6) return 30000;
@@ -755,6 +766,8 @@ int readHttpStatus(const std::string& hdrPath) {
     return code;
 }
 
+}  // namespace
+
 // Sleep ms in short slices so Ctrl-C also cancels a retry cooldown.
 bool sleepCancellable(long ms, std::atomic<bool>* cancel) {
     int64_t end = nowMs() + ms;
@@ -765,8 +778,6 @@ bool sleepCancellable(long ms, std::atomic<bool>* cancel) {
         nanosleep(&ts, nullptr);
     }
 }
-
-}  // namespace
 
 bool curlAvailable() {
     SpawnOpts o;
@@ -1166,8 +1177,13 @@ Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks
             }
         }
         if (!failMsg.empty()) {
+            // Gateway codes (408/409/425/52x) and "Provider returned error"-style
+            // bodies are upstream hiccups, never payload faults.
+            bool gateway = http == 408 || http == 409 || http == 425 || (http >= 520 && http <= 529) ||
+                           (http != 400 && http != 401 && http != 403 && http != 404 && http != 413 &&
+                            http != 422 && isTransientProviderMessage(failMsg.substr(std::min<size_t>(8, failMsg.size()))));
             bool retry = attempt + 1 < kChatMaxAttempts &&
-                         shouldRetryRequest(http, transportFailed, timedOut, emitted);
+                         (shouldRetryRequest(http, transportFailed, timedOut, emitted) || (gateway && !emitted && !timedOut));
             if (!retry) return Result<ChatResponse>::Err(failMsg);
             long ms = std::max(retryDelayMs(attempt + 1), retryAfter);
             if (cb.onNotice)
@@ -1180,28 +1196,46 @@ Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks
             continue;
         }
 
+        // Upstream hiccups that arrive inside an HTTP 200 (error event, JSON
+        // error body, truncated stream) retry like a 5xx while nothing
+        // visible was emitted; otherwise the turn would fail outright.
+        auto retryInBand = [&](const std::string& err) {
+            if (emitted || attempt + 1 >= kChatMaxAttempts || !isTransientProviderMessage(err)) return false;
+            long ms = retryDelayMs(attempt + 1);
+            if (cb.onNotice)
+                cb.onNotice("provider error (" + err.substr(0, 120) + "); retry " + std::to_string(attempt + 2) +
+                            "/" + std::to_string(kChatMaxAttempts) + " in " + std::to_string(ms / 1000) + "s");
+            return true;
+        };
         if (stream) {
             ChatResponse resp = isOpenAi ? oacc.finish() : isCodex ? cacc.finish() : aacc.finish();
-            if (!resp.error.empty()) return Result<ChatResponse>::Err(resp.error);
-            if (resp.text.empty() && resp.calls.empty() && !r.out.empty()) {
+            std::string err = resp.error;
+            if (err.empty() && resp.text.empty() && resp.calls.empty() && !r.out.empty()) {
                 // Some gateways ignore stream:true and return plain JSON.
                 auto v = json::parse(r.out);
-                if (v.ok)
-                    {
-                        auto parsed = finish(isOpenAi ? parseOpenAiResponse(v.value)
-                                                      : parseAnthropicResponse(v.value));
-                        if (parsed.ok && cb.onToken) cb.onToken(parsed.value.text);
+                if (v.ok) {
+                    auto parsed = finish(isOpenAi ? parseOpenAiResponse(v.value) : parseAnthropicResponse(v.value));
+                    if (parsed.ok) {
+                        if (cb.onToken) cb.onToken(parsed.value.text);
                         return parsed;
                     }
-                return Result<ChatResponse>::Err("empty response from provider");
+                    err = parsed.error;
+                } else {
+                    err = "empty response from provider";
+                }
             }
-            if (!(isOpenAi ? oacc.done : isCodex ? cacc.done : aacc.done))
-                return Result<ChatResponse>::Err("provider stream ended before completion (no tools executed)");
-            return finish(Result<ChatResponse>::Ok(std::move(resp)));
+            if (err.empty() && !(isOpenAi ? oacc.done : isCodex ? cacc.done : aacc.done))
+                err = "provider stream ended before completion (no tools executed)";
+            if (err.empty()) return finish(Result<ChatResponse>::Ok(std::move(resp)));
+            if (!retryInBand(err)) return Result<ChatResponse>::Err(err);
+            if (!sleepCancellable(retryDelayMs(attempt + 1), cb.cancel)) return Result<ChatResponse>::Err("cancelled");
+            continue;
         }
         auto v = json::parse(r.out);
         if (!v.ok) return Result<ChatResponse>::Err("invalid JSON from provider: " + v.error);
-        return finish(isOpenAi ? parseOpenAiResponse(v.value) : parseAnthropicResponse(v.value));
+        auto parsed = finish(isOpenAi ? parseOpenAiResponse(v.value) : parseAnthropicResponse(v.value));
+        if (parsed.ok || !retryInBand(parsed.error)) return parsed;
+        if (!sleepCancellable(retryDelayMs(attempt + 1), cb.cancel)) return Result<ChatResponse>::Err("cancelled");
     }
 }
 

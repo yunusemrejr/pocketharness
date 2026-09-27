@@ -1218,13 +1218,71 @@ std::vector<std::vector<std::string>> rmInvocations(const std::string& cmd) {
         }
         words.clear();
     };
-    for (char ch : cmd) {
+    // Heredoc bodies are data (file contents written by cat/tee/...), not
+    // commands, unless they feed a shell. Delimiters queue per line; the
+    // bodies are skipped at the next newline.
+    std::vector<std::pair<std::string, bool>> heredocs;  // delimiter, strip tabs
+    auto feedsShell = [&] {
+        for (const auto& w : words) {
+            if (w.find('=') != std::string::npos && w[0] != '-') continue;
+            size_t slash = w.rfind('/');
+            std::string base = slash == std::string::npos ? w : w.substr(slash + 1);
+            if (base == "sudo" || base == "env" || base == "exec" || base == "command" || base == "nohup") continue;
+            static const char* kShells[] = {"bash", "sh", "zsh", "dash", "ksh", "ash", "fish", "busybox", "ssh",
+                                            "su", "eval", "source", ".", "xargs", "parallel", nullptr};
+            for (const char** p = kShells; *p; ++p)
+                if (base == *p) return true;
+            return false;
+        }
+        return false;
+    };
+    for (size_t i = 0; i < cmd.size(); ++i) {
+        char ch = cmd[i];
         if (quote) {
             if (ch == quote) quote = 0; else word += ch;
             continue;
         }
+        if (ch == '<' && cmd.compare(i, 2, "<<") == 0 && cmd.compare(i, 3, "<<<") != 0) {
+            size_t j = i + 2;
+            bool strip = j < cmd.size() && cmd[j] == '-';
+            if (strip) ++j;
+            while (j < cmd.size() && (cmd[j] == ' ' || cmd[j] == '\t')) ++j;
+            std::string delim;
+            while (j < cmd.size() && !strchr(" \t\n;&|<>()", cmd[j])) {
+                if (cmd[j] != '\'' && cmd[j] != '"' && cmd[j] != '\\') delim += cmd[j];
+                ++j;
+            }
+            size_t eol = cmd.find('\n', j);
+            std::string rest = cmd.substr(j, eol == std::string::npos ? std::string::npos : eol - j);
+            bool piped = false;  // cat <<EOF | bash: the body still runs
+            for (const char* sh : {"bash", "sh", "zsh", "dash", "ksh", "eval", "xargs", "ssh"})
+                piped = piped || (rest.find('|') != std::string::npos && hasWord(rest, sh));
+            if (!delim.empty() && !piped && !feedsShell()) heredocs.emplace_back(delim, strip);
+            endWord();
+            i = j - 1;
+            continue;
+        }
+        if (ch == '\n' && !heredocs.empty()) {
+            endSegment();
+            for (const auto& [delim, strip] : heredocs) {
+                while (i < cmd.size()) {
+                    size_t eol = cmd.find('\n', i + 1);
+                    std::string line = cmd.substr(i + 1, eol == std::string::npos ? std::string::npos : eol - i - 1);
+                    i = eol == std::string::npos ? cmd.size() : eol;
+                    if (strip) line.erase(0, line.find_first_not_of('\t') == std::string::npos ? line.size() :
+                                                line.find_first_not_of('\t'));
+                    if (line == delim) break;
+                }
+            }
+            heredocs.clear();
+            continue;
+        }
         if (ch == '\'' || ch == '"') { quote = ch; quoted = true; continue; }
         if (ch == ' ' || ch == '\t') { endWord(); continue; }
+        if (ch == '$' && i + 1 < cmd.size() && cmd[i + 1] == '{') {  // ${VAR} is one word, not a group
+            size_t close = cmd.find('}', i);
+            if (close != std::string::npos) { word += cmd.substr(i, close - i + 1); i = close; continue; }
+        }
         if (strchr(";&|\n(){}`", ch)) { endSegment(); continue; }
         word += ch;
     }
@@ -1321,6 +1379,15 @@ GuardResult classifyCommand(const std::string& cmd, const std::string& workspace
     }
     // rm -r[f]: the classic. Judged per rm invocation (its own flags and
     // targets), so paths and flags elsewhere in the line never leak in.
+    // Variables assigned from mktemp (P=$(mktemp -d)) name fresh scratch.
+    std::vector<std::string> tempVars;
+    for (const char* pat : {"=$(mktemp", "=`mktemp"}) {
+        for (size_t at = c.find(pat); at != std::string::npos; at = c.find(pat, at + 1)) {
+            size_t b = at;
+            while (b > 0 && (isalnum((unsigned char)c[b - 1]) || c[b - 1] == '_')) --b;
+            if (b < at && !isdigit((unsigned char)c[b])) tempVars.push_back(c.substr(b, at - b));
+        }
+    }
     for (const auto& args : rmInvocations(c)) {
         bool recursive = false, force = false, options = true;
         std::vector<std::string> targets;
@@ -1351,6 +1418,12 @@ GuardResult classifyCommand(const std::string& cmd, const std::string& workspace
             // Session scratch is private and already confined by the sandbox.
             bool scratch = (startsWith(t, "$TMPDIR/") || startsWith(t, "${TMPDIR}/")) &&
                            t.find("..") == std::string::npos && t.size() > t.find('/') + 1;
+            for (const auto& v : tempVars) {
+                for (const std::string& ref : {"$" + v, "${" + v + "}"})
+                    if (startsWith(t, ref) && (t.size() == ref.size() || t[ref.size()] == '/') &&
+                        t.find("..") == std::string::npos)
+                        scratch = true;
+            }
             if (scratch) continue;
             if (t[0] == '/' && !workspace.empty() && !startsWith(t, workspace + "/") && t != workspace &&
                 t.find('*') == std::string::npos) {

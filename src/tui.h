@@ -58,9 +58,12 @@ std::string fmtK(long n);
 // Footer status line while a turn runs: an animated braille spinner plus
 // elapsed time ("⠋ working 12s · queued 0 · ..."), static "paused" while
 // held. Pure in (now,start) for tests; honors POCKET_NO_ANIM with a
-// static bullet. Exposed for tests.
+// static bullet. activity names the current phase ("thinking", "bash");
+// lastEvent > 0 flags a silent stretch ("quiet 20s") so stalls are visible.
+// Exposed for tests.
 std::string busyLine(int64_t now, int64_t start, size_t queued, bool held,
-                     const std::string& hint);
+                     const std::string& hint, const std::string& activity = "working",
+                     int64_t lastEvent = 0);
 
 // Picker matching: indices of labels containing filter (case-insensitive;
 // empty filter matches all). Exposed for tests.

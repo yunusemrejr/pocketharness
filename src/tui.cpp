@@ -865,7 +865,7 @@ TuiInputLayout layoutTuiInput(const std::vector<std::string>& lines, size_t row,
 }
 
 std::string busyLine(int64_t now, int64_t start, size_t queued, bool held,
-                     const std::string& hint) {
+                     const std::string& hint, const std::string& activity, int64_t lastEvent) {
     std::string q = "queued " + std::to_string(queued);
     if (held) return "paused · " + q + " · " + hint;
     int64_t el = now - start;
@@ -878,8 +878,16 @@ std::string busyLine(int64_t now, int64_t start, size_t queued, bool held,
                                       "⠴", "⠦", "⠧", "⠇", "⠏"};
         frame = kSpin[(size_t)((el / 100) % 10)];
     }
-    std::string out = frame + " working";
-    if (el >= 1000) out += " " + std::to_string(el / 1000) + "s";
+    auto secs = [](int64_t ms) {
+        int64_t s = ms / 1000;
+        if (s < 60) return std::to_string(s) + "s";
+        char b[32];
+        snprintf(b, sizeof b, "%lldm%02llds", (long long)(s / 60), (long long)(s % 60));
+        return std::string(b);
+    };
+    std::string out = frame + " " + activity;
+    if (el >= 1000) out += " " + secs(el);
+    if (lastEvent > 0 && now - lastEvent >= 15000) out += " · quiet " + secs(now - lastEvent);
     return out + " · " + q + " · " + hint;
 }
 
@@ -1552,9 +1560,11 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
     if (goal || resume) goalStatus = "goal: active · " + (resume ? agent.goal() : input) + "\n";
     auto originalKpi = bar->kpi;
     int64_t turnStart = nowMs();
+    std::string activity = "working";  // footer phase, set by pump
+    int64_t lastEvent = turnStart;
     bar->kpi = [&](int) {
         std::string hint = approvalPending ? "approval: y/N" : queue.picker ? "picker waiting · Esc pause" : "Enter queue · Esc pause";
-        return status + "\n" + busyLine(nowMs(), turnStart, queue.messages.size(), queue.held, hint);
+        return status + "\n" + busyLine(nowMs(), turnStart, queue.messages.size(), queue.held, hint, activity, lastEvent);
     };
     bar->fixedInputH = 3;
     bar->fixedFooterH = (int)bar->statusRows().size();
@@ -1662,6 +1672,15 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
             events.cv.notify_all();
         }
         for (const auto& event : batch) {
+            if (event.kind != Kind::Status) lastEvent = nowMs();
+            if (event.kind == Kind::Token) { activity = "writing"; thinkingHead = false; }
+            else if (event.kind == Kind::Reasoning) activity = "thinking";
+            else if (event.kind == Kind::Tool) {
+                thinkingHead = false;
+                const std::string& t = event.text;
+                if (startsWith(t, "✓ ") || startsWith(t, "✗ ")) activity = "working";
+                else activity = startsWith(t, "$ ") ? "bash" : t.substr(0, t.find(' '));
+            } else if (event.kind == Kind::Approval) activity = "awaiting approval";
             if (event.kind == Kind::Status) { status = event.text; goalStatus = event.extra; }
             else if (event.kind == Kind::Done) { finished = true; result = event.text; }
             else if (event.kind == Kind::Approval) {
@@ -1671,8 +1690,17 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
                 else if (event.kind == Kind::Reasoning) {
                     if (!thinkingHead) { thinkingHead = true; rend.write("∴ thinking\n"); }
                     rend.feed(event.text, true);
-                } else rend.write(col(C_DIM) + std::string(event.kind == Kind::Tool ? "  › " : "  ◇ ") +
-                                  sanitizeTerminal(event.text) + col(C_RESET) + "\n");
+                } else {
+                    // Failures and recoveries must stand out from routine dim chatter.
+                    const std::string& t = event.text;
+                    bool failed = event.kind == Kind::Tool && startsWith(t, "✗ ");
+                    bool warn = event.kind == Kind::Notice &&
+                                (t.find("error") != std::string::npos || t.find("fail") != std::string::npos ||
+                                 t.find("unavailable") != std::string::npos || t.find("retry") != std::string::npos);
+                    rend.write(col(failed ? C_RED : warn ? C_YELLOW : C_DIM) +
+                               std::string(event.kind == Kind::Tool ? "  › " : "  ◇ ") +
+                               sanitizeTerminal(t) + col(C_RESET) + "\n");
+                }
             });
         }
         // Consume composer typeahead before establishing approval ownership.
@@ -1720,6 +1748,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
                 events.approval = answer;
             }
             events.cv.notify_all();
+            activity = "working";
             approvalPending = false;
             output([&] { rend.write(answer > 0 ? "allowed once\n" : "rejected\n"); });
             draw();
@@ -1798,8 +1827,12 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
         if (result == "cancelled") writeAll(STDOUT_FILENO, queue.held ?
             "\n(paused; queued messages held until a new message or /queue resume)\n" :
             "\n(stopped; continuing with explicitly queued follow-up)\n");
-        else if (!result.empty()) writeAll(STDOUT_FILENO, "\nerror: " + sanitizeTerminal(result) + "\n");
-        else writeAll(STDOUT_FILENO, "\n");
+        else if (!result.empty()) writeAll(STDOUT_FILENO, "\n" + col(C_RED) + "error: " + sanitizeTerminal(result) + col(C_RESET) + "\n");
+        else {
+            int64_t s = (nowMs() - turnStart) / 1000;
+            std::string took = s < 60 ? std::to_string(s) + "s" : std::to_string(s / 60) + "m" + std::to_string(s % 60) + "s";
+            writeAll(STDOUT_FILENO, "\n" + col(C_DIM) + "  ✓ done in " + took + col(C_RESET) + "\n");
+        }
     });
     bar->fixedInputH = bar->fixedFooterH = 0;
     bar->kpi = std::move(originalKpi);
@@ -2543,7 +2576,19 @@ int tuiRun(TuiOpts& opts) {
             continue;
         }
         if (command.empty()) text = attachPastedImages(opts, agent, text);
-        if (bar.active) writeAll(STDOUT_FILENO, col(C_BOLD) + "> " + col(C_RESET) + sanitizeTerminal(text) + "\n");
+        if (bar.active) {
+            // Echo the submission, folding a huge paste so it cannot flood
+            // the transcript (the model still receives every line).
+            auto lines = splitLines(text);
+            std::string shown = text;
+            if (lines.size() > 24) {
+                shown.clear();
+                for (size_t i = 0; i < 12; ++i) shown += lines[i] + "\n";
+                shown += "[... " + std::to_string(lines.size() - 16) + " more lines ...]";
+                for (size_t i = lines.size() - 4; i < lines.size(); ++i) shown += "\n" + lines[i];
+            }
+            writeAll(STDOUT_FILENO, col(C_BOLD) + "> " + col(C_RESET) + sanitizeTerminal(shown) + "\n");
+        }
         if (command == "/goal") {
             bool resume = args == "resume";
             runTurnInteractive(opts, agent, resume ? "" : args, shared, cancel, &bar, queue, !resume, resume);

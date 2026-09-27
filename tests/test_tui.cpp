@@ -332,9 +332,10 @@ TEST(tui_Working_Footer_Shows_Liveness_And_Elapsed) {
     CHECK(t.send("first\r"));
     CHECK(t.waitFor("FIRST_RUNNING"));
     CHECK(t.waitFor("working · queued 0"));  // static bullet under POCKET_NO_ANIM
-    CHECK(t.waitFor("working 1s", 4000));    // elapsed ticks while gated
+    CHECK(t.waitFor("writing 1s", 4000));    // phase + elapsed tick while gated
     t.finishFirst();
     CHECK(t.waitFor("REPLY:\"first\""));
+    CHECK(t.waitFor("done in"));
     CHECK(t.quit());
     return "";
 }
@@ -972,6 +973,9 @@ TEST(tui_BusyLine) {
     setenv("POCKET_NO_ANIM", "1", 1);
     CHECK(busyLine(150, 0, 0, false, "h") == "• working · queued 0 · h");
     CHECK(busyLine(2000, 0, 0, false, "h") == "• working 2s · queued 0 · h");
+    CHECK(busyLine(125000, 0, 0, false, "h", "thinking") == "• thinking 2m05s · queued 0 · h");
+    CHECK(busyLine(40000, 0, 1, false, "h", "bash", 20000) == "• bash 40s · quiet 20s · queued 1 · h");
+    CHECK(busyLine(40000, 0, 1, false, "h", "bash", 30000) == "• bash 40s · queued 1 · h");
     unsetenv("POCKET_NO_ANIM");
     return "";
 }

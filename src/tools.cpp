@@ -33,12 +33,13 @@ std::vector<ToolDef> nativeToolDefs() {
          "(default 1), else the edit fails without touching the file. $TMPDIR/ means private session scratch.",
          R"({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"expected_matches":{"type":"integer"},"edits":{"type":"array","items":{"type":"object","properties":{"old_text":{"type":"string"},"new_text":{"type":"string"},"expected_matches":{"type":"integer"}},"required":["old_text","new_text"]}}},"required":["path"]})"},
         {"bash",
-         "Run a Linux command (bash -c) with captured stdout/stderr, timeout, "
+         "Run a Linux command (bash) with captured stdout/stderr, timeout, "
          "filesystem sandboxing and network access. The workspace is already the "
          "working directory: never cd there first. Use normal programs (git, grep, "
          "make, ssh, ...) through this tool. When the session is offline, network "
          "commands are blocked for the whole session: do not retry them. Chain dependent steps with &&; "
-         "a failed command can leave earlier side effects, so inspect state before retrying.",
+         "a failed command can leave earlier side effects, so inspect state before retrying. "
+         "Background servers: cmd >$TMPDIR/cmd.log 2>&1 &",
          R"({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]})"},
         {"skill",
          "Discover and load Markdown skills. Check the catalog (list) before domain "
@@ -243,11 +244,15 @@ ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
     if (!data.ok) return {false, data.error};
     std::string updated = data.value;
     for (const auto& edit : edits) {
-        const std::string& oldText = edit.at("old_text").asStr();
-        const std::string& newText = edit.at("new_text").asStr();
-        double count = edit.at("expected_matches").asNum(1);
-        if (oldText.empty() || !edit.at("new_text").isStr() || count < 1 || count > 100000 ||
-            count != std::floor(count) || (edit.has("expected_matches") && !edit.at("expected_matches").isNum()))
+        const json::Value& oldV = edit.has("old_text") ? edit.at("old_text") : edit.at("old_string");
+        const json::Value& newV = edit.has("new_text") ? edit.at("new_text") : edit.at("new_string");
+        const std::string& oldText = oldV.asStr();
+        const std::string& newText = newV.asStr();
+        // A numeric string counts; 0 or null means "unspecified" (default 1).
+        const json::Value& em = edit.at("expected_matches");
+        double count = em.isStr() ? std::atof(em.asStr().c_str()) : em.asNum(1);
+        if (em.isNull() || count == 0) count = 1;
+        if (oldText.empty() || !newV.isStr() || count < 1 || count > 100000 || count != std::floor(count))
             return {false, "edit: need nonempty old_text, string new_text, positive integer expected_matches"};
         long found = countOccurrences(updated, oldText);
         if (found != (long)count)
@@ -286,9 +291,14 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
 
     SpawnOpts o;
     o.exe = "/bin/bash";
-    o.argv = {"bash", "--noprofile", "--norc", "-o", "pipefail", "-c", cmd};
+    // The command travels in the environment, not argv: `pkill -f pattern`
+    // would otherwise match (and kill) this very shell via its cmdline.
+    o.argv = {"bash", "--noprofile", "--norc", "-o", "pipefail", "-c",
+              "export -n POCKET_BASH_CMD; eval \"$POCKET_BASH_CMD\""};
     o.env = buildChildEnv(env.cfg ? env.cfg->exposeEnv : std::vector<std::string>(), env.workspace,
                           env.sessionTmp, env.sandboxHome, env.auth);
+    std::erase_if(o.env, [](const std::string& e) { return startsWith(e, "POCKET_BASH_CMD="); });
+    o.env.push_back("POCKET_BASH_CMD=" + cmd);
     if (env.readOnly) {
         // Pinned pagers cannot execute, and git skips its index refresh
         // writes. Stripped first: getenv reads the first match, so a stale
@@ -305,6 +315,9 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
     o.cancel = env.cancel;
     // Deeper Pocket instances finish teardown before their parent's deadline.
     o.terminateGraceMs = std::max(500, 1500 - 200 * env.depth);
+    // `server &` keeps the output pipes open after the shell exits; stop
+    // reading shortly after instead of blocking until the timeout.
+    o.lingerMs = 1500;
     o.childSetup = [cs]() { childEnterSandbox(cs); };
 
     SpawnResult sr = spawn(o);
@@ -330,6 +343,9 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
         out += "[stderr]\n" + sr.err;
     }
     if (sr.truncated) out += "[... output truncated ...]\n";
+    if (sr.detached)
+        out += "[note: background process(es) still running; their later output is not captured - redirect it "
+               "to a file, e.g. cmd >$TMPDIR/cmd.log 2>&1 &]\n";
     if (sr.exitCode == 127 && sr.out.empty() && sr.err.empty() && !sr.error.empty()) {
         r.output = sr.error;
         return r;
@@ -466,15 +482,35 @@ ToolResult runTool(ToolEnv& env, const std::string& name, const std::string& arg
     }();
     auto schema = schemas.find(name);
     if (schema == schemas.end()) return {false, "unknown tool: " + name};
-    for (const auto& key : schema->second.at("required").asArr())
-        if (!args.has(key.asStr())) return {false, name + ": missing " + key.asStr()};
-    for (const auto& [key, value] : args.asObj()) {
+    // Lenient intake: common aliases map to schema names, unknown or null keys
+    // are dropped, numeric strings coerce, and an out-of-range optional integer
+    // falls back to its default. Only a wrong required value is fatal.
+    static const std::map<std::string, std::string> aliases = {
+        {"file_path", "path"}, {"filePath", "path"}, {"file", "path"}, {"cmd", "command"},
+        {"old_string", "old_text"}, {"new_string", "new_text"}, {"timeout_sec", "timeout"}};
+    json::Object clean;
+    for (const auto& [rawKey, raw] : args.asObj()) {
+        auto alias = aliases.find(rawKey);
+        const std::string& key = alias != aliases.end() && !args.has(alias->second) ? alias->second : rawKey;
         std::string type = schema->second.at("properties").at(key).at("type").asStr();
+        if (type.empty() || raw.isNull()) continue;
+        json::Value value = raw;
+        if (type == "integer" && value.isStr()) {
+            std::string s = trim(value.asStr());
+            if (!s.empty() && s.size() < 10 && s.find_first_not_of("0123456789") == std::string::npos)
+                value = json::Value((long)std::stol(s));
+        }
+        if (type == "string" && value.isNum()) value = json::stringify(value);
         bool valid = type == "string" ? value.isStr() : type == "array" ? value.isArr() :
                      type == "integer" && value.isNum() && value.asNum() == std::floor(value.asNum()) &&
                      value.asNum() >= 1 && value.asNum() <= 1000000000;
-        if (!valid) return {false, name + ": invalid argument " + key};
+        if (!valid && type == "integer") continue;
+        if (!valid) return {false, name + ": invalid argument " + key + " (expected " + type + ")"};
+        clean[key] = std::move(value);
     }
+    args = json::Value(std::move(clean));
+    for (const auto& key : schema->second.at("required").asArr())
+        if (!args.has(key.asStr())) return {false, name + ": missing " + key.asStr()};
     if (env.cancel && env.cancel->load()) return {false, "cancelled"};
     if (name != "skill" && !env.auth) return {false, "tool authority unavailable"};
     // Read-only evidence passes (/double streams) can observe but never

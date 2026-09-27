@@ -2228,6 +2228,8 @@ TEST(agent_Double_ReadOnly_Evidence_Tools) {
     CHECK(notes.find("Double B: evidence (0 reads, 1 commands)") != std::string::npos);
     CHECK(historyHas(agent, "user", "UNIFIED-BRIEF"));
     CHECK_EQ(boxRead(tools.auth, "note.txt", 100).value, std::string("hello-evidence"));  // untouched
+    CHECK(historyHas(agent, "user", "Already inspected by the analyses"));  // digest spares re-exploration
+    CHECK(historyHas(agent, "user", "- read note.txt"));
     CHECK_EQ(agent.stats().toolCalls, 1);  // parent's own call only; evidence never counted
     rmRf(home);
     return "";
@@ -2338,7 +2340,8 @@ TEST(agent_Double_Deadline_Cancels_Slow_Stream) {
     CHECK(historyHas(agent, "user", "ANALYSIS-A"));
     std::string notes;
     for (const auto& n : notices) notes += n + "\n";
-    CHECK(notes.find("deadline exceeded") != std::string::npos);
+    // A finished long before the deadline: B is cut off as a straggler.
+    CHECK(notes.find("straggling") != std::string::npos);
     rmRf(home);
     return "";
 }
@@ -2512,6 +2515,188 @@ TEST(agent_Double_Parent_Executes_Own_Write_Once) {
     CHECK(historyCallHas(agent, "m1"));
     CHECK(!historyCallHas(agent, "evil1") && !historyCallHas(agent, "evil2"));
     CHECK_EQ(agent.stats().toolCalls, 1);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Old_Images_Drop_In_Batches) {
+    std::string home = makeTempDir("pocket-aimgprune");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    std::string ws = home + "/ws";
+    CHECK(ensureDir(ws, 0755).ok);
+    CHECK(atomicWriteFile(ws + "/s.png", std::string("\x89PNG\r\n\x1a\nPAYLOAD", 15), 0644).ok);
+    ToolEnv env;
+    env.workspace = ws;
+    AgentOpts ao;
+    ao.model = resolveModel(defaultConfig(), "glm").value;
+    ao.tools = &env;
+    size_t lastImages = 0;
+    ao.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        lastImages = 0;
+        for (const auto& m : req.messages) lastImages += m.images.size();
+        ChatResponse r;
+        r.text = "seen";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(ao);
+    for (int turn = 0; turn < 4; ++turn) {
+        for (int i = 0; i < 3; ++i) CHECK(a.attachImage(ws + "/s.png").empty());
+        CHECK(a.runTurn("look").empty());
+    }
+    CHECK_EQ(lastImages, (size_t)12);  // at the threshold: nothing dropped yet
+    for (int i = 0; i < 3; ++i) CHECK(a.attachImage(ws + "/s.png").empty());
+    CHECK(a.runTurn("look").empty());
+    CHECK_EQ(lastImages, (size_t)4);  // one batch down to the newest four
+    CHECK(a.messages()[0].content.find("older image(s) dropped") != std::string::npos);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Provider_Error_Recovers_On_Same_Model) {
+    AgentOpts ao;
+    ao.model = resolveModel(defaultConfig(), "glm").value;
+    ao.recoverDelayMs = 1;
+    int calls = 0;
+    std::vector<std::string> notices;
+    ao.onNotice = [&](const std::string& n) { notices.push_back(n); };
+    ao.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        if (++calls < 3) return Result<ChatResponse>::Err("Provider returned error");
+        ChatResponse r;
+        r.text = "recovered";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(ao);
+    CHECK(a.runTurn("hi").empty());
+    CHECK_EQ(calls, 3);
+    CHECK(!notices.empty() && notices[0].find("recovering") != std::string::npos);
+    // Deterministic payload errors are never retried.
+    calls = 0;
+    ao.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ++calls;
+        return Result<ChatResponse>::Err("HTTP 400: invalid tool schema");
+    };
+    Agent b(ao);
+    CHECK(!b.runTurn("hi").empty());
+    CHECK_EQ(calls, 1);
+    return "";
+}
+
+TEST(agent_Double_Evidence_Budget_Forces_Conclusion) {
+    DoubleTools tools;
+    CHECK(tools.ok);
+    CHECK(boxWrite(tools.auth, "note.txt", "hello", 0644).ok);
+    std::string home = makeTempDir("pocket-double-budget");
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    DoubleProbe probe;
+    probe.toolRoundsA = 99;  // A would search forever; the conclusion round stops it
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    opts.tools = &tools.env;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks& cb) { return doubleMock(probe, req, cb); };
+    Agent agent(opts);
+    CHECK(agent.setDouble(true).empty());
+    CHECK(agent.runTurn("fix the bug").empty());
+    CHECK_EQ(probe.dualA.size(), (size_t)5);  // 4 evidence rounds + 1 conclusion round
+    const auto& last = probe.dualA.back().messages.back();
+    CHECK(last.role == "user" && last.content.find("Evidence budget spent") != std::string::npos);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Double_Deadline_Fires_When_Both_Slow) {
+    std::string home = makeTempDir("pocket-double-dead2");
+    HomeGuard hg(home);
+    auto id = sessionCreate();
+    DoubleProbe probe;
+    probe.blockA = probe.blockB = true;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.sessionId = id.value;
+    opts.doubleDeadlineMs = 150;
+    std::vector<std::string> notices;
+    opts.onNotice = [&](const std::string& n) { notices.push_back(n); };
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks& cb) { return doubleMock(probe, req, cb); };
+    Agent agent(opts);
+    CHECK(agent.setDouble(true).empty());
+    int64_t t0 = nowMs();
+    CHECK(agent.runTurn("fix the bug").empty());
+    CHECK(nowMs() - t0 < 5000);
+    std::string notes;
+    for (const auto& n : notices) notes += n + "\n";
+    CHECK(notes.find("deadline exceeded") != std::string::npos);
+    CHECK(notes.find("continuing as a single stream") != std::string::npos);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Council_Reviewers_Run_Concurrently) {
+    ToolEnv tools;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.reviewers = {opts.model, opts.model, opts.model};
+    opts.tools = &tools;
+    opts.review = true;
+    opts.decide = [&](const json::Value&, const std::vector<Question>&, bool, double*) {
+        return std::map<std::string, double>{{"bad", .5}};
+    };
+    std::atomic<int> live{0}, maxLive{0}, votes{0};
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse response;
+        if (req.system.find("strict senior reviewer") != std::string::npos) {
+            int cur = ++live;
+            for (int mx = maxLive.load(); cur > mx && !maxLive.compare_exchange_weak(mx, cur);) {}
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            --live;
+            response.text = ++votes == 1 ? "LGTM." : "LGTM - looks fine";
+        } else {
+            tools.changedFiles.push_back("checked.cpp");
+            response.text = "The requested change is implemented and checked.";
+        }
+        return Result<ChatResponse>::Ok(response);
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Implement and verify the requested change").empty());
+    CHECK_EQ(votes.load(), 3);
+    CHECK(maxLive.load() >= 2);  // reviewers overlapped instead of queueing
+    CHECK_EQ(agent.stats().reviews, 1);
+    CHECK(agent.messages().back().content.find("review council") == std::string::npos);  // approvals held
+    return "";
+}
+
+TEST(agent_Text_Only_Model_Gets_Images_Stripped) {
+    std::string home = makeTempDir("pocket-ablind");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    CHECK(atomicWriteFile(home + "/s.png", std::string("\x89PNG\r\n\x1a\nPAYLOAD", 15), 0644).ok);
+    ToolEnv env;
+    env.workspace = home;
+    AgentOpts ao;
+    ao.model = resolveModel(defaultConfig(), "glm").value;
+    ao.tools = &env;
+    int calls = 0, rejected = 0;
+    ao.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ++calls;
+        for (const auto& m : req.messages)
+            if (!m.images.empty()) {
+                ++rejected;
+                return Result<ChatResponse>::Err(
+                    "HTTP 400: The provided messages contain images, but qwen does not support image inputs.");
+            }
+        ChatResponse r;
+        r.text = "fine";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(ao);
+    CHECK(a.attachImage(home + "/s.png").empty());
+    CHECK(a.runTurn("look").empty());
+    CHECK_EQ(calls, 2);  // one rejection, one text-only resend
+    CHECK(a.attachImage(home + "/s.png").empty());
+    CHECK(a.runTurn("again").empty());
+    CHECK_EQ(calls, 3);  // the model is remembered as blind: no second rejection
+    CHECK_EQ(rejected, 1);
     rmRf(home);
     return "";
 }

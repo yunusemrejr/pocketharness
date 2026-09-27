@@ -1,6 +1,35 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
+
+- Recover from provider hiccups automatically. "Provider returned error",
+  overloaded/upstream/rate-limit bodies, gateway codes (408/409/425/52x),
+  in-stream error events, JSON error bodies inside HTTP 200 and truncated
+  streams now retry with backoff while nothing visible was emitted; the
+  agent then retries once more on the same model after fallbacks.
+- Models without image input: a vision rejection marks the model blind for
+  the session and resends with images replaced by a short placeholder.
+- Double mode is faster and tighter: the evidence loop ends with a forced
+  conclusion round (budget-exceeding tool calls never run), a straggling
+  second stream is cut once the first finishes, and the reconcile/parent
+  seed carries a digest of what the analyses already inspected so evidence
+  is not re-gathered.
+- Council reviewers run in parallel; the request brief runs concurrently
+  with skill hinting; a down decisions endpoint no longer stalls twice
+  (primary then backup). Skill hints without a Jev verdict only fire when
+  the request names the skill.
+- Tools: lenient argument intake (common aliases like `file_path`,
+  `old_string`, `cmd`; numeric strings; null/unknown keys dropped);
+  `bash` no longer blocks until timeout on backgrounded servers (pipes are
+  released 1.5s after the shell exits, with a note), and `pkill -f` can no
+  longer match its own shell. `pocket kit SUB --help` prints usage.
+- rm guard: heredoc bodies are data, not commands; `${VAR}` stays one word;
+  `rm -rf "$D"` on a `D=$(mktemp -d)` scratch dir is allowed.
+- TUI: the footer names the live phase (thinking, writing, bash, read,
+  awaiting approval), shows elapsed time as m:ss and flags silent stretches
+  ("quiet 20s"); each thinking span gets its header; failed tools render
+  red and error/retry notices yellow; turns end with "✓ done in Ns" and
+  errors in red; huge pasted input is folded in the transcript echo.
 
 - Harden Double mode while keeping its shape (two concurrent same-model
   first passes, one reconciliation, one unified plan, normal parent loop).

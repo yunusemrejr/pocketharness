@@ -98,6 +98,8 @@ struct AgentOpts {
     // /double per-phase deadline in ms (first passes, then reconciliation).
     // 0 selects the default. Unit tests use small values for prompt deadlines.
     long doubleDeadlineMs = 0;
+    // Cooldown before same-model recovery attempts (x1, then x4).
+    long recoverDelayMs = 2000;
 };
 
 // Default /double deadline: generous for legitimate analyses (bounded to a
@@ -227,11 +229,16 @@ class Agent {
     std::string runDoublePass();
     void recordOutcome(const std::string& scope, const std::string& reason, const std::string& detail);
     Result<ChatResponse> requestOnce();
+    // With `deferred`, usage is collected there instead of recorded, so
+    // concurrent side requests never touch stats_ off the calling thread.
     Result<ChatResponse> sideRequest(const ResolvedModel& m, const std::string& system,
-                                     const std::string& user, long maxTokens);
+                                     const std::string& user, long maxTokens,
+                                     std::vector<ChatResponse>* deferred = nullptr);
     std::string stopGate(const std::string& finalText);
     std::string councilReview();
-    std::string makeBrief(const std::string& request);
+    // With `deferred`, usage is collected there and no notice is emitted:
+    // safe to run off the agent thread (it touches no stats or callbacks).
+    std::string makeBrief(const std::string& request, std::vector<ChatResponse>* deferred = nullptr);
     std::string turnDigest(size_t maxBytes) const;
     json::Value turnTranscript(const std::string& finalText) const;
     std::map<std::string, double> ask(const json::Value& state, const std::vector<Question>& qs, bool transcript);
@@ -280,6 +287,7 @@ class Agent {
     size_t turnStart_ = 0;
     int turnNudges_ = 0, turnGates_ = 0;
     bool unverified_ = false, verifyNudged_ = false, reviewed_ = false, calmNext_ = false;
+    std::vector<std::string> blind_;  // model specs that rejected image input this session
     std::vector<std::string> hookNagged_;
 };
 

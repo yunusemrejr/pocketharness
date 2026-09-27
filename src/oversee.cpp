@@ -308,7 +308,8 @@ std::string remoteUnavailable(const Config& cfg) {
 
 std::map<std::string, double> decisionsCall(const std::string& model, const json::Value& state,
                                             const std::vector<Question>& qs, double* cost,
-                                            std::atomic<bool>* cancel, const Activity& activity) {
+                                            std::atomic<bool>* cancel, const Activity& activity,
+                                            bool* down = nullptr) {
     std::map<std::string, double> out;
     if (qs.empty() || cancelled(cancel)) return out;
     const char* key = getenv("OPENROUTER_API_KEY");
@@ -323,6 +324,8 @@ std::map<std::string, double> decisionsCall(const std::string& model, const json
     auto r = httpRequest("https://openrouter.ai/api/alpha/decisions", std::string("Authorization: Bearer ") + key,
                          payload, 15000, {}, cancel);
     if (!r.ok) {
+        // Endpoint unreachable (not a per-model 4xx): a backup model there would stall too.
+        if (down && !startsWith(r.error, "HTTP 4")) *down = true;
         reportActivity(activity, engine + " " + (cancelled(cancel) ? "cancelled" : "failed (" + requestFailure(r.error) + ")"));
         return out;
     }
@@ -453,9 +456,10 @@ std::map<std::string, double> decide(const Config& cfg, const json::Value& state
     if (useRemote) {
         const char* primary = transcript ? "respan/span-01" : "~typesafe/jev-latest";
         const char* backup = transcript ? "~typesafe/jev-latest" : "respan/span-01";
-        out = decisionsCall(primary, state, batch, cost, cancel, activity);
+        bool down = false;
+        out = decisionsCall(primary, state, batch, cost, cancel, activity, &down);
         auto missing = missingQuestions(batch, out);
-        if (!missing.empty() && !cancelled(cancel)) {
+        if (!missing.empty() && !down && !cancelled(cancel)) {
             // Jev accepts structured state: preserve actual request/reference
             // fields rather than flattening them away during Span fallback.
             json::Value alt = transcript ? state : json::Value(clipped(json::stringify(state), 24000));
