@@ -616,11 +616,13 @@ Result<ChatResponse> Agent::requestOnce() {
         return res;
     };
     auto r = send();
-    // Fallback role: a provider that stays down after its own retries hands
-    // this request to the fallback model. Payload errors (4xx) never switch.
+    // Fallback role: a provider that stays down after its own retries, or
+    // still rejects the payload after learning its quirks (400/422), hands
+    // this request to the fallback model. Auth and not-found errors never switch.
     bool transient = !r.ok && isTransientProviderError(r.error);
+    bool rejected = !r.ok && (startsWith(r.error, "HTTP 400") || startsWith(r.error, "HTTP 422"));
     const ResolvedModel* used = &opts_.model;
-    if (transient && !opts_.fallback.empty() && opts_.fallback[0].spec != opts_.model.spec) {
+    if ((transient || rejected) && !opts_.fallback.empty() && opts_.fallback[0].spec != opts_.model.spec) {
         if (contextUsed() >= opts_.fallback[0].context)
             return Result<ChatResponse>::Err(r.error + "; fallback context window is too small for this conversation");
         if (opts_.onNotice) opts_.onNotice("main model failed (" + r.error.substr(0, 100) + "); using fallback " + opts_.fallback[0].spec);

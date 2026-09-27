@@ -14,7 +14,7 @@
 namespace pocket {
 
 // Version of the harness binary.
-inline constexpr const char* kVersion = "0.7.1";
+inline constexpr const char* kVersion = "0.7.2";
 
 // ---------------------------------------------------------------------------
 // Result<T>: minimal error-or-value. Errors are human-readable strings.

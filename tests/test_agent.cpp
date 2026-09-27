@@ -2579,6 +2579,19 @@ TEST(agent_Provider_Error_Recovers_On_Same_Model) {
     Agent b(ao);
     CHECK(!b.runTurn("hi").empty());
     CHECK_EQ(calls, 1);
+    // ...but a payload the main model still rejects goes to the fallback model.
+    calls = 0;
+    ao.fallback = {resolveModel(defaultConfig(), "deepseek").value};
+    ao.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ++calls;
+        if (req.model.spec == ao.model.spec) return Result<ChatResponse>::Err("HTTP 400: unsupported replay field");
+        ChatResponse r;
+        r.text = "via fallback";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent c(ao);
+    CHECK(c.runTurn("hi").empty());
+    CHECK_EQ(calls, 2);
     return "";
 }
 

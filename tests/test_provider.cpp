@@ -365,6 +365,30 @@ TEST(provider_DeepSeek_Tool_History_Preserves_Reasoning_Across_User_Turns) {
     return "";
 }
 
+TEST(provider_DeepSeek_Foreign_Or_Thinkless_Turns_Replay_Empty_Reasoning) {
+    ChatRequest req;
+    req.model = mkModel("deepseek");
+    req.thinking = "high";
+    req.tools = {{"read", "read a file", R"({"type":"object"})"}};
+    ChatMessage fallback{"assistant", "", {{"one", "read", "{}"}}, ""};
+    fallback.replay = json::Object{{"model", "orcarouter:glm-5.3-flash"}, {"reasoning_content", "glm thoughts"}};
+    ChatMessage thinkless{"assistant", "", {{"two", "read", "{}"}}, ""};
+    req.messages = {{"user", "go", {}, ""}, fallback, {"tool", "r1", {}, "one"}, thinkless, {"tool", "r2", {}, "two"}};
+    // Live API: a tool-call turn without reasoning_content is a 400; "" is accepted.
+    auto body = buildOpenAiBody(req);
+    CHECK(body.at("messages").at(1).at("reasoning_content").asStr() == "");
+    CHECK(body.at("messages").at(3).at("reasoning_content").asStr() == "");
+    CHECK(body.at("thinking").at("type").asStr() == "enabled");
+    // DeepSeek thinks by default: reasoning "none" must disable it explicitly.
+    req.model.options.reasoning = "none";
+    req.thinking = "auto";
+    CHECK(buildOpenAiBody(req).at("thinking").at("type").asStr() == "disabled");
+    // Other OpenAI-compatible hosts never see the field.
+    req.model = mkModel();
+    CHECK(!buildOpenAiBody(req).at("messages").at(3).has("reasoning_content"));
+    return "";
+}
+
 TEST(provider_Sse_Multiline_And_Key_Injection) {
     std::string carry;
     CHECK(sseSplit("data: {\"x\":\n", carry).empty());

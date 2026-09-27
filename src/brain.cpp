@@ -357,6 +357,10 @@ std::string quirkFromError(const std::string& err, bool sentReasoning,
         return "max_tokens";
     if (tokenParameter == "max_tokens" && e.find("max_completion_tokens") != std::string::npos)
         return "max_completion_tokens";
+    // A history-shape complaint ("reasoning_content ... must be passed back")
+    // is not a missing capability: retry this request without thinking, learn nothing.
+    if (e.find("passed back") != std::string::npos && e.find("reasoning") != std::string::npos)
+        return "thinking_off_once";
     if (sentReasoning && (e.find("reasoning") != std::string::npos ||
                           e.find("thinking") != std::string::npos ||
                           e.find("effort") != std::string::npos))

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.2
+
+- DeepSeek thinking mode no longer stops sessions and goals with
+  `HTTP 400: The reasoning_content in the thinking mode must be passed back`.
+  Assistant turns without DeepSeek reasoning (answered by the fallback
+  model, or sent with thinking off) are now replayed with an empty
+  `reasoning_content`, which the API accepts (verified live against the
+  failing session history).
+- That error is no longer mistaken for "model does not support reasoning":
+  it retries the request once without thinking and learns nothing. A
+  `no_reasoning` quirk previously learned for DeepSeek is ignored, and
+  reasoning `none` on DeepSeek now sends an explicit `thinking: disabled`
+  (DeepSeek thinks by default, so omitting the field did not turn it off).
+- A request the main model still rejects with 400/422 after quirk handling
+  goes to the fallback model instead of ending the turn or pausing the goal.
+
 ## 0.7.1
 
 - Session exit cleans up after itself. Quitting, closing the

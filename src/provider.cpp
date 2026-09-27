@@ -38,6 +38,11 @@ bool isOpenRouter(const ResolvedModel& m) {
     return m.provider.name == "openrouter";
 }
 
+// DeepSeek's own API (thinking toggle, mandatory reasoning replay).
+bool isDeepSeek(const ResolvedModel& m) {
+    return m.provider.name == "deepseek" || m.provider.baseUrl.find("api.deepseek.com") != std::string::npos;
+}
+
 // Shared usage-block reader (streaming deltas and full responses alike).
 // Reads exactly what the provider reported; absent fields stay -1.
 void readUsage(const json::Value& u, long& in, long& out, long& hit, long& miss, double& cost) {
@@ -132,6 +137,10 @@ json::Value buildOpenAiBody(const ChatRequest& req) {
             for (const char* key : {"reasoning_content", "reasoning_details"})
                 if (m.replay.has(key)) o[key] = m.replay.at(key);
         }
+        // DeepSeek thinking mode rejects any assistant turn replayed without
+        // reasoning_content (fallback-model or thinking-off turns); empty is accepted.
+        if (m.role == "assistant" && isDeepSeek(req.model) && !o.count("reasoning_content"))
+            o["reasoning_content"] = json::Value("");
         msgs.push_back(json::Value(o));
     }
     b["messages"] = json::Value(msgs);
@@ -165,8 +174,10 @@ json::Value buildOpenAiBody(const ChatRequest& req) {
             b["reasoning"] = json::Object{{"effort", effort}};
         else b["reasoning_effort"] = effort;
     }
-    if (req.model.provider.name == "deepseek" && req.model.options.reasoning != "none" && req.thinking != "auto")
-        b["thinking"] = json::Object{{"type", req.thinking == "off" || req.thinking == "none" ? "disabled" : "enabled"}};
+    // DeepSeek thinks by default, so "none" must be sent as an explicit disable.
+    bool deepseekOff = req.model.options.reasoning == "none" || req.thinking == "off" || req.thinking == "none";
+    if (isDeepSeek(req.model) && (deepseekOff || req.thinking != "auto"))
+        b["thinking"] = json::Object{{"type", deepseekOff ? "disabled" : "enabled"}};
     if (req.model.provider.name == "openai" && req.model.options.promptCache && !req.sessionTag.empty())
         b["prompt_cache_key"] = req.sessionTag;
     // OpenRouter provider routing, e.g. model "hy4-preview@deepinfra".
@@ -1250,7 +1261,10 @@ Result<ChatResponse> chatRequest(const ChatRequest& original, const ChatCallback
     // teaches a new one and retries once per quirk. Nothing to configure.
     ChatRequest req = original;
     std::string key = req.model.provider.name + ":" + req.model.model;
-    for (const auto& q : brainQuirks(key)) applyQuirk(req.model.options, q);
+    // DeepSeek always supports thinking; a stored "no_reasoning" came from its
+    // reasoning-replay 400 (fixed since 0.7.2) and would only disable thinking.
+    for (const auto& q : brainQuirks(key))
+        if (!(q == "no_reasoning" && isDeepSeek(req.model))) applyQuirk(req.model.options, q);
     for (int learned = 0;; ++learned) {
         int64_t t0 = nowMs();
         auto r = chatRequestOnce(req, cb);
@@ -1259,9 +1273,14 @@ Result<ChatResponse> chatRequest(const ChatRequest& original, const ChatCallback
             brainNoteHealth(req.model.provider.name, r.ok, (long)(nowMs() - t0));
         if (r.ok || learned >= 3) return r;
         bool sentReasoning = req.model.options.reasoning != "none" && req.thinking != "auto" &&
-                             (req.thinking != "off" || req.model.provider.name == "deepseek");
+                             (req.thinking != "off" || isDeepSeek(req.model));
         std::string q = quirkFromError(r.error, sentReasoning, req.model.options.tokenParameter);
-        if (q.empty()) return r;
+        if (q == "thinking_off_once" && req.thinking != "off") {
+            req.thinking = "off";
+            if (cb.onNotice) cb.onNotice(key + " rejected the replayed reasoning; retrying this request without thinking");
+            continue;
+        }
+        if (q.empty() || q == "thinking_off_once") return r;
         brainNoteQuirk(key, q);
         applyQuirk(req.model.options, q);
         if (cb.onNotice) cb.onNotice("learned " + key + " quirk: " + q + "; retrying");

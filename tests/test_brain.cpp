@@ -55,6 +55,8 @@ TEST(brain_Quirks_Learned_From_400s_Persist) {
     CHECK(quirkFromError("HTTP 400: Unrecognized field stream_options", false, "max_tokens") == "no_stream_usage");
     CHECK(quirkFromError("HTTP 400: use max_completion_tokens instead", false, "max_tokens") == "max_completion_tokens");
     CHECK(quirkFromError("HTTP 500: reasoning exploded", true, "max_tokens") == "");
+    CHECK(quirkFromError("HTTP 400: The `reasoning_content` in the thinking mode must be passed back to the API.", true,
+                         "max_tokens") == "thinking_off_once");
     brainNoteQuirk("p:m", "no_reasoning");
     brainNoteQuirk("p:m", "no_reasoning");  // idempotent
     CHECK(brainQuirks("p:m").size() == 1);
