@@ -41,6 +41,10 @@ struct ModelOptions {
     std::string tokenParameter = "max_tokens";
     bool streamUsage = true;
     bool promptCache = true;
+    // Catalog-derived (OpenRouter): how to honor thinking=off. "" sends
+    // nothing, "disable" turns reasoning off, else a mandatory reasoner's
+    // lowest effort (such models otherwise default to high/max effort).
+    std::string thinkOff;
 };
 
 struct ModelCfg {

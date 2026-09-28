@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.8.1
+
+- Speed: the review council no longer waits on a stalled reviewer. After
+  the first verdict, the rest get a grace window of 20-45s. After that
+  they are cancelled, and the notice names every reviewer that gave no
+  verdict and why ("no verdict: openrouter:z-ai/glm-5.3-flash timed
+  out"). A simple fix-and-verify turn went from 210s to about 23s.
+- Speed: the brief is advisory and now has a 20s deadline. A slow fast
+  model no longer delays the work, and a late brief is never injected.
+  Small, precise tasks get a short brief (intent plus 1-3 acceptance
+  lines) instead of invented scope.
+- OpenRouter `thinking=off` is now actually sent. Before, no knob was
+  sent, so reasoning models ran at their default effort, which is `max`
+  for mandatory reasoners such as GLM-5.3-flash. Those side calls often
+  spent the whole budget on reasoning and returned nothing. The catalog
+  now records whether reasoning is mandatory and its lowest effort. Off
+  sends `{"enabled":false}`, or that lowest effort for mandatory
+  reasoners. When a stale catalog triggers a "reasoning is mandatory"
+  400, the request retries at `low` instead of learning a harmful
+  `no_reasoning` quirk.
+- Compaction rejects summaries that contain tool-call markup. It uses a
+  framed `<work_log>` prompt and retries once with a stricter ask. After
+  that it falls back to a native work digest, so the context is never
+  replaced by `<tool_call>` garbage.
+- Sandbox: Python from uv, pyenv, mise and asdf is found through PATH,
+  and so are workspace `.venv/bin/python` symlinks into those managers.
+  They get read-only runtime roots, so `uv venv` interpreters no longer
+  fail with "Permission denied". This follows the existing Node manager
+  support.
+- `-p` stdout starts a new paragraph between rounds, so narration before
+  a tool call no longer runs into the final answer.
+- The awareness block says when `.pocket/memory.md` does not exist yet,
+  so the first append no longer fails on the missing directory.
+- `.pocket-test-*` directories left by interrupted test runs are
+  gitignored.
+
 ## 0.8.0
 
 - A malformed tool call no longer stops the turn or the goal. Arguments

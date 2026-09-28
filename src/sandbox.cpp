@@ -241,20 +241,23 @@ VoidResult authorityAddWriteRoot(Authority& a, const std::string& path) {
     return VoidResult::Ok();
 }
 
-std::vector<std::string> discoverRuntimeRoots(const char* path, const std::string& home) {
+std::vector<std::string> discoverRuntimeRoots(const char* path, const std::string& home,
+                                              const std::string& workspace) {
     std::vector<std::string> roots;
     auto owner = canonicalDir(home);
     if (!owner.ok) return roots;
-    const char* managers[] = {"/.nvm/versions/node/", "/.volta/tools/image/node/",
-        "/.local/share/fnm/node-versions/", "/.local/share/mise/installs/node/", "/.asdf/installs/nodejs/"};
-    std::string paths = path ? path : "";
-    std::replace(paths.begin(), paths.end(), ':', '\n');
-    for (const auto& entry : splitLines(paths)) {
-        if (entry.empty() || entry[0] != '/') continue;
-        auto bin = canonicalDir(entry);
-        if (!bin.ok || !endsWith(bin.value, "/bin")) continue;
+    // {manager prefix under home, executable that proves a real runtime}
+    static const std::pair<const char*, const char*> managers[] = {
+        {"/.nvm/versions/node/", "node"}, {"/.volta/tools/image/node/", "node"},
+        {"/.local/share/fnm/node-versions/", "node"}, {"/.local/share/mise/installs/node/", "node"},
+        {"/.asdf/installs/nodejs/", "node"}, {"/.local/share/uv/python/", "python3"},
+        {"/.pyenv/versions/", "python3"}, {"/.local/share/mise/installs/python/", "python3"},
+        {"/.asdf/installs/python/", "python3"}};
+    auto consider = [&](const std::string& binDir) {
+        auto bin = canonicalDir(binDir);
+        if (!bin.ok || !endsWith(bin.value, "/bin")) return;
         std::string root = bin.value.substr(0, bin.value.size() - 4);
-        for (const char* manager : managers) {
+        for (const auto& [manager, exe] : managers) {
             std::string prefix = owner.value + manager;
             if (!startsWith(root, prefix)) continue;
             std::string version = root.substr(prefix.size());
@@ -263,12 +266,24 @@ std::vector<std::string> discoverRuntimeRoots(const char* path, const std::strin
                 version.resize(version.size() - std::string("/installation").size());
             }
             if (version.empty() || version.find('/') != std::string::npos) continue;
-            std::string node = bin.value + "/node";
-            struct stat st{};
-            if (lstat(node.c_str(), &st) || !S_ISREG(st.st_mode) || access(node.c_str(), X_OK)) continue;
+            std::string file = bin.value + "/" + exe;
+            if (access(file.c_str(), X_OK)) continue;
             if (std::find(roots.begin(), roots.end(), root) == roots.end()) roots.push_back(root);
             break;
         }
+    };
+    std::string paths = path ? path : "";
+    std::replace(paths.begin(), paths.end(), ':', '\n');
+    for (const auto& entry : splitLines(paths))
+        if (!entry.empty() && entry[0] == '/') consider(entry);
+    // A project venv links its interpreter into a manager tree (uv, pyenv);
+    // without that tree `.venv/bin/python` fails with "Permission denied".
+    for (const char* venv : {"/.venv/bin/python", "/venv/bin/python"}) {
+        if (workspace.empty()) break;
+        char real[PATH_MAX];
+        if (!realpath((workspace + venv).c_str(), real)) continue;
+        std::string target = real;
+        consider(target.substr(0, target.rfind('/')));
     }
     return roots;
 }

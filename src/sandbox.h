@@ -48,9 +48,11 @@ void authorityClose(Authority& a);
 VoidResult authorityAddReadRoot(Authority& a, const std::string& path);
 VoidResult authorityAddWriteRoot(Authority& a, const std::string& path);
 
-// Versioned Node installations already on the user's PATH. Grants only the
+// Versioned Node/Python installations on the user's PATH or behind a workspace
+// venv (.venv/bin/python -> ~/.local/share/uv/...). Grants only the
 // selected runtime tree, never the containing home or manager configuration.
-std::vector<std::string> discoverRuntimeRoots(const char* path, const std::string& home);
+std::vector<std::string> discoverRuntimeRoots(const char* path, const std::string& home,
+                                              const std::string& workspace = "");
 
 // Contained file operations for the native tools.
 Result<int> boxOpenRead(const Authority& a, const std::string& path);  // owned fd, regular files only

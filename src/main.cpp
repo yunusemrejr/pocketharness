@@ -468,11 +468,11 @@ int pocketMain(int argc, char** argv) {
     if (!coordinationReady.ok) { fprintf(stderr, "pocket: %s\n", coordinationReady.error.c_str()); return 1; }
     std::string coordination = coordinationReady.value;
     std::vector<std::string> readRoots = cfg.allowRead, writeRoots = cfg.allowWrite;
-    // Shell startup files are intentionally not sourced. Keep selected Node
+    // Shell startup files are intentionally not sourced. Keep selected Node/Python
     // toolchains usable without granting access to the rest of the real HOME.
     // passwd (rather than the fake child HOME) also works for recursive Pocket.
     const passwd* account = getpwuid(geteuid());
-    for (const auto& runtime : discoverRuntimeRoots(getenv("PATH"), account ? account->pw_dir : homeDir()))
+    for (const auto& runtime : discoverRuntimeRoots(getenv("PATH"), account ? account->pw_dir : homeDir(), workspace))
         readRoots.push_back(runtime);
     // Only bounded informational notices are shared; transcripts and credentials
     // stay in the private state directory outside this narrow grant.
@@ -650,9 +650,16 @@ int pocketMain(int argc, char** argv) {
         agent.setCancel(&printCancel);
         bool errTty = isatty(STDERR_FILENO);
         bool midLine = false;  // notices must start on their own line
+        // Text from separate rounds (split by tool calls) must not run
+        // together on stdout: a tool between two chunks starts a paragraph.
+        char outLast = 0;
+        std::atomic<bool> outBreak{false};
         agent.setCallbacks(
             [&](std::string_view tok) {
                 std::string s = sanitizeTerminal(std::string(tok));
+                if (outBreak && outLast && !s.empty()) s = (outLast == '\n' ? "\n" : "\n\n") + s;
+                outBreak = false;
+                if (!s.empty()) outLast = s.back();
                 (void)!fwrite(s.data(), 1, s.size(), stdout);
                 fflush(stdout);
                 if (!s.empty()) midLine = s.back() != '\n';
@@ -669,6 +676,7 @@ int pocketMain(int argc, char** argv) {
             });
         tools.onEvent = [&](const std::string& line) { fprintf(stderr, "⚙ %s\n", sanitizeTerminal(line).c_str()); };
         tools.onToolDone = [&](const std::string& name, bool ok, const std::string&) {
+            outBreak = true;
             fprintf(stderr, "%s %s\n", ok ? "✓" : "✗", name.c_str());
         };
         std::string err = !goalText.empty() ? agent.runGoal(goalText) :

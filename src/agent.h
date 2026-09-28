@@ -20,6 +20,12 @@ namespace pocket {
 // when compacting now would be wrong (too short, or no message boundary keeps
 // tool_use/tool_result pairing intact). Pure and unit-tested.
 size_t compactCutPoint(const std::vector<ChatMessage>& msgs, size_t keepLast = 8);
+// Request, changes (paths + new text), command outcomes and answers of
+// msgs[from, to), clipped to maxBytes. Also the offline compaction summary.
+std::string workDigest(const std::vector<ChatMessage>& msgs, size_t from, size_t to, size_t maxBytes);
+// A summary with tool-call markup removed; empty when little else is left
+// (the summarizer continued the transcript instead of summarizing it).
+std::string cleanSummary(const std::string& text);
 
 // History invariant: every tool message must answer a tool_call id issued by
 // a PRECEDING assistant message. Returns "" when valid, else a description.
@@ -98,6 +104,11 @@ struct AgentOpts {
     // /double per-phase deadline in ms (first passes, then reconciliation).
     // 0 selects the default. Unit tests use small values for prompt deadlines.
     long doubleDeadlineMs = 0;
+    // Minimum wait for straggling review-council members once one reviewer
+    // has answered (the window grows with the first answer, up to 45s).
+    long councilGraceMs = 20000;
+    // The brief is advisory: past this deadline the turn starts without it.
+    long briefDeadlineMs = 20000;
     // Cooldown before same-model recovery attempts (x1, then x4).
     long recoverDelayMs = 2000;
 };
@@ -232,14 +243,17 @@ class Agent {
     std::string effectiveThinking() const;
     // With `deferred`, usage is collected there instead of recorded, so
     // concurrent side requests never touch stats_ off the calling thread.
+    // `cancel` overrides the session flag (e.g. a council grace deadline).
     Result<ChatResponse> sideRequest(const ResolvedModel& m, const std::string& system,
                                      const std::string& user, long maxTokens,
-                                     std::vector<ChatResponse>* deferred = nullptr);
+                                     std::vector<ChatResponse>* deferred = nullptr,
+                                     std::atomic<bool>* cancel = nullptr);
     std::string stopGate(const std::string& finalText);
     std::string councilReview();
     // With `deferred`, usage is collected there and no notice is emitted:
     // safe to run off the agent thread (it touches no stats or callbacks).
-    std::string makeBrief(const std::string& request, std::vector<ChatResponse>* deferred = nullptr);
+    std::string makeBrief(const std::string& request, std::vector<ChatResponse>* deferred = nullptr,
+                          std::atomic<bool>* cancel = nullptr);
     std::string turnDigest(size_t maxBytes) const;
     json::Value turnTranscript(const std::string& finalText) const;
     std::map<std::string, double> ask(const json::Value& state, const std::vector<Question>& qs, bool transcript);

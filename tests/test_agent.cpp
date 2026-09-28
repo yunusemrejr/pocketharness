@@ -2679,6 +2679,82 @@ TEST(agent_Council_Reviewers_Run_Concurrently) {
     return "";
 }
 
+TEST(agent_Council_Does_Not_Wait_For_Stalled_Reviewer) {
+    ToolEnv tools;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.reviewers = {opts.model, opts.model};
+    opts.tools = &tools;
+    opts.review = true;
+    opts.councilGraceMs = 100;
+    opts.decide = [&](const json::Value&, const std::vector<Question>&, bool, double*) {
+        return std::map<std::string, double>{{"bad", .5}};
+    };
+    std::atomic<int> reviews{0};
+    std::atomic<bool> stalledCancelled{false};
+    std::vector<std::string> notices;
+    opts.onNotice = [&](const std::string& n) { notices.push_back(n); };
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks& cb) {
+        ChatResponse response;
+        if (req.system.find("strict senior reviewer") != std::string::npos) {
+            if (++reviews == 2) {  // a provider that never answers until cancelled
+                for (int i = 0; i < 1000 && !(cb.cancel && cb.cancel->load()); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                stalledCancelled = cb.cancel && cb.cancel->load();
+                return Result<ChatResponse>::Err("cancelled");
+            }
+            response.text = "LGTM";
+        } else {
+            tools.changedFiles.push_back("checked.cpp");
+            response.text = "The requested change is implemented and checked.";
+        }
+        return Result<ChatResponse>::Ok(response);
+    };
+    Agent agent(opts);
+    int64_t t0 = nowMs();
+    CHECK(agent.runTurn("Implement and verify the requested change").empty());
+    CHECK(nowMs() - t0 < 3000);
+    CHECK(stalledCancelled.load());
+    bool approved = false;
+    for (const auto& n : notices) approved |= n.find("review: 1/1 approve; no verdict: ") == 0 && n.find("timed out") != std::string::npos;
+    CHECK(approved);
+    return "";
+}
+
+TEST(agent_Slow_Brief_Is_Skipped_At_Deadline) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.brief = true;
+    opts.briefDeadlineMs = 100;
+    std::atomic<bool> briefCancelled{false};
+    std::string workPrompt;
+    std::vector<std::string> notices;
+    opts.onNotice = [&](const std::string& n) { notices.push_back(n); };
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks& cb) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) {
+            for (int i = 0; i < 1000 && !(cb.cancel && cb.cancel->load()); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            briefCancelled = cb.cancel && cb.cancel->load();
+            r.text = "INTENT: late";
+            return Result<ChatResponse>::Ok(r);
+        }
+        workPrompt = req.messages.back().content;
+        r.text = "Done.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    int64_t t0 = nowMs();
+    CHECK(agent.runTurn("fix the parser bug in the tokenizer module please").empty());
+    CHECK(nowMs() - t0 < 3000);
+    CHECK(briefCancelled.load());
+    CHECK(workPrompt.find("[brief") == std::string::npos);  // a late brief is never injected
+    bool noted = false;
+    for (const auto& n : notices) noted |= n.find("brief: skipped") == 0;
+    CHECK(noted);
+    return "";
+}
+
 TEST(agent_Text_Only_Model_Gets_Images_Stripped) {
     std::string home = makeTempDir("pocket-ablind");
     CHECK(!home.empty());
@@ -2711,5 +2787,37 @@ TEST(agent_Text_Only_Model_Gets_Images_Stripped) {
     CHECK_EQ(calls, 3);  // the model is remembered as blind: no second rejection
     CHECK_EQ(rejected, 1);
     rmRf(home);
+    return "";
+}
+
+TEST(agent_Compaction_Rejects_Tool_Markup_Summaries) {
+    CHECK(cleanSummary("<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>").empty());
+    CHECK(cleanSummary("<function=read><parameter=path>a</parameter></function>").empty());
+    CHECK_EQ(cleanSummary("short summary"), std::string("short summary"));
+    std::string prose(300, 'x');
+    CHECK_EQ(cleanSummary(prose + "<tool_call>junk</tool_call>"), prose);
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    int summaries = 0;
+    bool strictRetry = false, framed = false;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.stream) { r.text = "answer"; return Result<ChatResponse>::Ok(r); }
+        ++summaries;
+        const std::string& ask = req.messages[0].content;
+        framed = startsWith(ask, "<work_log>") && ask.find("Do not call tools") != std::string::npos;
+        strictRetry = ask.find("previous reply was tool-call markup") != std::string::npos;
+        r.text = "<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent a(opts);
+    for (int i = 0; i < 7; ++i) CHECK(a.runTurn("question " + std::to_string(i)).empty());
+    CHECK(a.compactNow().empty());
+    CHECK_EQ(summaries, 2);
+    CHECK(framed && strictRetry);
+    const std::string& kept = a.messages().front().content;
+    CHECK(kept.find("<tool_call>") == std::string::npos);
+    CHECK(kept.find("native digest") != std::string::npos);
+    CHECK(kept.find("question 0") != std::string::npos);
     return "";
 }

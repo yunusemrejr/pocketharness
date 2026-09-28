@@ -85,6 +85,17 @@ TEST(catalog_Parses_OpenRouter_And_Bare_Shapes) {
     return "";
 }
 
+TEST(catalog_Records_Mandatory_Reasoning_Floor) {
+    auto c = parseCatalog("openrouter", R"({"data":[
+        {"id":"z/must","supported_parameters":["reasoning"],
+         "reasoning":{"mandatory":true,"supported_efforts":["max","high","low"],"default_effort":"max"}},
+        {"id":"z/opt","supported_parameters":["reasoning"],"reasoning":{"mandatory":false}}]})");
+    CHECK(c.size() == 2);
+    CHECK_EQ(c[0].floor, std::string("low"));
+    CHECK(c[1].floor.empty() && c[1].reasoning == 1);
+    return "";
+}
+
 TEST(config_Env_File_And_Roles) {
     std::string home = makeTempDir("pocket-env");
     HomeGuard hg(home);

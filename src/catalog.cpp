@@ -31,6 +31,7 @@ json::Value toJson(const CatalogModel& m) {
     json::Object o{{"id", m.id}};
     if (m.context > 0) o["ctx"] = m.context;
     if (m.reasoning >= 0) o["think"] = (long)m.reasoning;
+    if (!m.floor.empty()) o["floor"] = m.floor;
     if (m.vision) o["vision"] = true;
     if (m.inPrice >= 0) o["in"] = m.inPrice;
     if (m.outPrice >= 0) o["out"] = m.outPrice;
@@ -43,6 +44,7 @@ CatalogModel fromJson(const std::string& provider, const json::Value& v) {
     m.id = v.at("id").asStr();
     m.context = v.at("ctx").asInt(-1);
     m.reasoning = (int)v.at("think").asInt(-1);
+    m.floor = v.at("floor").asStr();
     m.vision = v.at("vision").asBool();
     m.inPrice = v.at("in").asNum(-1);
     m.outPrice = v.at("out").asNum(-1);
@@ -101,6 +103,17 @@ std::vector<CatalogModel> parseCatalog(const std::string& provider, const std::s
                 if (p.asStr() == "reasoning" || p.asStr() == "include_reasoning" ||
                     p.asStr() == "reasoning_effort")
                     m.reasoning = 1;
+        }
+        // OpenRouter publishes whether reasoning can be turned off at all.
+        const auto& rs = e.at("reasoning");
+        if (rs.isObj() && rs.at("mandatory").asBool()) {
+            static const char* kEfforts[] = {"minimal", "low", "medium", "high", "xhigh", "max"};
+            for (const char* eff : kEfforts) {
+                for (const auto& s : rs.at("supported_efforts").asArr())
+                    if (s.asStr() == eff) m.floor = eff;
+                if (!m.floor.empty()) break;
+            }
+            if (m.floor.empty()) m.floor = "low";
         }
         for (const auto& mod : e.at("architecture").at("input_modalities").asArr())
             if (mod.asStr() == "image") m.vision = true;
@@ -216,6 +229,7 @@ void catalogApply(const Config& cfg, ResolvedModel& m) {
     const CatalogModel* c = catalogFind(all, m.provider.name, m.model);
     bool pinned = hasExplicitContext(cfg, m.provider.name, m.model);
     if (c && c->reasoning == 0 && m.options.reasoning == "auto") m.options.reasoning = "none";
+    if (c && c->reasoning == 1) m.options.thinkOff = c->floor.empty() ? "disable" : c->floor;
     if (c) m.inPrice = c->inPrice, m.outPrice = c->outPrice;
     if (pinned) return;
     if (c && c->context > 0) { m.context = c->context; return; }

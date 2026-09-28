@@ -9,7 +9,8 @@ tests/run_tests
 # Optional capability example outputs
 build/
 
-# Local dev scratch
+# Local dev scratch (and dirs left by interrupted sandbox tests)
+.pocket-test-*
 *.tmp.*
 *~
 

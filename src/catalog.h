@@ -15,6 +15,7 @@ struct CatalogModel {
     std::string provider, id;
     long context = -1;   // -1 unpublished
     int reasoning = -1;  // -1 unknown, 0 no, 1 yes (published supported_parameters)
+    std::string floor;   // mandatory reasoner: its lowest supported effort ("" = can be disabled)
     bool vision = false;
     double inPrice = -1, outPrice = -1;  // USD per 1M tokens, -1 unknown
 };

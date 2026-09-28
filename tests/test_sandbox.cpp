@@ -202,6 +202,26 @@ TEST(sandbox_Installed_Node_Runtime_Is_Usable_Without_Exposing_Home) {
     return "";
 }
 
+TEST(sandbox_Workspace_Venv_Grants_Only_Its_Managed_Python) {
+    CHECK(setup().empty());
+    std::string home = g_outside + "/venv-home";
+    std::string py = home + "/.local/share/uv/python/cpython-3.12-test";
+    CHECK(ensureDir(py + "/bin", 0700).ok);
+    CHECK(atomicWriteFile(py + "/bin/python3.12", "#!/bin/sh\n", 0700).ok);
+    CHECK(symlink("python3.12", (py + "/bin/python3").c_str()) == 0);
+    std::string ws = home + "/proj";
+    CHECK(ensureDir(ws + "/.venv/bin", 0700).ok);
+    CHECK(symlink((py + "/bin/python3.12").c_str(), (ws + "/.venv/bin/python").c_str()) == 0);
+    CHECK(discoverRuntimeRoots("/usr/bin", home, ws) == std::vector<std::string>{py});
+    CHECK(discoverRuntimeRoots("/usr/bin", home).empty());
+    // A venv pointing somewhere unmanaged grants nothing.
+    CHECK(unlink((ws + "/.venv/bin/python").c_str()) == 0);
+    CHECK(symlink((home + "/python3").c_str(), (ws + "/.venv/bin/python").c_str()) == 0);
+    CHECK(atomicWriteFile(home + "/python3", "#!/bin/sh\n", 0700).ok);
+    CHECK(discoverRuntimeRoots("/usr/bin", home, ws).empty());
+    return "";
+}
+
 TEST(sandbox_Guard) {
     struct Case {
         const char* cmd;

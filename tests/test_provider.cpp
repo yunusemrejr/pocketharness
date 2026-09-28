@@ -61,6 +61,24 @@ TEST(provider_OpenRouter_Session_And_Routing) {
     return "";
 }
 
+TEST(provider_OpenRouter_Thinking_Off_Is_Explicit) {
+    ChatRequest req;
+    req.model = mkModel("openrouter");
+    req.thinking = "off";
+    CHECK(!buildOpenAiBody(req).has("reasoning"));  // unknown capability: send nothing
+    req.model.options.thinkOff = "disable";
+    CHECK(!buildOpenAiBody(req).at("reasoning").at("enabled").asBool(true));
+    req.model.options.thinkOff = "low";  // mandatory reasoner: lowest effort, never its max default
+    CHECK_EQ(buildOpenAiBody(req).at("reasoning").at("effort").asStr(), std::string("low"));
+    req.thinking = "high";
+    CHECK_EQ(buildOpenAiBody(req).at("reasoning").at("effort").asStr(), std::string("high"));
+    req.model = mkModel("deepseek");
+    req.model.options.thinkOff = "disable";
+    req.thinking = "off";
+    CHECK(!buildOpenAiBody(req).has("reasoning"));  // OpenRouter-only knob
+    return "";
+}
+
 TEST(provider_Anthropic_Body) {
     ChatRequest req;
     req.model = mkModel();

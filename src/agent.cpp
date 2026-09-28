@@ -654,7 +654,8 @@ Result<ChatResponse> Agent::requestOnce() {
 
 Result<ChatResponse> Agent::sideRequest(const ResolvedModel& m, const std::string& system,
                                         const std::string& user, long maxTokens,
-                                        std::vector<ChatResponse>* deferred) {
+                                        std::vector<ChatResponse>* deferred,
+                                        std::atomic<bool>* cancel) {
     ChatRequest req;
     req.model = m;
     req.system = system;
@@ -668,7 +669,7 @@ Result<ChatResponse> Agent::sideRequest(const ResolvedModel& m, const std::strin
     if (req.messages[0].content.size() > cap)
         req.messages[0].content = user.substr(0, cap / 2) + "\n[... omitted for context ...]\n" + user.substr(user.size() - cap / 2);
     ChatCallbacks cb;
-    cb.cancel = opts_.cancel;
+    cb.cancel = cancel ? cancel : opts_.cancel;
     bool usageSeen = false;
     auto record = [&](const ChatResponse& u, long ms) {
         if (deferred) deferred->push_back(u);
@@ -681,7 +682,7 @@ Result<ChatResponse> Agent::sideRequest(const ResolvedModel& m, const std::strin
     // before answering; one retry with a larger budget beats failing a goal.
     long larger = std::min(req.maxTokens * 4, std::max(256L, m.context / 4));
     if (!r.ok && r.error.find("output limit reached") != std::string::npos && larger > req.maxTokens &&
-        !(opts_.cancel && opts_.cancel->load())) {
+        !(cb.cancel && cb.cancel->load())) {
         req.maxTokens = larger;
         usageSeen = false;
         t0 = nowMs();
@@ -762,6 +763,31 @@ size_t compactCutPoint(const std::vector<ChatMessage>& msgs, size_t keepLast) {
     return keepFrom;
 }
 
+namespace {
+const char* kCompactAsk =
+    "Summarize the work log above so the agent can continue without it. Keep: the goal and every user "
+    "requirement, key findings, files changed and why, commands that passed or failed, decisions, open "
+    "problems and next steps. Be dense and factual, under 1500 words. Do not call tools and do not "
+    "continue the work: write the summary only.";
+}  // namespace
+
+std::string cleanSummary(const std::string& text) {
+    std::string out;
+    size_t markup = 0;
+    for (size_t i = 0; i < text.size();) {
+        size_t a = text.find("<tool_call", i), b = text.find("<function=", i);
+        size_t open = std::min(a, b);
+        if (open == std::string::npos) { out += text.substr(i); break; }
+        out += text.substr(i, open - i);
+        const char* close = open == a ? "</tool_call>" : "</function>";
+        size_t end = text.find(close, open);
+        i = end == std::string::npos ? text.size() : end + strlen(close);
+        markup += i - open;
+    }
+    out = trim(out);
+    return markup && out.size() < 200 ? std::string() : out;
+}
+
 std::string Agent::compactNow() {
     size_t keepFrom = compactCutPoint(messages_, 8);
     if (keepFrom >= messages_.size()) return "";
@@ -771,8 +797,10 @@ std::string Agent::compactNow() {
         old += "### " + m.role + "\n" + m.content + "\n";
         if (!m.images.empty())
             old += "(" + std::to_string(m.images.size()) + " attached image(s) omitted)\n";
+        // Plain notes, not call syntax: a transcript of calls invites the
+        // summarizer to emit one more call instead of the summary.
         for (const auto& tc : m.toolCalls)
-            old += "(tool " + tc.name + " " + tc.argsJson + ")\n";
+            old += "- ran " + tc.name + ": " + tc.argsJson.substr(0, 1500) + "\n";
     }
     // Keep the user's constraints verbatim in the resulting history. A
     // summarizer may compress work evidence, but cannot silently rewrite the
@@ -786,8 +814,8 @@ std::string Agent::compactNow() {
     if (old.size() > 120000) old = old.substr(old.size() - 120000);
     ChatRequest req;
     req.model = opts_.fast.empty() ? opts_.model : opts_.fast[0];  // cheaper summarizer when set
-    req.system = "Summarize the conversation below for continuation. Keep: goals, key findings, "
-                 "files changed, decisions, and next steps. Be dense, factual, under 1500 words.";
+    req.system = "You summarize an agent's work log for continuation. You never act, call tools or "
+                 "continue the work. Output only the summary as plain markdown.";
     req.messages = {ChatMessage{"user", old, {}, ""}};
     req.thinking = "off";
     req.stream = false;
@@ -804,20 +832,38 @@ std::string Agent::compactNow() {
     size_t recentChars = maxChars - anchorChars - previous.size();
     if (old.size() > recentChars) old = old.substr(old.size() - recentChars);
     old = constraints.substr(0, anchorChars) + previous + old;
-    req.messages[0].content = old;
+    // The instruction follows the log: models obey the last thing they read.
+    req.messages[0].content = "<work_log>\n" + old + "\n</work_log>\n\n" + kCompactAsk;
     ChatCallbacks cb;
     cb.cancel = opts_.cancel;
     cb.onNotice = opts_.onNotice;
     bool usageSeen = false;
     cb.onUsage = [&](const ChatResponse& usage) { usageSeen = true; recordResponse(usage, 0, &req.model, true); };
-    int64_t t0 = nowMs();
-    auto r = opts_.request(req, cb);
-    if (!r.ok) return "compaction failed: " + r.error;
-    if (!usageSeen) recordResponse(r.value, nowMs() - t0, &req.model, true);
-    if (r.value.text.empty()) return "compaction returned an empty summary";
-    std::string summary = constraints + "[Work evidence summary]\n" + r.value.text;
+    // One retry when the summarizer continues the log instead of summing it
+    // up; then the native digest, so compaction never stores tool markup.
+    std::string text;
+    for (int attempt = 0; attempt < 2 && text.empty(); ++attempt) {
+        usageSeen = false;
+        int64_t t0 = nowMs();
+        auto r = opts_.request(req, cb);
+        if (!r.ok) {
+            if (attempt == 0 && !(opts_.cancel && opts_.cancel->load())) return "compaction failed: " + r.error;
+            break;
+        }
+        if (!usageSeen) recordResponse(r.value, nowMs() - t0, &req.model, true);
+        text = cleanSummary(r.value.text);
+        if (text.empty())
+            req.messages[0].content += "\n\nYour previous reply was tool-call markup or empty. Reply with "
+                                       "the prose summary only.";
+    }
+    if (text.empty()) {
+        if (opts_.cancel && opts_.cancel->load()) return "compaction failed: cancelled";
+        text = "[native digest: the summarizer returned no usable summary]\n" +
+               workDigest(messages_, 0, keepFrom, 12000);
+    }
+    std::string summary = constraints + "[Work evidence summary]\n" + text;
     SessionEvent checkpoint{"compact", summary, "", "", "", true};
-    checkpoint.replay = json::Object{{"cut", (long)keepFrom}, {"summary", r.value.text.substr(0, 24000)}};
+    checkpoint.replay = json::Object{{"cut", (long)keepFrom}, {"summary", text.substr(0, 24000)}};
     ++stats_.compactions;
     stats_.lastPrompt = -1;
     lastEstimate_ = 0;
@@ -826,7 +872,7 @@ std::string Agent::compactNow() {
     std::vector<ChatMessage> kept(messages_.begin() + (long)keepFrom, messages_.end());
     messages_.clear();
     messages_.push_back(ChatMessage{"user", "[Summary of earlier work]\n" + summary, {}, ""});
-    messages_.front().replay = json::Object{{"compact_summary", r.value.text.substr(0, 24000)}};
+    messages_.front().replay = json::Object{{"compact_summary", text.substr(0, 24000)}};
     messages_.insert(messages_.end(), kept.begin(), kept.end());
     turnStart_ = turnStart_ >= keepFrom ? turnStart_ - keepFrom + 1 : 0;
     thinkNow_ = "high";  // re-orient after the summary
@@ -874,9 +920,13 @@ void Agent::pushUser(const std::string& text) {
 // Compact record of this turn's work for reviewers and goal audits: the
 // request, every change (paths + new text), command outcomes, final answer.
 std::string Agent::turnDigest(size_t maxBytes) const {
+    return workDigest(messages_, turnStart_, messages_.size(), maxBytes);
+}
+
+std::string workDigest(const std::vector<ChatMessage>& msgs, size_t from, size_t to, size_t maxBytes) {
     std::string d;
-    for (size_t i = turnStart_; i < messages_.size(); ++i) {
-        const auto& m = messages_[i];
+    for (size_t i = from; i < to && i < msgs.size(); ++i) {
+        const auto& m = msgs[i];
         if (m.role == "user") d += "USER: " + m.content.substr(0, 3000) + "\n";
         for (const auto& tc : m.toolCalls) {
             auto a = json::parse(tc.argsJson);
@@ -1032,27 +1082,49 @@ std::string Agent::councilReview() {
         "gradients, emoji decoration, pointless animation), unverified claims. Ignore style nits. "
         "Reply exactly LGTM if acceptable; otherwise a terse numbered list of defects with file names.";
     int objections = 0, answered = 0;
-    std::string findings;
+    std::string findings, silent;
     // Reviewers run concurrently: the council costs one reviewer's latency,
-    // not the sum. Usage is recorded here after the join.
+    // not the sum. Once one answers, stragglers get a bounded grace window
+    // and are then cancelled, so one stalled provider never holds the turn.
+    // Usage is recorded here after the join.
     std::vector<Result<ChatResponse>> votes(council.size(), Result<ChatResponse>::Err("not run"));
     std::vector<std::vector<ChatResponse>> usages(council.size());
+    std::vector<std::atomic<bool>> stop(council.size());
+    std::vector<std::atomic<bool>> done(council.size());
     std::vector<std::thread> pool;
     for (size_t i = 0; i < council.size(); ++i)
         pool.emplace_back([&, i] {
             try {
-                votes[i] = sideRequest(council[i], sys, digest, 1200, &usages[i]);
+                votes[i] = sideRequest(council[i], sys, digest, 1200, &usages[i], &stop[i]);
             } catch (...) {
                 votes[i] = Result<ChatResponse>::Err("reviewer failed");
             }
+            done[i] = true;
         });
+    const int64_t t0 = nowMs();
+    int64_t grace = t0 + 300000;
+    for (;;) {
+        size_t finished = 0;
+        for (size_t i = 0; i < council.size(); ++i) finished += done[i].load();
+        if (finished == council.size()) break;
+        int64_t now = nowMs();
+        if (finished && grace > now + 45000) grace = now + std::max<int64_t>(opts_.councilGraceMs, std::min<int64_t>(now - t0, 45000));
+        if (now >= grace || (opts_.cancel && opts_.cancel->load())) {
+            for (auto& s : stop) s = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     for (auto& t : pool) t.join();
     for (size_t i = 0; i < council.size(); ++i) {
         for (const auto& u : usages[i]) recordResponse(u, 0, &council[i], true);
         const auto& r = votes[i];
-        if (!r.ok) continue;
-        std::string t = trim(r.value.text);
-        if (t.empty()) continue;
+        std::string t = r.ok ? trim(r.value.text) : "";
+        if (t.empty()) {
+            std::string why = stop[i] ? "timed out" : !r.ok ? r.error.substr(0, 80) : "empty reply";
+            silent += (silent.empty() ? "" : "; ") + council[i].spec + " " + why;
+            continue;
+        }
         ++answered;
         std::string lt = toLower(t);
         if (startsWith(lt, "lgtm") && lt.size() < 48) continue;  // "LGTM." / "LGTM - looks fine"
@@ -1061,7 +1133,8 @@ std::string Agent::councilReview() {
     }
     ++stats_.reviews;
     if (opts_.onNotice)
-        opts_.onNotice("review: " + std::to_string(answered - objections) + "/" + std::to_string(answered) + " approve");
+        opts_.onNotice("review: " + std::to_string(answered - objections) + "/" + std::to_string(answered) + " approve" +
+                       (silent.empty() ? "" : "; no verdict: " + silent));
     if (answered == 0 || objections * 2 <= answered) return "";
     return "[overseer review] The review council found problems. Fix what is valid (briefly say why if "
            "you reject an item), re-verify, then finish:\n" + findings;
@@ -1188,7 +1261,8 @@ void Agent::readWorkspaceUpdates() {
 // The planning council: interpret the request the way the best domain
 // expert would, decide the open questions from evidence, and fix
 // acceptance criteria that the reviewers and goal audits later enforce.
-std::string Agent::makeBrief(const std::string& request, std::vector<ChatResponse>* deferred) {
+std::string Agent::makeBrief(const std::string& request, std::vector<ChatResponse>* deferred,
+                             std::atomic<bool>* cancel) {
     ResolvedModel m = opts_.fast.empty() ? opts_.model : opts_.fast[0];
     std::string snapshot;
     if (opts_.tools) {
@@ -1209,7 +1283,9 @@ std::string Agent::makeBrief(const std::string& request, std::vector<ChatRespons
     auto r = sideRequest(m,
         "You are the planning council for an expert autonomous agent. Before work starts, interpret the "
         "request as the best practitioner in its domain would. The user's words are the top priority; the "
-        "wisdom notes are guidance. Output, under 250 words:\n"
+        "wisdom notes are guidance. Scale to the request: a small precise task (one bug, one file, one "
+        "command) gets only INTENT and 1-3 ACCEPTANCE lines; never invent scope. Otherwise output, under "
+        "250 words:\n"
         "INTENT: what the user actually wants (1-2 lines).\n"
         "DECISIONS: the questions an expert would raise (identity, audience, typography, color, layout, "
         "architecture, data correctness, performance, security, tests...) each answered decisively from the "
@@ -1217,7 +1293,7 @@ std::string Agent::makeBrief(const std::string& request, std::vector<ChatRespons
         "ACCEPTANCE: 3-7 checkable criteria.\n"
         "AVOID: the generic, average outcome for this request.",
         "REQUEST:\n" + request.substr(0, 6000) + "\n\nPROJECT:\n" + snapshot + "\nWISDOM:\n" + wisdomFor(request, 5000),
-        900, deferred);
+        900, deferred, cancel);
     if (!r.ok || trim(r.value.text).empty()) return "";
     if (!deferred && opts_.onNotice) opts_.onNotice("brief: request interpreted by " + m.spec);
     return "[brief — the harness's expert interpretation; the request above wins on conflict]\n" + trim(r.value.text);
@@ -1820,13 +1896,16 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
     std::string brief;
     std::vector<ChatResponse> briefUsage;
     std::thread briefWorker;
+    std::atomic<bool> briefStop{false}, briefDone{false};
+    const int64_t briefStart = nowMs();
     if (!continuation && opts_.brief && goalStatus_ != GoalStatus::Active && needsBrief(userText))
         briefWorker = std::thread([&] {
             try {
-                brief = makeBrief(userText, &briefUsage);
+                brief = makeBrief(userText, &briefUsage, &briefStop);
             } catch (...) {
                 brief.clear();
             }
+            briefDone = true;
         });
     std::string hint;
     if (!continuation && opts_.hint) {
@@ -1834,13 +1913,23 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
         try {
             hint = opts_.hint(userText, &cost);
         } catch (...) {
+            briefStop = true;
             if (briefWorker.joinable()) briefWorker.join();  // never unwind past a live thread
             throw;
         }
         if (cost > 0) { stats_.sideCost += cost; stats_.cost += cost; stats_.costSeen = true; }
     }
     if (briefWorker.joinable()) {
+        // The brief is advisory: a slow fast-model never delays the work.
+        while (!briefDone && nowMs() - briefStart < opts_.briefDeadlineMs && !(opts_.cancel && opts_.cancel->load()))
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (!briefDone) {
+            briefStop = true;
+            if (opts_.onNotice && !(opts_.cancel && opts_.cancel->load()))
+                opts_.onNotice("brief: skipped (fast model exceeded " + std::to_string(opts_.briefDeadlineMs / 1000) + "s)");
+        }
         briefWorker.join();
+        if (briefStop) brief.clear();
         const ResolvedModel& bm = opts_.fast.empty() ? opts_.model : opts_.fast[0];
         for (const auto& u : briefUsage) recordResponse(u, 0, &bm, true);
         if (!brief.empty()) {

@@ -737,7 +737,8 @@ std::string awarenessBlock(const std::string& ws, const Config& cfg, bool allowN
          "run a small real case, and inspect the result before claiming success.\n";
     std::string mem = projectDir(ws) + "/memory.md";
     auto m = readFileBounded(mem, 16384);
-    s += "Project memory: " + mem + " — append short durable learnings (commands, pitfalls, decisions).\n";
+    s += "Project memory: " + mem + (m.ok ? "" : " (not created yet; `mkdir -p .pocket` first)") +
+         " — append short durable learnings (commands, pitfalls, decisions).\n";
     if (m.ok && !trim(m.value).empty()) s += "Project memory contents:\n" + m.value + "\n";
     return s;
 }

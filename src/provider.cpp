@@ -174,6 +174,12 @@ json::Value buildOpenAiBody(const ChatRequest& req) {
             b["reasoning"] = json::Object{{"effort", effort}};
         else b["reasoning_effort"] = effort;
     }
+    // OpenRouter reasons at the model default when no knob is sent, so "off"
+    // is explicit; mandatory reasoners get their lowest effort instead.
+    const std::string& off = req.model.options.thinkOff;
+    if (isOpenRouter(req.model) && req.model.options.reasoning != "none" && !off.empty() &&
+        (req.thinking == "off" || req.thinking == "none"))
+        b["reasoning"] = off == "disable" ? json::Object{{"enabled", false}} : json::Object{{"effort", off}};
     // DeepSeek thinks by default, so "none" must be sent as an explicit disable.
     bool deepseekOff = req.model.options.reasoning == "none" || req.thinking == "off" || req.thinking == "none";
     if (isDeepSeek(req.model) && (deepseekOff || req.thinking != "auto"))
@@ -1336,8 +1342,15 @@ Result<ChatResponse> chatRequest(const ChatRequest& original, const ChatCallback
         if (r.ok || (!payloadFault && r.error != "cancelled"))
             brainNoteHealth(req.model.provider.name, r.ok, (long)(nowMs() - t0));
         if (r.ok || learned >= 3) return r;
+        // A stale catalog can miss that reasoning is mandatory: lower it
+        // instead of learning "no_reasoning" (which means default=max effort).
+        if (req.model.options.thinkOff == "disable" && toLower(r.error).find("mandatory") != std::string::npos) {
+            req.model.options.thinkOff = "low";
+            continue;
+        }
         bool sentReasoning = req.model.options.reasoning != "none" && req.thinking != "auto" &&
-                             (req.thinking != "off" || isDeepSeek(req.model));
+                             (req.thinking != "off" || isDeepSeek(req.model) ||
+                              (isOpenRouter(req.model) && !req.model.options.thinkOff.empty()));
         std::string q = quirkFromError(r.error, sentReasoning, req.model.options.tokenParameter);
         if (q == "thinking_off_once" && req.thinking != "off") {
             req.thinking = "off";
