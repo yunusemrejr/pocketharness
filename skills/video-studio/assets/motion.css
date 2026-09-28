@@ -1,0 +1,113 @@
+/* Pocket motion kit: deterministic CSS animation primitives for `pocket kit video`.
+   Every effect starts at an absolute time given by --at (e.g. style="--at:var(--b2-s)"), so a scene is a
+   timeline written in CSS: no JavaScript, and the renderer can seek any frame. Copy this file next to the scene. */
+
+:root {
+  --ease-out: cubic-bezier(.16, 1, .3, 1);       /* expo-out: default entrance, fast then settling */
+  --ease-in: cubic-bezier(.7, 0, .84, 0);        /* exits */
+  --ease-io: cubic-bezier(.65, 0, .35, 1);       /* camera and morphs */
+  --spring: linear(0, .0316, .1109, .2185, .3393, .4619, .5785, .6841, .7757, .8523, .9139, .9616, .9968, 1.0213, 1.0369, 1.0455, 1.0487, 1.0481, 1.0448, 1.0398, 1.034, 1.028, 1.0222, 1.0169, 1.0122, 1.0082, 1.005, 1.0025, 1.0006, .9993, .9984, .9979, .9976, .9976, .9978, .998, .9983, .9985, .9988, .9991, .9993, .9995, 1);
+  --at: 0s;      /* when the effect starts (absolute seconds) */
+  --dur: .8s;    /* how long it takes */
+}
+* { box-sizing: border-box; margin: 0; }
+html, body { width: 100%; height: 100%; overflow: hidden; }
+body { background: var(--paper, #111); color: var(--ink, #eee); font-family: var(--text, sans-serif); }
+.stage { position: relative; width: 100vw; height: 100vh; overflow: hidden; }
+.fill { position: absolute; inset: 0; }
+
+/* A beat is visible for its window only: style="--at:var(--b1-s);--len:calc(var(--b1-e) - var(--b1-s) + .6s)". */
+.beat { position: absolute; inset: 0; visibility: hidden; animation: beat-on var(--len, 1s) step-start var(--at); }
+@keyframes beat-on { from, to { visibility: visible; } }
+
+/* Entrances. Combine with --at/--dur; children of .stagger step by --gap per sibling. */
+.fade   { animation: fade var(--dur) var(--ease-out) var(--at) both; }
+.rise   { animation: rise var(--dur) var(--ease-out) var(--at) both; }
+.drop   { animation: drop var(--dur) var(--ease-out) var(--at) both; }
+.from-l { animation: from-l var(--dur) var(--ease-out) var(--at) both; }
+.from-r { animation: from-r var(--dur) var(--ease-out) var(--at) both; }
+.pop    { animation: pop calc(var(--dur) * .9) var(--spring) var(--at) both; }
+.zoom   { animation: zoom calc(var(--dur) * 1.4) var(--ease-out) var(--at) both; }
+.blur-in { animation: blur-in var(--dur) var(--ease-out) var(--at) both; }
+.wipe   { animation: wipe var(--dur) var(--ease-io) var(--at) both; }
+.grow-x { transform-origin: left center; animation: grow-x var(--dur) var(--ease-out) var(--at) both; }
+.grow-y { transform-origin: center bottom; animation: grow-y var(--dur) var(--ease-out) var(--at) both; }
+.mask { overflow: hidden; padding-bottom: .12em; margin-bottom: -.12em; }              /* line reveal: .mask > span.up */
+.up { display: block; animation: up var(--dur) var(--ease-out) var(--at) both; }
+.stagger > * { --at: calc(var(--from, 0s) + (sibling-index() - 1) * var(--gap, .09s)); }
+@keyframes fade    { from { opacity: 0; } }
+@keyframes rise    { from { opacity: 0; transform: translateY(var(--dist, 48px)); } }
+@keyframes drop    { from { opacity: 0; transform: translateY(calc(var(--dist, 48px) * -1)); } }
+@keyframes from-l  { from { opacity: 0; transform: translateX(calc(var(--dist, 120px) * -1)); } }
+@keyframes from-r  { from { opacity: 0; transform: translateX(var(--dist, 120px)); } }
+@keyframes pop     { from { opacity: 0; transform: scale(.6); } 25% { opacity: 1; } }
+@keyframes zoom    { from { opacity: 0; transform: scale(1.18); } }
+@keyframes blur-in { from { opacity: 0; filter: blur(14px); transform: scale(1.04); } }
+@keyframes wipe    { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
+@keyframes grow-x  { from { transform: scaleX(0); } }
+@keyframes grow-y  { from { transform: scaleY(0); } }
+@keyframes up      { from { transform: translateY(108%); } }
+
+/* Exits go on a wrapper so they do not fight the child's entrance: style="--out:5.2s". */
+.out-fade { animation: out-fade .45s var(--ease-in) var(--out) both; }
+.out-up   { animation: out-up .5s var(--ease-in) var(--out) both; }
+.out-l    { animation: out-l .5s var(--ease-in) var(--out) both; }
+@keyframes out-fade { to { opacity: 0; } }
+@keyframes out-up   { to { opacity: 0; transform: translateY(-40px); } }
+@keyframes out-l    { to { opacity: 0; transform: translateX(-120px); } }
+
+/* Camera: slow push or drift on a container. Set --s0/--s1 (scale), --x0/--y0/--x1/--y1 (translate). */
+.cam { animation: cam var(--len, 6s) var(--ease-io) var(--at) both; transform-origin: var(--origin, 50% 50%); }
+@keyframes cam { from { transform: translate(var(--x0, 0), var(--y0, 0)) scale(var(--s0, 1)); }
+                 to   { transform: translate(var(--x1, 0), var(--y1, 0)) scale(var(--s1, 1.08)); } }
+.drift { animation: drift var(--period, 14s) ease-in-out infinite alternate; }          /* ambient, loops deterministically */
+@keyframes drift { from { transform: translate(-1.2%, -.8%) rotate(-.4deg); } to { transform: translate(1.2%, .8%) rotate(.4deg); } }
+
+/* Emphasis. */
+.mark { background: linear-gradient(var(--accent, currentColor), var(--accent, currentColor)) no-repeat 0 96% / 0% .2em;
+        animation: mark .7s var(--ease-out) var(--at) forwards; }
+@keyframes mark { to { background-size: 100% .2em; } }
+.pulse { animation: pulse .7s var(--ease-io) var(--at); }
+@keyframes pulse { 40% { transform: scale(1.06); } }
+.draw { stroke-dasharray: 1; stroke-dashoffset: 1; animation: draw var(--dur) var(--ease-io) var(--at) forwards; }   /* SVG path with pathLength="1" */
+@keyframes draw { to { stroke-dashoffset: 0; } }
+
+/* Number that counts up: <span class="count" style="--to:87;--unit:'%';--at:2s"></span> */
+@property --n { syntax: '<integer>'; inherits: false; initial-value: 0; }
+.count { counter-reset: n var(--n); animation: count var(--dur) var(--ease-out) var(--at) both; font-variant-numeric: tabular-nums; }
+.count::after { content: counter(n) var(--unit, ''); }
+@keyframes count { from { --n: 0; } to { --n: var(--to); } }
+
+/* Captions from `kit say`: <div class="cap">...</div> is the generated fragment. Restyle freely. */
+.cap { position: absolute; left: 8%; right: 8%; bottom: 8%; text-align: center; font: 600 clamp(28px, 3.2vw, 56px)/1.25 var(--text, sans-serif); pointer-events: none; }
+.cap > span { position: absolute; left: 0; right: 0; bottom: 0; opacity: 0; text-shadow: 0 2px 14px rgba(0,0,0,.35); animation: cap-on var(--d) linear var(--s); }
+@keyframes cap-on { 0% { opacity: 0; transform: translateY(.25em); } 7% { opacity: 1; transform: none; } 93% { opacity: 1; } 100% { opacity: 0; } }
+
+/* Call-to-action pieces (publish mode only; see cta.html). Colours come from the theme. */
+.cta { display: inline-flex; align-items: center; gap: .6em; padding: .55em 1.1em; border-radius: 999px; font: 700 clamp(26px, 2.6vw, 44px)/1 var(--text, sans-serif);
+       background: var(--accent, #d33); color: var(--on-accent, #fff); position: relative; white-space: nowrap; }
+.cta.ghost { background: transparent; color: var(--ink); box-shadow: inset 0 0 0 3px var(--line, currentColor); }
+.cta .before, .cta .after { display: inline-flex; align-items: center; gap: .5em; }
+.cta .after { position: absolute; inset: 0; justify-content: center; opacity: 0; }
+.cta.clicks { animation: pop .7s var(--spring) var(--at) both, press .32s var(--ease-io) var(--click) both; }
+.cta.clicks .before { animation: swap-out .2s linear var(--click) both; }
+.cta.clicks .after { animation: swap-in .2s linear var(--click) both; }
+.cta.clicks.ghost { animation: pop .7s var(--spring) var(--at) both, press .32s var(--ease-io) var(--click) both, fill .3s linear var(--click) both; }
+.bell { transform-origin: 50% 12%; animation: pop .7s var(--spring) var(--at, 0s) both, ring .9s ease-in-out var(--ring) both; }
+.thumb { transform-origin: 30% 80%; animation: like .7s var(--spring) var(--click) both; }
+.cursor { position: absolute; width: 1.1em; height: 1.1em; left: 62%; top: 72%; animation: cursor-in .9s var(--ease-io) var(--at) both; }
+@keyframes press { 45% { transform: scale(.93); } }
+@keyframes swap-out { to { opacity: 0; } }
+@keyframes swap-in { to { opacity: 1; } }
+@keyframes fill { to { background: var(--accent); color: var(--on-accent, #fff); box-shadow: none; } }
+@keyframes ring { 10% { transform: rotate(18deg); } 25% { transform: rotate(-16deg); } 40% { transform: rotate(12deg); } 55% { transform: rotate(-8deg); } 70% { transform: rotate(4deg); } 100% { transform: none; } }
+@keyframes like { 0% { transform: scale(1); } 30% { transform: scale(1.35) rotate(-14deg); } 100% { transform: scale(1) rotate(0); } }
+@keyframes cursor-in { from { opacity: 0; transform: translate(6em, 5em); } 30% { opacity: 1; } to { transform: none; } }
+
+/* Lower third for a channel, name or site the user supplied: <div class="handle"><b>Name</b><span>@handle</span></div> */
+.handle { position: absolute; left: 6%; bottom: 9%; display: grid; gap: .15em; padding-left: .9em; border-left: .16em solid var(--accent); font: 500 clamp(24px, 2.2vw, 38px)/1.15 var(--text, sans-serif);
+          animation: from-l .7s var(--ease-out) var(--at) both, out-fade .5s var(--ease-in) var(--out) both; }
+.handle b { font: 700 1.15em/1.1 var(--display, var(--text, sans-serif)); }
+.handle span { color: var(--muted, currentColor); }
+
+@media (prefers-reduced-motion: reduce) { .drift { animation: none; } }

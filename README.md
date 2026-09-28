@@ -271,7 +271,14 @@ pocket kit search QUERY     keyless web search (DuckDuckGo html → lite)
 pocket kit dom URL          JS-rendered text via headless Chrome
 pocket kit shot URL OUT.png screenshot for visual QA (desktop/mobile sizes)
 pocket kit frame SCENE.html OUT.png --time 1.5   seek a deterministic frame
-pocket kit video SCENE.html OUT.mp4 --duration 6 --fps 24 [--audio sound.wav] [--start S] [--timeout S]
+pocket kit video SCENE.html OUT.mp4 --duration 6 --fps 30 --size 1920x1080 [--audio mix.wav] [--start S]
+pocket kit vcheck FILE.mp4 [--duration S]        finished-video QA: streams, black/frozen/silent spans, loudness, clipping
+pocket kit vsheet FILE.mp4 OUT.png [--n 12]       the whole video as one timestamped contact sheet
+pocket kit say OUT.wav "script" | --file S.txt    neural narration + measured timing (json, srt, captions.html, cues.css)
+pocket kit music OUT.wav --style lofi --duration 60 --seed 3   generative stereo score (6 styles, arranged, mixed, reverbed)
+pocket kit mix OUT.wav --voice v.wav --music m.wav --at 4.2:whoosh.wav   ducking, effects cues, -14 LUFS, peak ceiling
+pocket kit theme "topic words"                    palette + font pair from the subject (avoids the default looks)
+pocket kit asset search|get|font ...              CC0 3D models/HDRIs/textures, open images/audio, Google Fonts, three.js
 pocket kit sfx OUT.wav whoosh [--duration .6]   seeded native sound effects
 pocket kit img FILE...      png/jpeg/gif/webp/svg type + dimensions
 pocket kit svg FILE         structure, viewBox, ids, animation count
@@ -294,14 +301,42 @@ pocket kit bench [-n N] CMD min/median/p95 wall time, CPU, peak RSS
 A tool costs a schema in every request; a kit subcommand costs one line in
 the system prompt.
 
-Scenes define `window.renderFrame(timeSeconds)` and may provide a `renderReady`
-promise. The native renderer drives the existing browser over private pipes,
+Scenes are HTML whose motion is CSS/SVG animation (seeked deterministically, so a
+scene is a timeline written in CSS and cue times come from `kit say`) or that define
+`window.renderFrame(timeSeconds)`, optionally with a `renderReady` promise. The native renderer drives the existing browser over private pipes,
 seeks every frame, streams PNG directly into FFmpeg and publishes the output
 only after successful completion. Each render gets its own browser profile.
 Cancellation, JavaScript/encoder errors and timeouts preserve existing output.
-Limits are 120 seconds, 3,600 frames and a configurable wall-clock deadline;
-render longer work as scenes. `kit frame` needs only Chrome. TypeScript must be
+Limits are 900 seconds, 54,000 frames and a wall-clock deadline that scales with the
+frame count (`--timeout` up to 4 h); render longer work in parts with `--start`. `kit frame` needs only Chrome. TypeScript must be
 compiled by the project's own build step first; offline scenes use local assets.
+
+### Video studio
+
+The bundled `video-studio` skill is loaded automatically for video requests (Jev
+decides, with a keyword fallback; the first `kit video` render also waits once for it).
+It carries the publish-versus-private decision, the hook and retention structure,
+art direction that rejects the default AI looks, branding rules (only identity the
+user gave, generic Subscribe/Follow/Like when several platforms), the audio mix and
+a QA gate. The tools underneath are native and cheap:
+
+- Narration: Piper neural voices, synthesised at about 0.1x real time on at most four
+  low-priority cores. `pocket kit say --setup` downloads the engine and a voice once
+  (about 90 MB, user-run: the sandbox sees the voices directory read-only).
+- Music: `kit music` composes chord progressions with voice-leading, bass, arpeggios,
+  motifs, drums, sidechain pump, a riser and breakdown, reverb and a bus compressor in
+  about a second of CPU for a minute of audio.
+- `kit mix` normalises voice, ducks the music while someone speaks, places effects,
+  and finishes at -14 LUFS with a look-ahead limiter.
+- `kit frame`/`kit video` lint the scene at sampled times (safe margins, clipping,
+  overlap, legibility floor, contrast, blank frames, mono display fonts, default
+  fonts, purple gradients). Encoding is tagged BT.709, so colours match the scene.
+- Real assets: Poly Haven CC0 models, HDRIs and textures, Openverse images and audio,
+  Google Fonts as local files, and three.js for software-WebGL scenes, each with a
+  written `ATTRIBUTION.txt`.
+
+[The narrated example](examples/capabilities/video/render.sh) runs the whole pipeline
+(voice, score, mix, captions, click-timed like/subscribe, render, QA).
 
 Run [the motion + audio example](examples/capabilities/motion/render.sh), or start
 from [the editable scene](skills/motion-graphics-production/assets/capability-demo.html).

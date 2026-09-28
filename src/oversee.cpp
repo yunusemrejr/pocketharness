@@ -726,14 +726,14 @@ std::string awarenessBlock(const std::string& ws, const Config& cfg, bool allowN
          "repeated identical calls are stopped\n";
     s += "- every write/edit is quality-scanned; ";
     s += cfg.review ? "an overseer reviews changed work before a turn ends\n" : "reviews are off\n";
-    s += "Superpowers: `pocket kit` via bash — web, search, dom, shot, frame, video, img, svg, spring, wav, sfx, audio, slop, "
+    s += "Superpowers: `pocket kit` via bash — web, search, dom, shot, frame, video, vcheck, vsheet, say (neural narration), music, mix, theme, asset, img, svg, spring, wav, sfx, audio, slop, "
          "find/sym/refs (code index), probe, ports, wait, net, seo, csv, bench; run `pocket kit` for usage. "
          "Start a dev server in the background, then `pocket kit wait PORT` (never a fixed sleep); `pocket kit ports` "
          "names the pid on a port before you kill anything. To see a UI, "
          "`pocket kit shot file://$PWD/page.html out.png 1280x800`, then read out.png: images you read are "
-         "shown to you. For timed HTML/SVG/Canvas scenes expose window.renderFrame(seconds), then use "
+         "shown to you. Timed scenes are HTML with CSS/SVG animation (or window.renderFrame(seconds)); "
          "`pocket kit frame scene.html still.png --time 2` or `pocket kit video scene.html clip.mp4 --duration 6`; "
-         "Chromium renders and FFmpeg encodes when installed. Native wav (chords, mixed tracks, drums) and sfx generate audio without Python. "
+         "Chromium renders and FFmpeg encodes when installed. Any video request: load the video-studio skill first (kit say/music/mix/theme/asset, lint, vsheet, vcheck). "
          "Discover and load the relevant skill before adapting its installed examples; check current help, "
          "run a small real case, and inspect the result before claiming success.\n";
     std::string mem = projectDir(ws) + "/memory.md";

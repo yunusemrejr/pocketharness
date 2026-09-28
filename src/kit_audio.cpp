@@ -125,8 +125,10 @@ Result<std::string> synthNotes(const std::string& notes, const std::string& wave
     size_t events = 0, tracks = 0;
     for (const std::string& rawTrack : split(notes, '|')) {
         std::string track = trim(rawTrack), tw = wave;
-        if (size_t gt = track.find('>'); gt != std::string::npos && gt < 8) {
+        if (size_t gt = track.find('>'); gt != std::string::npos && gt < 12) {
             tw = trim(track.substr(0, gt));
+            if (tw == "sawtooth") tw = "saw";
+            else if (tw == "triangle") tw = "tri";
             track = track.substr(gt + 1);
             if (!validWave(tw)) return R::Err("track wave must be sine, square, saw or tri: " + tw);
         }

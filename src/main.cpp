@@ -589,16 +589,20 @@ int pocketMain(int argc, char** argv) {
         // Remote Jev answers it for free in the batch; a local LM pays one inference per question, so
         // offline it is only asked when a keyword already suspects UI work.
         const bool askUi = remoteAvailable(cfg) || looksLikeUiWork(text);
+        const bool askVideo = remoteAvailable(cfg) || looksLikeVideoWork(text);
+        if (askVideo) qs.push_back({"video", "Does this task involve making, editing or rendering a video, motion graphics, an animation with sound, "
+                                    "a voiceover, or a music track for a video?"});
         if (askUi) qs.push_back({"ui", "Does this task involve designing, building or restyling a user interface, user experience, "
                             "web page or any graphical/terminal interface?"});
         if (qs.empty()) return "";
         auto p = decide(cfg, json::Object{{"task", text.substr(0, 2000)}}, qs, false, cost, tools.cancel, tools.onEvent);
         bool ui = p.count("ui") ? p["ui"] >= 0.7 : looksLikeUiWork(text);
+        bool video = p.count("video") ? p["video"] >= 0.7 : looksLikeVideoWork(text);
         std::vector<std::string> keep;
         for (size_t i = 0; i < hits.size(); ++i)
             // Without a verdict, only a skill the request names (fuzzily) is offered:
             // a bare BM25 word overlap is noise, not relevance.
-            if (hits[i].name != kUiDocSkill &&
+            if (hits[i].name != kUiDocSkill && hits[i].name != kVideoDocSkill &&
                 (p.empty() ? i == 0 && fuzzyScore(hits[i].name, text) >= 0.8 : p["s" + std::to_string(i)] >= 0.7))
                 keep.push_back(hits[i].name);
         std::string out;
@@ -607,6 +611,11 @@ int pocketMain(int argc, char** argv) {
                   "doctrine: skill(action=load, name=\"" + std::string(kUiDocSkill) +
                   "\"). Defaults (indigo/purple gradients, cream/terracotta serif, Inter, identical icon cards, "
                   "invented stats) are defects.";
+        if (video && !tools.videoDocLoaded)
+            out += std::string(out.empty() ? "" : "\n") +
+                   "[harness] This is video work. Before planning or writing scenes, load the video doctrine: skill(action=load, name=\"" +
+                   std::string(kVideoDocSkill) + "\"). Decide publish vs private mode first; use pocket kit say/music/mix/theme/asset "
+                   "and the lint + vsheet + vcheck gate. A text-card slideshow with a random melody is a defect.";
         if (!keep.empty())
             out += (out.empty() ? "" : "\n") + std::string("[harness] Relevant skill") + (keep.size() > 1 ? "s: " : ": ") +
                    join(keep, ", ") + " — load with skill(action=load, name=...) before starting.";

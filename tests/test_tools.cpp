@@ -393,3 +393,22 @@ TEST(tools_Failed_Edit_Shows_Where_To_Look) {
     CHECK(r.output.find("3|   return compute(1);") != std::string::npos);  // closest text, no re-read needed
     return "";
 }
+
+TEST(tools_Rendering_A_Video_Waits_Once_For_The_Video_Doctrine) {
+    CHECK(looksLikeVideoWork("make a YouTube explainer about backups"));
+    CHECK(looksLikeVideoWork("render an mp4 with voiceover"));
+    CHECK(!looksLikeVideoWork("fix the parser off-by-one"));
+    ToolFixture f;
+    CHECK(f.ok);
+    ToolResult r = runTool(f.env, "bash", R"({"command":"echo kit video scene.html out.mp4"})");
+    CHECK(r.output.find(kVideoDocSkill) != std::string::npos && r.output.find("this stop happens once") != std::string::npos);
+    CHECK(f.env.videoNagged);
+    r = runTool(f.env, "bash", R"({"command":"echo kit video scene.html out.mp4"})");
+    CHECK(r.ok && r.output.find("this stop happens once") == std::string::npos);  // only once
+    ToolFixture g;
+    CHECK(g.ok);
+    g.env.videoDocLoaded = true;
+    r = runTool(g.env, "bash", R"({"command":"echo kit video x"})");
+    CHECK(r.ok && r.output.find("this stop happens once") == std::string::npos);
+    return "";
+}

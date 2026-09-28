@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.9.0
+
+Motion video, rebuilt around what a publishable video needs.
+
+- New `video-studio` skill and request gate: a video request gets the same
+  Jev-judged demand as UI work to load the doctrine (publish vs private mode,
+  hook and retention structure, art direction against the default AI looks,
+  branding rules, audio mix, QA gate), and the first `kit video` render is
+  stopped once until it was read.
+- `kit say`: neural narration through Piper (`--setup` downloads it once), one
+  model load per script, sentence-level timing measured from the audio, word
+  windows estimated from syllables, `{TTS|tee tee ess}` pronunciation overrides.
+  Writes `.json`, `.srt`, a ready `.captions.html` and `.cues.css` (`--b1-s`,
+  `--u3-s`, ...) so scenes are timed to the voice. Runs on at most four cores at
+  low priority. The sandbox exposes the voices directory read-only; installing
+  stays a user action.
+- `kit music`: generative stereo score, six styles, seeded and deterministic.
+  Voice-led chord loops, bass, arpeggios, motif, drums, sidechain pump, risers,
+  a breakdown near 60%, Freeverb reverb, ping-pong delay and a bus compressor.
+- `kit mix`: cue-sheet mixer with speech-aware ducking, effect cues, BS.1770-4
+  integrated loudness (checked against FFmpeg's meter), look-ahead peak limiter.
+- `kit asset search|get|font`: Poly Haven CC0 models/HDRIs/textures, Openverse
+  images/audio with licence and credit lines, Google Fonts as local woff2, and a
+  pinned three.js with loaders. `ATTRIBUTION.txt` is written automatically.
+- `kit theme`: palette and font pair derived from the subject; accent arcs exclude
+  indigo-to-magenta and the terracotta band, the neutral is tinted, contrast is
+  enforced.
+- `kit vsheet`: the whole video as one timestamped contact sheet, so a vision
+  model reviews it in one image read.
+- `kit frame` / `kit video`: a scene lint (safe margin, frame-edge and overflow
+  clipping, overlap, legibility floor, contrast, blank frames, failed images and
+  fonts, monospace display type, default fonts, purple gradients); pure CSS/SVG
+  scenes need no `renderFrame`; BT.709-tagged encoding; software WebGL and
+  file:// modules enabled for three.js scenes; limits raised to 900 s, 54,000
+  frames and a 4 h deadline.
+- Fixed: `document.getAnimations()` forgets finished animations, so a scene
+  sought out of order (lint sampling, `--start`) could never be sought back.
+  The renderer now keeps every animation it has seen.
+- `kit vcheck` reports integrated loudness and flags programmes that are too
+  quiet or too loud.
+- JSON numbers print in the shortest form that round-trips (`3.854`, not
+  `3.8540000000000001`).
+
 ## 0.8.3
 
 - Goals are checked against the deliverable, not only the transcript. When a

@@ -438,7 +438,10 @@ void writeValue(std::string& out, const Value& v, int indent, int cur) {
             out += std::to_string((long long)d);
         } else if (std::isfinite(d)) {
             char buf[32];
-            snprintf(buf, sizeof(buf), "%.17g", d);
+            for (int precision = 15; precision <= 17; ++precision) {  // shortest text that round-trips
+                snprintf(buf, sizeof(buf), "%.*g", precision, d);
+                if (strtod(buf, nullptr) == d) break;
+            }
             out += buf;
         } else {
             out += "null";

@@ -1,7 +1,10 @@
 // PocketHarness - `pocket kit` native superpowers.
 #include "kit.h"
 #include "kit_audio.h"
+#include "config.h"
+#include "kit_media.h"
 #include "kit_ops.h"
+#include "kit_studio.h"
 #include "kit_video.h"
 
 #include <sys/statvfs.h>
@@ -338,7 +341,14 @@ std::string hostProbe(const std::string& dir) {
         chrome = chrome || !whichExe(name).empty();
     s += "capabilities: native audio/SFX + analysis; frames " + std::string(chrome ? "available" : "need Chrome/Chromium") +
          "; video " + (chrome && !whichExe("ffmpeg").empty() ? "available (Chrome + FFmpeg)" : "needs Chrome/Chromium + FFmpeg") + "\n";
-    s += "scene contract: local HTML with window.renderFrame(timeSeconds); use kit frame before kit video\n";
+    {
+        std::error_code ec;
+        bool voice = false;
+        if (std::filesystem::is_directory(voicesDir(), ec))
+            for (auto& e : std::filesystem::directory_iterator(voicesDir(), ec)) voice = voice || e.path().extension() == ".onnx";
+        s += std::string("narration: ") + (voice ? "neural voice installed (kit say)" : "run `pocket kit say --setup` once for a neural voice (Piper, ~90 MB)") + "\n";
+    }
+    s += "scene contract: local HTML with CSS/SVG animations or window.renderFrame(timeSeconds); use kit frame before kit video\n";
     return s;
 }
 
@@ -424,7 +434,7 @@ struct Hit {
 // Generic result scraper: anchors carrying `anchorMark`, the next
 // `snippetMark` element before the following anchor is the snippet.
 std::vector<Hit> scrape(const std::string& h, const std::string& anchorMark, const std::string& snippetMark,
-                        const std::string& snippetEnd) {
+                        const std::string& snippetEnd, const std::string& titleMark = "") {
     std::vector<Hit> out;
     for (size_t p = 0; (p = h.find(anchorMark, p)) != std::string::npos && out.size() < 10;) {
         size_t open = h.rfind("<a", p), tagEnd = h.find('>', p), close = h.find("</a>", tagEnd);
@@ -432,6 +442,13 @@ std::vector<Hit> scrape(const std::string& h, const std::string& anchorMark, con
         Hit hit;
         hit.url = decodeEntities(attr(std::string_view(h).substr(open, tagEnd - open), "href"));
         hit.title = trim(htmlToText(h.substr(tagEnd + 1, close - tagEnd - 1)));
+        if (!titleMark.empty()) {  // engines whose link also wraps the site name and breadcrumb
+            size_t t = h.find(titleMark, tagEnd);
+            if (t != std::string::npos && t < close) {
+                size_t ts = h.find('>', t), te = h.find("</div>", ts);
+                if (ts != std::string::npos && te != std::string::npos) hit.title = trim(htmlToText(h.substr(ts + 1, te - ts - 1)));
+            }
+        }
         size_t next = h.find(anchorMark, close), sp = h.find(snippetMark, close);
         if (sp != std::string::npos && sp < next) {
             size_t se = h.find('>', sp), sc = h.find(snippetEnd, se);
@@ -459,15 +476,17 @@ int kitSearch(const std::vector<std::string>& a) {
     // Keyless endpoints in order (engines that serve decoys to scripts, like
     // Bing, are deliberately absent: no results beats wrong results).
     struct Engine {
-        const char *url, *anchor, *snip, *snipEnd;
+        const char *url, *anchor, *snip, *snipEnd, *title;
     } engines[] = {
-        {"https://html.duckduckgo.com/html/?q=", "class=\"result__a\"", "class=\"result__snippet\"", "</a>"},
-        {"https://lite.duckduckgo.com/lite/?q=", "class='result-link'", "class='result-snippet'", "</td>"},
+        {"https://html.duckduckgo.com/html/?q=", "class=\"result__a\"", "class=\"result__snippet\"", "</a>", ""},
+        {"https://lite.duckduckgo.com/lite/?q=", "class='result-link'", "class='result-snippet'", "</td>", ""},
+        // Third opinion when DuckDuckGo rate-limits: hashed class names change, so anchor on the stable ones.
+        {"https://search.brave.com/search?q=", " l1\"><div class=\"site-name-wrapper", "class=\"content desktop-default-regular", "</div>", "search-snippet-title"},
     };
     for (const auto& e : engines) {
         auto body = fetch(e.url + enc, 12);
         if (!body.ok) continue;
-        std::vector<Hit> hits = scrape(body.value, e.anchor, e.snip, e.snipEnd);
+        std::vector<Hit> hits = scrape(body.value, e.anchor, e.snip, e.snipEnd, e.title);
         if (hits.empty()) continue;
         for (size_t i = 0; i < hits.size(); ++i)
             printf("%zu. %s\n   %s\n   %s\n", i + 1, hits[i].title.c_str(), hits[i].url.c_str(), hits[i].snippet.c_str());
@@ -476,7 +495,9 @@ int kitSearch(const std::vector<std::string>& a) {
     return fail("no results: every keyless engine refused (rate limit); retry later or kit web a known URL");
 }
 
-int kitShot(const std::vector<std::string>& a, bool dom) {
+int kitShot(std::vector<std::string> a, bool dom) {
+    // Models write `--size 1280x800` as often as the bare form: accept both.
+    if (!dom && a.size() == 4 && a[2] == "--size") { a[2] = a[3]; a.pop_back(); }
     if (a.size() < (dom ? 1u : 2u) || a.size() > (dom ? 1u : 3u))
         return fail(dom ? "usage: kit dom URL" : "usage: kit shot URL OUT.png [WxH]");
     if (a[0].empty() || a[0][0] == '-' || a[0].find_first_of("\r\n") != std::string::npos)
@@ -805,7 +826,13 @@ int kitMain(int argc, char** argv) {
         "  frame HTML OUT.png     deterministic scene frame (--time, --size)\n"
         "  video HTML OUT.mp4     render a scene (--duration, --fps, --size, --audio, --start, --timeout)\n"
         "  vcheck FILE.mp4        finished-video QA: streams, duration, black/frozen/silent spans, clipping\n"
+        "  vsheet FILE.mp4 OUT.png contact sheet of the whole video in one image (timestamped)\n"
+        "  say OUT.wav \"text\"     neural narration (Piper) + timing json, srt, captions.html, cues.css; --setup once\n"
+        "  asset search|get|font   open-licensed images/audio/3D/HDRI/fonts + three.js, with ATTRIBUTION.txt\n"
+        "  theme \"topic\"          palette + font pair derived from the subject (avoids the default looks)\n"
         "  sfx OUT.wav PRESET     native click/chime/laser/whoosh/impact/tone/noise\n"
+        "  music OUT.wav          generative stereo score: --style ambient/lofi/corporate/cinematic/tech/upbeat --duration --key --seed\n"
+        "  mix OUT.wav            cue-sheet mixer: --voice --music (auto-ducked) --at SEC:FILE, loudness-normalised + limited\n"
         "  img FILE...            image type + dimensions (png/jpeg/gif/webp/svg)\n"
         "  svg FILE               SVG lint: structure, viewBox, ids, animation count\n"
         "  spring [k] [c] [m]     physical spring -> CSS linear() easing + duration\n"
@@ -838,6 +865,12 @@ int kitMain(int argc, char** argv) {
     if (sub == "frame") return kitFrame(a);
     if (sub == "vcheck") return kitVcheck(a);
     if (sub == "sfx") return kitSfx(a);
+    if (sub == "music") return kitMusic(a);
+    if (sub == "mix") return kitMix(a);
+    if (sub == "say") return kitSay(a);
+    if (sub == "asset") return kitAsset(a);
+    if (sub == "theme") return kitTheme(a);
+    if (sub == "vsheet") return kitVsheet(a);
     if (sub == "wav") return kitWav(a);
     if (sub == "audio") return kitAudio(a);
     if (sub == "svg") return kitSvg(a);

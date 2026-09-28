@@ -2,7 +2,7 @@
 
 Keep narration concrete and readable aloud. Measure the actual recording before locking cue seconds; estimated speaking rates are planning aids, not synchronization evidence. Leave room for breaths and for the visual explanation to land.
 
-PocketHarness does not bundle TTS, speech alignment or automatic captions. Use a supplied recording or an existing local TTS executable after reading its installed help. Keep display text and pronunciation substitutions separate. Do not download a voice or contact a paid service merely because a guide mentions one. If narration is not required, a silent animation or sparse procedural sound can be the right result.
+`pocket kit say` synthesises narration with a local neural voice (Piper; `kit say --setup` downloads it once) and writes measured sentence times, estimated word times, an SRT, a captions fragment and CSS cue variables. `{TTS|tee tee ess}` keeps display text and pronunciation separate. `kit music` composes a score, `kit mix` balances voice, music, effects and loudness. If narration is not required, a silent animation or sparse procedural sound can be the right result. The video-studio skill has the whole pipeline.
 
 Use the procedural-audio skill for `pocket kit wav`, `sfx` and `audio` syntax. Seed generated sounds, use an envelope to avoid abrupt edges, and attach each effect to a specific visual event. A sound effect is punctuation, not a substitute for meaningful motion. Keep music sparse under speech and listen to the actual mix; no automatic ducking is implied.
 

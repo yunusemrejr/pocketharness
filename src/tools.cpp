@@ -503,6 +503,14 @@ ToolResult toolBash(ToolEnv& env, const json::Value& args) {
     }
     if (timeoutSec < 1) timeoutSec = 1;
     if (timeoutSec > 3600) timeoutSec = 3600;
+    // Backstop for the prompt-time verdict: a render started without the doctrine is stopped once, before the CPU is spent.
+    if (!env.videoDocLoaded && !env.videoNagged && !env.readOnly && cmd.find("kit video") != std::string::npos) {
+        env.videoNagged = true;
+        r.output = "[harness] Video work: you have not read the video doctrine. Run skill(action=load, name=\"" + std::string(kVideoDocSkill) +
+                   "\") first: publish vs private mode, the say/music/mix pipeline, art direction, and the QA gate. "
+                   "Then rerun this command (this stop happens once).";
+        return r;
+    }
     if (env.readOnly) {
         if (timeoutSec > 120) timeoutSec = 120;  // evidence gathering stays quick
         std::string why;
@@ -585,6 +593,7 @@ ToolResult toolSkill(ToolEnv& env, const json::Value& args) {
         }
         emit(env, "skill load " + name);
         if (name == kUiDocSkill) env.uiDocLoaded = true;
+        if (name == kVideoDocSkill) env.videoDocLoaded = true;
         r.ok = true;
         r.output = loaded.value +
                    "\n\n[harness] Tools here: read, write, edit, bash, skill. Where this skill names "
@@ -761,6 +770,14 @@ bool looksLikeUiWork(const std::string& text) {
     for (const char* k : {"landing page", "website", "web page", "webpage", "frontend", "front-end", " ui ", " ux ",
                           "user interface", " gui ", "dashboard", "mockup", "wireframe", "stylesheet", " css",
                           "tailwind", "navbar", "hero section", "figma", "redesign", "web app", ".html"})
+        if (t.find(k) != std::string::npos) return true;
+    return false;
+}
+
+bool looksLikeVideoWork(const std::string& text) {
+    std::string t = " " + toLower(text) + " ";
+    for (const char* k : {"video", "motion graphic", "animation", "animated", "youtube", "shorts", "reel", "voiceover", "voice-over",
+                          "narration", "explainer", "trailer", "kit video", ".mp4", "storyboard", "soundtrack"})
         if (t.find(k) != std::string::npos) return true;
     return false;
 }

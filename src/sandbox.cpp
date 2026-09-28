@@ -176,6 +176,12 @@ Result<Authority> authorityInit(const std::string& workspace,
         if (std::find(a.readRoots.begin(), a.readRoots.end(), c.value) == a.readRoots.end())
             a.readRoots.push_back(c.value);
     }
+    // Narration engine and voices (kit say): data plus one vendor binary, read-only. Installing stays a
+    // user action outside the sandbox, so a model can never plant something that later runs unconfined.
+    if (auto c = canonicalDir(homeDir() + "/.local/share/pocketharness/voices"); c.ok) {
+        if (std::find(a.readRoots.begin(), a.readRoots.end(), c.value) == a.readRoots.end())
+            a.readRoots.push_back(c.value);
+    }
     if (!unsafe) {
         for (const auto& r : a.readRoots) {
             int fd = openRootFd(r);
@@ -1131,6 +1137,8 @@ std::vector<std::string> buildChildEnv(const std::vector<std::string>& exposeEnv
     // Marker only (lets scripts detect the harness). Everything else a
     // recursive pocket needs lives in $TMPDIR/pocket.parent, never here.
     set("POCKETHARNESS=1");
+    // The real voices directory (HOME is remapped inside the sandbox); kit say reads it from here.
+    if (auto c = canonicalDir(homeDir() + "/.local/share/pocketharness/voices"); c.ok) set("POCKET_VOICES=" + c.value);
     return env;
 }
 

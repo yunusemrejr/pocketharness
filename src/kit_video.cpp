@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cmath>
 #include <filesystem>
+#include <map>
 #include <thread>
 
 #include "common.h"
@@ -228,15 +229,132 @@ struct Cdp {
     }
 };
 
-const char* videoUsage = "usage: kit video SCENE.html OUT.mp4 --duration SECONDS [--size 1280x720] [--fps 30] [--audio FILE] [--start SECONDS] [--timeout SECONDS]";
-const char* frameUsage = "usage: kit frame SCENE.html OUT.png [--time SECONDS] [--size 1280x720] [--timeout 120]";
+
+// Scene lint, run in the page at sampled times. Returns [[kind, message], ...]; kinds dedupe across samples.
+const char* kLintJs = R"JS((() => {
+    const W = innerWidth, H = innerHeight, S = Math.min(W, H), margin = Math.round(S * .05), minPx = S * .022;
+    const out = [], boxes = [];
+    const alphaOf = e => { let a = 1; for (let p = e; p && p.nodeType === 1; p = p.parentElement) a *= parseFloat(getComputedStyle(p).opacity); return a; };
+    const shown = e => { for (let p = e; p && p.nodeType === 1; p = p.parentElement) { const c = getComputedStyle(p); if (c.display === 'none' || c.visibility === 'hidden') return false; } return alphaOf(e) > .3; };
+    const moving = e => { for (let p = e; p && p.nodeType === 1; p = p.parentElement)
+        for (const a of p.getAnimations()) { const t = a.effect && a.effect.getComputedTiming(); if (t && t.progress > 0 && t.progress < 1 && t.activeDuration < 2500) return true; } return false; };  // long ones are beat windows or camera moves
+    const rgba = c => { const m = c.match(/rgba?\(([^)]+)\)/); if (!m) return null; const v = m[1].split(/[ ,\/]+/).filter(Boolean).map(Number); return {r: v[0], g: v[1], b: v[2], a: v.length > 3 ? v[3] : 1}; };
+    const lum = c => { const f = x => { x /= 255; return x <= .03928 ? x / 12.92 : Math.pow((x + .055) / 1.055, 2.4); }; return .2126 * f(c.r) + .7152 * f(c.g) + .0722 * f(c.b); };
+    const backdrop = e => { const layers = []; for (let p = e; p && p.nodeType === 1; p = p.parentElement) {
+        const c = getComputedStyle(p); if (c.backgroundImage !== 'none') return null;
+        const b = rgba(c.backgroundColor); if (b && b.a > 0) { layers.push(b); if (b.a >= .99) break; } }
+        let base = {r: 255, g: 255, b: 255}; for (let i = layers.length - 1; i >= 0; --i) { const l = layers[i]; base = {r: base.r * (1 - l.a) + l.r * l.a, g: base.g * (1 - l.a) + l.g * l.a, b: base.b * (1 - l.a) + l.b * l.a}; } return base; };
+    const label = (e, t) => e.tagName.toLowerCase() + (typeof e.className === 'string' && e.className.trim() ? '.' + e.className.trim().split(/\s+/)[0] : '') + ' "' + t.slice(0, 26) + '"';
+    for (const e of document.body.querySelectorAll('*')) {
+        let text = '', r = null;
+        for (const n of e.childNodes) if (n.nodeType === 3 && n.textContent.trim()) {
+            text += n.textContent.trim() + ' ';
+            const g = document.createRange(); g.selectNodeContents(n);
+            for (const q of g.getClientRects()) if (q.width > 0 && q.height > 0)
+                r = r ? {left: Math.min(r.left, q.left), top: Math.min(r.top, q.top), right: Math.max(r.right, q.right), bottom: Math.max(r.bottom, q.bottom)} : {left: q.left, top: q.top, right: q.right, bottom: q.bottom};
+        }
+        text = text.trim();
+        if (!text || !r || !shown(e) || moving(e)) continue;
+        const cs = getComputedStyle(e), fs = parseFloat(cs.fontSize), name = label(e, text), fam = cs.fontFamily.split(',')[0].replace(/["']/g, '').trim();
+        boxes.push({e, r, name, a: alphaOf(e)});
+        if (r.left < -2 || r.top < -2 || r.right > W + 2 || r.bottom > H + 2) out.push(['edge:' + name, name + ' is cut off by the frame edge']);
+        else if (!e.closest('[data-bleed]') && (r.left < margin || r.top < margin || r.right > W - margin || r.bottom > H - margin))
+            out.push(['margin:' + name, name + ' sits inside the ' + margin + 'px safe margin']);
+        for (let p = e.parentElement; p && p !== document.body; p = p.parentElement) {
+            const c = getComputedStyle(p), fs = parseFloat(getComputedStyle(e).fontSize);
+            if (/hidden|clip/.test(c.overflow + c.overflowX + c.overflowY)) { const q = p.getBoundingClientRect();
+                const slack = Math.max(2, fs * .18);  // Range boxes are the font's content area, taller than the ink
+                if (r.right > q.right + 2 || r.left < q.left - 2 || r.bottom > q.bottom + slack || r.top < q.top - slack) { out.push(['clip:' + name, name + ' is clipped by an overflow:hidden container']); break; } }
+        }
+        if (fs < minPx) out.push(['small:' + name, name + ' is ' + Math.round(fs) + 'px, under the ' + Math.round(minPx) + 'px legibility floor']);
+        if (/mono|courier|consolas|menlo|monaco/i.test(cs.fontFamily.split(',')[0]) && fs >= minPx * 1.6) out.push(['mono:' + fam, 'monospace (' + fam + ') used for display text; keep mono for code and data only']);
+        if (/^(inter|space grotesk|geist|instrument serif)$/i.test(fam)) out.push(['font:' + fam, fam + ' is the default AI font rotation; pick a deliberate pair (kit theme)']);
+        if (/^(arial|helvetica|times new roman|system-ui|sans-serif|serif|segoe ui|roboto)$/i.test(fam)) out.push(['sys:' + fam, 'text falls back to the system font "' + fam + '"; load a real typeface (kit asset font)']);
+        const over = document.elementsFromPoint((r.left + r.right) / 2, (r.top + r.bottom) / 2).some(n => /^(IMG|CANVAS|VIDEO)$/i.test(n.tagName));
+        const bg = over ? null : backdrop(e), fg = rgba(cs.color);  // over a photo or 3D view the backdrop is unknown
+        if (bg && fg) { const a = Math.min(1, fg.a * alphaOf(e)), mix = {r: bg.r * (1 - a) + fg.r * a, g: bg.g * (1 - a) + fg.g * a, b: bg.b * (1 - a) + fg.b * a};
+            const l1 = lum(mix), l2 = lum(bg), ratio = (Math.max(l1, l2) + .05) / (Math.min(l1, l2) + .05);
+            if (ratio < (fs >= S * .033 ? 3 : 4.5)) out.push(['contrast:' + name, name + ' has contrast ' + ratio.toFixed(1) + ':1 against its background']); }
+    }
+    for (let i = 0; i < boxes.length && out.length < 40; ++i) for (let j = i + 1; j < boxes.length; ++j) {
+        const a = boxes[i], b = boxes[j]; if (a.e.contains(b.e) || b.e.contains(a.e) || a.a < .6 || b.a < .6) continue;
+        const w = Math.min(a.r.right, b.r.right) - Math.max(a.r.left, b.r.left), h = Math.min(a.r.bottom, b.r.bottom) - Math.max(a.r.top, b.r.top);
+        if (w > 0 && h > 0 && w * h > .25 * Math.min((a.r.right - a.r.left) * (a.r.bottom - a.r.top), (b.r.right - b.r.left) * (b.r.bottom - b.r.top)))
+            out.push(['overlap:' + a.name + b.name, a.name + ' overlaps ' + b.name]);
+    }
+    let media = 0;
+    for (const m of document.body.querySelectorAll('svg, img, canvas, video')) { const q = m.getBoundingClientRect(); if (q.width * q.height > 400 && shown(m)) ++media; }
+    if (!boxes.length && !media) out.push(['blank', 'nothing is visible: every beat is hidden or its animation has not started']);
+    for (const img of document.images) if (!img.complete || !img.naturalWidth) out.push(['img:' + img.src, 'image failed to load: ' + img.src.slice(-60)]);
+    if (document.fonts) for (const f of document.fonts) if (f.status === 'error') out.push(['fontfile:' + f.family, 'font file for ' + f.family + ' failed to load']);
+    return JSON.stringify(out);
+})())JS";
+
+// Source-level tells the DOM cannot show: purple gradients and the default font names.
+std::vector<std::string> styleTells(const std::string& html) {
+    std::vector<std::string> out;
+    for (size_t p = html.find("gradient("); p != std::string::npos; p = html.find("gradient(", p + 9)) {
+        size_t end = html.find(')', p);
+        std::string body = html.substr(p, end == std::string::npos ? 200 : std::min<size_t>(end - p, 300));
+        int violet = 0;
+        for (size_t h = body.find('#'); h != std::string::npos; h = body.find('#', h + 1)) {
+            if (h + 7 > body.size()) break;
+            const std::string digits = body.substr(h + 1, 6);
+            char* e = nullptr;
+            long v = strtol(digits.c_str(), &e, 16);
+            if (*e) continue;
+            double r = ((v >> 16) & 255) / 255.0, g = ((v >> 8) & 255) / 255.0, b = (v & 255) / 255.0;
+            double mx = std::max({r, g, b}), mn = std::min({r, g, b}), d = mx - mn, hue = 0;
+            if (d > 0.001) hue = mx == r ? 60 * std::fmod((g - b) / d + 6, 6) : mx == g ? 60 * ((b - r) / d + 2) : 60 * ((r - g) / d + 4);
+            if (d / (mx > 0 ? mx : 1) > .4 && mx > .4 && hue >= 245 && hue <= 335) ++violet;
+        }
+        if (violet >= 2) { out.push_back("an indigo/purple gradient is the learned default look; derive colour from the subject (kit theme)"); break; }
+    }
+    return out;
+}
+
+const char* videoUsage = "usage: kit video SCENE.html OUT.mp4 --duration SECONDS [--size 1920x1080] [--fps 30] [--audio FILE] [--start SECONDS] [--timeout SECONDS] [--no-lint]";
+const char* frameUsage = "usage: kit frame SCENE.html OUT.png [--time SECONDS] [--size 1280x720] [--timeout 120] [--no-lint]";
+
+
+// Lint the scene at sample times; report what is stable across samples (a transient mid-reveal state is not a defect).
+void lintScene(Cdp& cdp, const std::vector<double>& times, const std::string& source) {
+    std::map<std::string, std::pair<int, std::pair<double, std::string>>> seen;
+    std::vector<std::string> order;
+    for (double t : times) {
+        auto seek = cdp.evaluate("window.__pocketSeek(" + json::stringify(t) + ")");
+        auto r = seek.ok ? cdp.evaluate(kLintJs) : seek;
+        auto list = r.ok ? json::parse(r.value.at("result").at("value").asStr()) : Result<json::Value>::Err(r.error);
+        if (!list.ok) { fprintf(stderr, "lint: could not run (%s)\n", sanitizeTerminal(list.error.substr(0, 300)).c_str()); return; }
+        for (const auto& item : list.value.asArr()) {
+            const std::string key = item.at(size_t(0)).asStr();
+            if (!seen.count(key)) { seen[key] = {0, {t, item.at(size_t(1)).asStr()}}; order.push_back(key); }
+            ++seen[key].first;
+        }
+    }
+    const int need = times.size() > 1 ? 2 : 1;
+    std::vector<std::string> lines;
+    for (const auto& key : order)
+        if (seen[key].first >= need) {
+            char at[32];
+            snprintf(at, sizeof at, "t=%.1fs ", seen[key].second.first);
+            lines.push_back(std::string(at) + seen[key].second.second);
+        }
+    for (const auto& tell : styleTells(source)) lines.push_back(tell);
+    if (lines.empty()) { fprintf(stderr, "lint: no layout, legibility or style faults at %zu sampled time%s\n", times.size(), times.size() == 1 ? "" : "s"); return; }
+    fprintf(stderr, "lint: %zu issue%s; fix before the final render\n", lines.size(), lines.size() == 1 ? "" : "s");
+    for (size_t i = 0; i < lines.size() && i < 12; ++i) fprintf(stderr, "  lint: %s\n", sanitizeTerminal(lines[i]).c_str());
+    if (lines.size() > 12) fprintf(stderr, "  lint: ... and %zu more\n", lines.size() - 12);
+}
 
 std::string render(const std::vector<std::string>& args, bool still) {
     if (args.size() < 2) return still ? frameUsage : videoUsage;
     int width = 1280, height = 720, fps = 30;
     double duration = 0, at = 0, timeout = 0, start = 0;
     std::string audio;
+    bool lint = true;
     for (size_t i = 2; i < args.size(); i += 2) {
+        if (args[i] == "--no-lint") { lint = false; --i; continue; }
         if (i + 1 == args.size()) return "missing value for " + args[i];
         const std::string& key = args[i];
         const std::string& value = args[i+1];
@@ -251,18 +369,18 @@ std::string render(const std::vector<std::string>& args, bool still) {
         } else if (key == "--audio" && !still) audio = value;
         else {
             if (!number(value, n)) return "invalid numeric value for " + key;
-            if (key == "--duration" && !still && n > 0 && n <= 120) duration = n;
+            if (key == "--duration" && !still && n > 0 && n <= 900) duration = n;
             else if (key == "--time" && still && n >= 0 && n <= 86400) at = n;
             else if (key == "--start" && !still && n >= 0 && n <= 86400) start = n;
             else if (key == "--fps" && !still && n >= 1 && n <= 60 && n == std::floor(n)) fps = (int)n;
-            else if (key == "--timeout" && n >= 1 && n <= 3600) timeout = n;
+            else if (key == "--timeout" && n >= 1 && n <= 14400) timeout = n;
             else return "unknown or out-of-range option " + key;
         }
     }
-    if (!still && (duration <= 0 || width % 2 || height % 2)) return "video needs --duration (0..120s) and even dimensions";
+    if (!still && (duration <= 0 || width % 2 || height % 2)) return "video needs --duration (0..900s) and even dimensions";
     int frames = still ? 1 : (int)std::ceil(duration * fps - 1e-9);
-    if (frames < 1 || frames > 3600) return "render must contain 1..3600 frames; render longer projects in scenes";
-    if (timeout <= 0) timeout = std::min(3600.0, 120.0 + frames * 0.5);  // scales with the work; explicit --timeout wins
+    if (frames < 1 || frames > 54000) return "render must contain 1..54000 frames; render longer projects in parts with --start";
+    if (timeout <= 0) timeout = std::min(14400.0, 120.0 + frames * 0.6);  // scales with the work; explicit --timeout wins
     if (!endsWith(toLower(args[1]), still ? ".png" : ".mp4")) return still ? "frame output must end in .png" : "video output must end in .mp4";
     std::error_code ec;
     auto source = std::filesystem::canonical(args[0], ec);
@@ -304,8 +422,10 @@ std::string render(const std::vector<std::string>& args, bool still) {
     Child browser, encoder;
     SpawnOpts browserOpts;
     browserOpts.exe = chrome;
-    browserOpts.argv = {chrome, "--headless=new", "--no-sandbox", "--disable-gpu", "--hide-scrollbars",
-        "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", "--disable-background-networking",
+    browserOpts.argv = {chrome, "--headless=new", "--no-sandbox", "--hide-scrollbars",
+        // Software WebGL (three.js scenes) and ES modules from the scene's own folder.
+        "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist", "--allow-file-access-from-files",
+        "--font-render-hinting=none", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", "--disable-background-networking",
         "--remote-debugging-pipe", "--user-data-dir=" + profile.path, "about:blank"};
     browserOpts.timeoutMs = (long)(timeout * 1000);
     browserOpts.outLimit = 8192;
@@ -339,12 +459,33 @@ std::string render(const std::vector<std::string>& args, bool still) {
     auto ready = cdp.evaluate(R"JS((async()=>{
         if (window.renderReady !== undefined) await window.renderReady;
         if (document.fonts) await document.fonts.ready;
-        await Promise.all(Array.from(document.images, image => image.decode()));
-        if (typeof window.renderFrame !== 'function') throw new Error('Define window.renderFrame(timeSeconds) to render each frame deterministically');
+        await Promise.all(Array.from(document.images, image => image.decode().catch(() => {})));
+        // A scene may be pure CSS/SVG animation: seeking the timeline is then all a frame needs.
+        if (typeof window.renderFrame !== 'function') {
+            if (!document.getAnimations().length && !document.querySelector('svg'))
+                throw new Error('Nothing to render: define window.renderFrame(timeSeconds) or animate with CSS/SVG animations');
+            window.renderFrame = () => {};
+        }
+        // getAnimations() forgets animations that have finished, and a forgotten one can never be sought back:
+        // keep every animation ever seen so any time can be revisited (lint samples out of order, --start jumps).
+        const seen = new Set(document.getAnimations());
+        window.__pocketSeek = async (t) => {
+            await window.renderFrame(t);
+            for (const a of document.getAnimations()) seen.add(a);
+            for (const a of seen) { a.pause(); a.currentTime = t * 1000; }
+            for (const s of document.querySelectorAll('svg')) if (s.pauseAnimations) { s.pauseAnimations(); s.setCurrentTime(t); }
+            return true;
+        };
         document.body.classList.add('exporting');
         return true;
     })())JS");
     if (!ready.ok) return ready.error;
+    if (lint) {
+        std::vector<double> times;
+        if (still) times.push_back(at);
+        else for (double f : {.05, .15, .27, .4, .52, .64, .76, .88, .96}) times.push_back(start + duration * f);
+        lintScene(cdp, times, readFileBounded(source.string(), 4 << 20).value);
+    }
     if (!still) {
         SpawnOpts encode;
         encode.exe = ffmpeg;
@@ -352,8 +493,11 @@ std::string render(const std::vector<std::string>& args, bool still) {
             "-f", "image2pipe", "-framerate", std::to_string(fps), "-vcodec", "png", "-i", "pipe:0"};
         if (!audio.empty() && start > 0) encode.argv.insert(encode.argv.end(), {"-ss", std::to_string(start)});
         if (!audio.empty()) encode.argv.insert(encode.argv.end(), {"-i", std::filesystem::absolute(audio).string()});
-        encode.argv.insert(encode.argv.end(), {"-map", "0:v:0", "-c:v", "libx264", "-threads", "2", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"});
-        if (!audio.empty()) encode.argv.insert(encode.argv.end(), {"-map", "1:a:0", "-af", "apad", "-c:a", "aac", "-b:a", "192k"});
+        // sRGB frames to BT.709 limited-range YUV, tagged, so players and YouTube show the colours the scene had.
+        encode.argv.insert(encode.argv.end(), {"-map", "0:v:0", "-vf", "scale=in_range=full:out_range=tv:out_color_matrix=bt709,format=yuv420p",
+            "-c:v", "libx264", "-threads", "2", "-preset", "veryfast", "-crf", "17", "-g", std::to_string(fps * 2),
+            "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"});
+        if (!audio.empty()) encode.argv.insert(encode.argv.end(), {"-map", "1:a:0", "-af", "apad", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"});
         encode.argv.insert(encode.argv.end(), {"-t", std::to_string((double)frames / fps), "-movflags", "+faststart", "-f", "mp4", "/proc/self/fd/5"});
         encode.timeoutMs = (long)(timeout * 1000);
         encode.outLimit = 8192;
@@ -369,9 +513,7 @@ std::string render(const std::vector<std::string>& args, bool still) {
         // One transient capture stall (GC, heavy canvas) must not cost the whole render: redraw and retry once.
         Result<json::Value> shot = Result<json::Value>::Err("");
         for (int attempt = 0; attempt < 2; ++attempt) {
-            auto draw = cdp.evaluate("(async()=>{const t=" + seconds + "; await window.renderFrame(t); "
-                "for(const a of document.getAnimations()){a.pause();a.currentTime=t*1000;} "
-                "for(const s of document.querySelectorAll('svg')){if(s.pauseAnimations){s.pauseAnimations();s.setCurrentTime(t);}} return true;})()");
+            auto draw = cdp.evaluate("window.__pocketSeek(" + seconds + ")");
             if (!draw.ok) return "frame " + std::to_string(frame) + ": " + draw.error;
             shot = cdp.call("Page.captureScreenshot", {{"format", "png"}, {"captureBeyondViewport", false}, {"fromSurface", true}});
             if (shot.ok || interrupted || browser.done.load()) break;
@@ -504,7 +646,7 @@ int kitVcheck(const std::vector<std::string>& args) {
         scan.exe = ffmpeg;
         scan.argv = {ffmpeg, "-hide_banner", "-nostats", "-nostdin", "-i", args[0]};
         if (video) scan.argv.insert(scan.argv.end(), {"-vf", "blackdetect=d=0.4:pix_th=0.05,freezedetect=n=0.001:d=2"});
-        if (audio) scan.argv.insert(scan.argv.end(), {"-af", "volumedetect,silencedetect=n=-50dB:d=2"});
+        if (audio) scan.argv.insert(scan.argv.end(), {"-af", "volumedetect,silencedetect=n=-50dB:d=2,ebur128=peak=true"});
         scan.argv.insert(scan.argv.end(), {"-f", "null", "-"});
         scan.timeoutMs = 600000;
         scan.outLimit = 4 << 20;
@@ -513,7 +655,8 @@ int kitVcheck(const std::vector<std::string>& args) {
             problems.push_back("decoding failed: " + sanitizeTerminal(sr.err.substr(sr.err.size() > 300 ? sr.err.size() - 300 : 0)));
         int black = 0, frozen = 0, silent = 0;
         double mean = 0, peak = -99;
-        bool haveVolume = false;
+        bool haveVolume = false, wantI = false, haveI = false;
+        double integrated = 0;
         for (const auto& line : splitLines(sr.err)) {
             if (line.find("black_start") != std::string::npos) {
                 snprintf(buf, sizeof buf, "black frames from %.1fs to %.1fs", logNumber(line, "black_start:"), logNumber(line, "black_end:"));
@@ -524,12 +667,20 @@ int kitVcheck(const std::vector<std::string>& args) {
             } else if (line.find("silence_duration") != std::string::npos) {
                 snprintf(buf, sizeof buf, "silence of %.1fs ending at %.1fs", logNumber(line, "silence_duration:"), logNumber(line, "silence_end:"));
                 if (++silent <= 3) notes.push_back(buf);
-            } else if (line.find("mean_volume:") != std::string::npos) { mean = logNumber(line, "mean_volume:"); haveVolume = true; }
+            } else if (line.find("Integrated loudness") != std::string::npos) { wantI = true; }
+            else if (wantI && line.find("I:") != std::string::npos) { integrated = logNumber(line, "I:"); haveI = true; wantI = false; }
+            else if (line.find("mean_volume:") != std::string::npos) { mean = logNumber(line, "mean_volume:"); haveVolume = true; }
             else if (line.find("max_volume:") != std::string::npos) peak = logNumber(line, "max_volume:");
         }
         if (audio && haveVolume) {
             snprintf(buf, sizeof buf, "audio mean %.1f dB, peak %.1f dB", mean, peak);
             notes.push_back(buf);
+            if (haveI) {
+                snprintf(buf, sizeof buf, "integrated loudness %.1f LUFS (streaming platforms aim for about -14)", integrated);
+                notes.push_back(buf);
+                if (integrated < -20 && mean >= -45) problems.push_back("programme is quiet (" + std::to_string((int)std::lround(integrated)) + " LUFS): platforms will not raise it; mix to about -14 LUFS with kit mix");
+                if (integrated > -9) problems.push_back("programme is very loud (" + std::to_string((int)std::lround(integrated)) + " LUFS): platforms turn it down and it may distort; mix to about -14 LUFS");
+            }
             if (mean < -45) problems.push_back("audio is effectively silent");
             if (peak >= -0.05) problems.push_back("audio peaks at full scale (clipping)");
         }

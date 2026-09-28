@@ -106,6 +106,8 @@ int browserFixture() {
             if (mode == "js_error" && expression.find("renderReady") != std::string::npos)
                 reply["result"] = json::Object{{"exceptionDetails", json::Object{{"text", "Uncaught"},
                     {"exception", json::Object{{"description", "fixture rendering failure"}}}}}};
+            else if (expression.find("JSON.stringify(out)") != std::string::npos)  // the scene lint asks for a JSON list
+                reply["result"] = json::Object{{"result", json::Object{{"type", "string"}, {"value", "[]"}}}};
             else reply["result"] = json::Object{{"result", json::Object{{"type", "boolean"}, {"value", true}}}};
         } else if (method == "Page.captureScreenshot") {
             if (mode == "timeout" || mode == "cancel") {
@@ -223,7 +225,7 @@ TEST(video_Frame_And_Sequence_Use_Explicit_Times) {
     CHECK(readFileBounded(scratch.path + "/out.mp4", 1000).value.size() == 34);
     auto log = readFileBounded(scratch.path + "/log", 100000);
     CHECK(log.ok && log.value.find("scene%20a%20%23.html") != std::string::npos);
-    for (const char* time : {"const t=1.25;", "const t=0;", "const t=0.5;"}) CHECK(log.value.find(time) != std::string::npos);
+    for (const char* time : {"__pocketSeek(1.25)", "__pocketSeek(0)", "__pocketSeek(0.5)"}) CHECK(log.value.find(time) != std::string::npos);
     CHECK(log.value.find("encoded bytes " + std::to_string(2 * fixturePng(320, 240).size())) != std::string::npos);
     CHECK(log.value.find("encoder 1:a:0") != std::string::npos && log.value.find("encoder apad") != std::string::npos);
     CHECK(scratch.cleaned());

@@ -1,0 +1,7 @@
+Most people back up their laptop once, and never test the restore. Here's the problem: a backup you have never restored is only a hope, not a plan.
+
+The rule is three, two, one. Three copies of your data. On two different kinds of storage. With one copy kept somewhere else.
+
+Then, once a month, actually restore a file. If it opens, your backup works. If it doesn't, you just found out while it still matters.
+
+That's the whole habit. If this helped, like the video and subscribe for the next one.

@@ -214,3 +214,9 @@ TEST(audio_Chords_Tracks_And_Drums_Mix_Without_Clipping) {
     CHECK(!synthNotes(tracks).ok);
     return "";
 }
+
+TEST(audio_Track_Wave_Aliases_Are_Accepted) {
+    CHECK(synthNotes("sawtooth> C3:.1 | triangle> E4:.1").ok);
+    CHECK(!synthNotes("wobble> C3:.1").ok);
+    return "";
+}
