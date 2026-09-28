@@ -23,4 +23,6 @@ pocket kit video scene.html preview.mp4 --size 640x360 --fps 24 --duration 6
 pocket kit video scene.html final.mp4 --size 1280x720 --fps 30 --duration 6 --audio soundtrack.wav
 ```
 
+Renders over 120 s are made in pieces: `--start S --duration D` renders seconds S..S+D (audio is cut to match), then join pieces with `ffmpeg -f concat -c copy`. The time budget scales with frame count; `--timeout` raises it (max 3600 s). A single stalled frame is retried once. After the final render run `pocket kit vcheck final.mp4 --duration D`: it reports missing streams, wrong duration, black or frozen spans, silence and clipping, and exits non-zero on faults. It does not judge content.
+
 Omit `--audio` for a silent clip. The source must expose the renderer contract before running these commands. Read [production pipeline](references/production-pipeline.md), [visual language](references/visual-language.md), [narration and sound](references/narration-and-sound.md) or [QA loop](references/qa-loop.md) only as needed. A successful render verifies encoding, not visual quality. Deliver editable sources, local assets and the requested video, with observed dimensions/duration and material limitations.

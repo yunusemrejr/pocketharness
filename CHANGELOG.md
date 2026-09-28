@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.8.3
+
+- Goals are checked against the deliverable, not only the transcript. When a
+  goal asks to save, export or render a named format (mp4, pdf, png, docx and
+  so on), the harness first looks for a structurally valid file of that format
+  (magic bytes, not just the extension). A missing or empty file sends the
+  agent back to work before the audit can certify anything. It fires once per
+  goal run, so a legitimate exception cannot loop.
+- New `goal_done` hook (user config only, like every hook): commands that must
+  pass before a goal is certified. A failure returns to work with the output.
+- Stop hooks are re-run after each fix, up to three times per turn. Before, a
+  hook that failed once was never checked again, so a still-broken build could
+  end the turn.
+- `kit video`: a stalled frame capture is retried once, and a second failure
+  names the frame. `--start SECONDS` renders a piece of a longer timeline (audio
+  cut to match) so long videos can be rendered in parts. The time budget scales
+  with frame count instead of a flat 120 s, and `--timeout` accepts up to
+  3600 s (600 before, which silently rejected larger values).
+- New `kit vcheck FILE.mp4 [--duration S]`: finished-video QA from the file
+  itself (streams, duration, audio/video length mismatch, black spans, frozen
+  spans, silence, clipping). It found the faults that agents had been
+  hand-writing ffprobe scripts for. It says plainly that it does not judge
+  content.
+- A failed `edit` now shows what to do next: the lines where an ambiguous
+  `old_text` occurs, or the closest current text with line numbers, so the
+  model no longer needs another read round (10 such failures in one day of
+  logs).
+- Node inside the sandbox: a `Cannot read package config ...: permission
+  denied` error (node walking up to a hidden ancestor package.json) now says to
+  add a package.json in the project root.
+
 ## 0.8.2
 
 - UI design doctrine: the bundled `ai-design-slop` skill (indigo/purple and

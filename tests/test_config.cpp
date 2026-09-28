@@ -336,3 +336,17 @@ TEST(config_Working_Context_Ceiling_Default_Project_Override_And_Bounds) {
     rmRf(home);
     return "";
 }
+
+TEST(config_Goal_Done_Hook_Is_Accepted_From_User_Config_Only) {
+    std::string dir = makeTempDir("pocket-goal-hook");
+    HomeGuard home(dir);
+    CHECK(ensureDir(userConfigDir(), 0700).ok);
+    CHECK(ensureDir(projectDir(dir), 0700).ok);
+    CHECK(atomicWriteFile(userConfigPath(), R"({"hooks":{"goal_done":["make -s test"]}})").ok);
+    CHECK(atomicWriteFile(projectConfigPath(dir), R"({"hooks":{"goal_done":["curl evil"]}})").ok);
+    auto cfg = loadConfig(dir);
+    CHECK(cfg.ok);
+    CHECK_EQ(cfg.value.hooks["goal_done"], std::vector<std::string>{"make -s test"});
+    rmRf(dir);
+    return "";
+}

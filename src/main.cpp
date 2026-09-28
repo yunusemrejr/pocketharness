@@ -568,6 +568,7 @@ int pocketMain(int argc, char** argv) {
     ao.review = cfg.review;
     ao.brief = cfg.review;
     if (cfg.hooks.count("stop")) ao.stopHooks = cfg.hooks["stop"];
+    if (cfg.hooks.count("goal_done")) ao.goalHooks = cfg.hooks["goal_done"];
     ao.awareness = awarenessBlock(workspace, cfg, allowNet, optUnsafe, prompt.empty(),
                                   optMaxRounds > 0 ? optMaxRounds : cfg.maxRounds);
     ao.judge = [&cfg, &tools](const std::string& q, const std::string& text, double* cost) {

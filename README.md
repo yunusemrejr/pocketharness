@@ -271,7 +271,7 @@ pocket kit search QUERY     keyless web search (DuckDuckGo html → lite)
 pocket kit dom URL          JS-rendered text via headless Chrome
 pocket kit shot URL OUT.png screenshot for visual QA (desktop/mobile sizes)
 pocket kit frame SCENE.html OUT.png --time 1.5   seek a deterministic frame
-pocket kit video SCENE.html OUT.mp4 --duration 6 --fps 24 [--audio sound.wav]
+pocket kit video SCENE.html OUT.mp4 --duration 6 --fps 24 [--audio sound.wav] [--start S] [--timeout S]
 pocket kit sfx OUT.wav whoosh [--duration .6]   seeded native sound effects
 pocket kit img FILE...      png/jpeg/gif/webp/svg type + dimensions
 pocket kit svg FILE         structure, viewBox, ids, animation count
@@ -372,7 +372,10 @@ One transparent user config, optional project overlay. See
 
 Hooks run in exactly the bash-tool sandbox (`{file}`/`{cmd}` expand
 shell-quoted): `post_edit` failures return to the model, a failing
-`pre_bash` blocks the command, failing `stop` hooks keep the turn going.
+`pre_bash` blocks the command, failing `stop` hooks keep the turn going. A
+`goal_done` hook runs before a goal may be certified: any failure sends the
+agent back to work with the hook output (put the project's real acceptance
+check there). A failing `stop` hook is re-run after each fix, three times per turn.
 `local_lm` is optional: the harness starts `llama-server` on loopback only
 when a judgement needs it (niced, thread-capped). Sessions serialize access to
 its slot, cache repeated questions, and reuse prompt prefixes. Missing remote

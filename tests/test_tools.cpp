@@ -380,3 +380,16 @@ TEST(tools_UI_Files_Demand_The_Design_Doctrine_Until_Loaded) {
     CHECK(r.ok && r.output.find(kUiDocSkill) == std::string::npos);
     return "";
 }
+
+TEST(tools_Failed_Edit_Shows_Where_To_Look) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(boxWrite(f.auth, "c", "int a;\nint main() {\n  return compute(1);\n}\nint z;\nint z;\n").ok);
+    auto r = runTool(f.env, "edit", R"({"path":"c","old_text":"int z;","new_text":"int y;"})");
+    CHECK(!r.ok);
+    CHECK(r.output.find("lines 5, 6") != std::string::npos);
+    r = runTool(f.env, "edit", R"({"path":"c","old_text":"  return compute(2);","new_text":"x"})");
+    CHECK(!r.ok);
+    CHECK(r.output.find("3|   return compute(1);") != std::string::npos);  // closest text, no re-read needed
+    return "";
+}

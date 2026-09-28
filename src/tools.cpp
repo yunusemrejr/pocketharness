@@ -298,6 +298,39 @@ bool fuzzyEdit(std::string& text, const std::string& oldText, const std::string&
     text = text.substr(0, b) + body + text.substr(e);
     return true;
 }
+// Lines the model needs to fix a failed edit without another read: where an
+// ambiguous old_text occurs, or the current text closest to its first line.
+std::string editContext(const std::string& text, const std::string& oldText, long found) {
+    auto tl = lineSpans(text);
+    auto lineNo = [&](size_t pos) {
+        return std::upper_bound(tl.begin(), tl.end(), pos, [](size_t p, const LineSpan& l) { return p < l.begin; }) - tl.begin();
+    };
+    if (found > 1) {
+        std::string at;
+        size_t pos = 0;
+        for (int n = 0; n < 8 && (pos = text.find(oldText, pos)) != std::string::npos; pos += oldText.size(), ++n)
+            at += (n ? ", " : "") + std::to_string(lineNo(pos));
+        return " Matches start at lines " + at + "; add surrounding lines or set expected_matches.";
+    }
+    std::string first;
+    for (auto l : lineSpans(oldText)) {
+        first = trim(oldText.substr(l.begin, l.end - l.begin));
+        if (!first.empty()) break;
+    }
+    if (first.size() < 4) return "";
+    size_t best = 0, bestScore = 0;
+    for (size_t i = 0; i < tl.size(); ++i) {
+        std::string line = trim(text.substr(tl[i].begin, tl[i].end - tl[i].begin));
+        size_t k = 0;
+        while (k < line.size() && k < first.size() && line[k] == first[k]) ++k;
+        if (k > bestScore) { bestScore = k; best = i; }
+    }
+    if (bestScore < std::min<size_t>(8, first.size() / 2 + 1)) return "";
+    std::string out = "\nClosest current text:";
+    for (size_t i = best; i < tl.size() && i < best + 8; ++i)
+        out += "\n" + std::to_string(i + 1) + "| " + text.substr(tl[i].begin, std::min<size_t>(tl[i].end - tl[i].begin, 200));
+    return out;
+}
 ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
     const std::string& path = args.at("path").asStr();
     // Models often mix both forms (edits plus a top-level pair, or edits:[]);
@@ -329,7 +362,7 @@ ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
         if (found != (long)count)
             return {false, "edit: found " + std::to_string(found) + " occurrence(s), expected " +
                     std::to_string((long)count) + "; file untouched." +
-                    (hint.empty() ? " Read the exact current lines first." : hint)};
+                    (hint.empty() ? std::string(" Read the exact current lines first.") : hint) + editContext(updated, oldText, found)};
         if (newText.size() > oldText.size() && newText.size() - oldText.size() >
             ((4u << 20) - updated.size()) / (size_t)found)
             return {false, "edit: result exceeds 4 MiB; file untouched"};
@@ -439,6 +472,9 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
     if (sr.termSig == SIGXFSZ || sr.exitCode == 128 + SIGXFSZ || sr.err.find("File too large") != std::string::npos)
         out += "[note: a file reached the " + std::to_string(env.cfg ? env.cfg->maxFileGb : 32) +
                " GiB max_file_gb cap - almost always a runaway writer; bound it, do not raise the cap]\n";
+    // Node walks up to every ancestor package.json; the sandbox denies those reads (EACCES, not ENOENT), which node treats as fatal.
+    if (sr.err.find("Cannot read package config") != std::string::npos && sr.err.find("permission denied") != std::string::npos)
+        out += "[note: node looked for a package.json above the workspace and the sandbox hides it. Put a package.json in the project root (e.g. {\"type\":\"module\"}) so the lookup stops there]\n";
     if (sr.detached)
         out += "[note: background process(es) still running; their later output is not captured - redirect it "
                "to a file, e.g. cmd >$TMPDIR/cmd.log 2>&1 &]\n";

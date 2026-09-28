@@ -80,7 +80,8 @@ struct Config {
     // provider failure), review (the overseer council). Values are specs.
     std::map<std::string, std::string> roles;
     // Shell hooks run in the same sandbox as the bash tool. Events:
-    // post_edit ({file} = changed path), pre_bash ({cmd}), stop (end of turn).
+    // post_edit ({file} = changed path), pre_bash ({cmd}), stop (end of turn),
+    // goal_done (before a goal may be certified; a failure sends the agent back to work).
     std::map<std::string, std::vector<std::string>> hooks;
     bool review = true;    // overseer reviews changed work before a turn ends
     bool autonomy = true;  // nudge models that stop early or ask permission

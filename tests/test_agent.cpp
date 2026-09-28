@@ -2821,3 +2821,18 @@ TEST(agent_Compaction_Rejects_Tool_Markup_Summaries) {
     CHECK(kept.find("question 0") != std::string::npos);
     return "";
 }
+
+TEST(agent_Missing_Deliverables_Checks_Named_Format) {
+    std::string ws = makeTempDir("pocket-dl");
+    CHECK(!ws.empty());
+    CHECK(missingDeliverables("fix the parser bug", ws).empty());               // no format named
+    CHECK(missingDeliverables("the mp4 player crashes", ws).empty());           // names a format, makes nothing
+    CHECK(missingDeliverables("save a short video as mp4", ws).find("no .mp4") != std::string::npos);
+    CHECK(atomicWriteFile(ws + "/out.mp4", std::string(64, 'x'), 0644).ok);     // right name, wrong bytes
+    CHECK(missingDeliverables("Render it as MP4.", ws).find("not a valid .mp4") != std::string::npos);
+    CHECK(ensureDir(ws + "/build", 0755).ok);
+    CHECK(atomicWriteFile(ws + "/build/real.mp4", std::string("\0\0\0\x18" "ftypisom", 12) + std::string(40, 'x'), 0644).ok);
+    CHECK(missingDeliverables("save as mp4", ws).empty());
+    rmRf(ws);
+    return "";
+}

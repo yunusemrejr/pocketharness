@@ -278,8 +278,8 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
     if (v.has("hooks") && !isProject) {
         if (!o.at("hooks").isObj()) return typeErr("hooks", "an object of event -> [commands]");
         for (const auto& [ev, cmds] : o.at("hooks").asObj()) {
-            if (ev != "post_edit" && ev != "pre_bash" && ev != "stop")
-                return VoidResult::Err("unknown hook event \"" + ev + "\" (post_edit/pre_bash/stop)");
+            if (ev != "post_edit" && ev != "pre_bash" && ev != "stop" && ev != "goal_done")
+                return VoidResult::Err("unknown hook event \"" + ev + "\" (post_edit/pre_bash/stop/goal_done)");
             if (!cmds.isArr()) return typeErr("hooks", "an object of event -> [commands]");
             for (const auto& c : cmds.asArr()) {
                 if (!c.isStr()) return typeErr("hooks", "an object of event -> [commands]");

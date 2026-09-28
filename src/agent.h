@@ -5,6 +5,7 @@
 #include <atomic>
 #include <deque>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,11 @@ struct ImageToken {
 std::vector<ImageToken> collectImageTokens(const std::string& text,
                                            const std::string& workspace);
 
+// Native pre-audit check for goals that name an output file format ("save as mp4",
+// "export a PDF"): "" when no format is demanded or a structurally valid file of
+// that format exists in the workspace, else what is missing or malformed.
+std::string missingDeliverables(const std::string& goal, const std::string& workspace);
+
 // The conversation driver. Owns message history; ToolEnv drives tools;
 // session persistence happens here (one place, always consistent).
 struct AgentOpts {
@@ -89,6 +95,7 @@ struct AgentOpts {
     bool autonomy = false;           // nudge early stops / permission asks
     bool review = false;             // council reviews changed work
     std::vector<std::string> stopHooks;
+    std::vector<std::string> goalHooks;  // "goal_done": must pass before a goal can be certified
     // P(yes) judge (local LM / Jev); -1 unavailable. cost += USD spent.
     std::function<double(const std::string& q, const std::string& text, double* cost)> judge;
     // Batched Span/Jev decisions (see oversee.h); empty map = unavailable.
@@ -298,13 +305,14 @@ class Agent {
     std::deque<size_t> goalObservations_;  // bounded fingerprints; never a completion verdict
     long outputBoost_ = 1;  // doubled when replies hit the output cap (session-wide)
     long workspaceSequence_ = 0;
+    bool deliverableChecked_ = false;  // the native deliverable gate fires once per goal run
     // Per-turn overseer state.
     size_t turnStart_ = 0;
     int turnNudges_ = 0, turnGates_ = 0;
     bool unverified_ = false, verifyNudged_ = false, reviewed_ = false, calmNext_ = false;
     std::string thinkNow_ = "high";  // adaptive thinking: level for the next request
     std::vector<std::string> blind_;  // model specs that rejected image input this session
-    std::vector<std::string> hookNagged_;
+    std::map<std::string, int> hookNagged_;  // stop-hook failures nagged this turn
 };
 
 }  // namespace pocket

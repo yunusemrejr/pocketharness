@@ -319,3 +319,11 @@ TEST(video_Validation_And_Missing_Dependencies_Have_No_Side_Effects) {
     CHECK(access((scratch.path + "/log").c_str(), F_OK) != 0);
     return "";
 }
+
+TEST(video_Vcheck_Rejects_Bad_Usage_And_Non_Media) {
+    CHECK_EQ(kitVcheck({}), 2);
+    CHECK_EQ(kitVcheck({"a.mp4", "--duration"}), 2);
+    CHECK_EQ(kitVcheck({"a.mp4", "--duration", "-3"}), 2);
+    CHECK_EQ(kitVcheck({"/nonexistent/none.mp4"}), 1);
+    return "";
+}

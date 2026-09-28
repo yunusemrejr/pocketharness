@@ -1210,10 +1210,10 @@ std::string Agent::stopGate(const std::string& text) {
     }
     if (opts_.tools && !opts_.tools->changedFiles.empty())
         for (const auto& hook : opts_.stopHooks) {
-            if (std::find(hookNagged_.begin(), hookNagged_.end(), hook) != hookNagged_.end()) continue;
+            if (hookNagged_[hook] >= 3) continue;  // re-run after each fix; give up after three nags
             ToolResult h = runHook(*opts_.tools, hook);
             if (h.ok) continue;
-            hookNagged_.push_back(hook);
+            ++hookNagged_[hook];
             if (opts_.onNotice) opts_.onNotice("stop hook failed: " + hook);
             return "[stop hook failed] `" + hook + "`\n" + capToolResult(h.output) + "\nFix the cause, then finish.";
         }
@@ -1300,6 +1300,29 @@ std::string Agent::makeBrief(const std::string& request, std::vector<ChatRespons
 }
 
 namespace {
+// Cheap magic-number check: a file that merely has the right extension is not a deliverable.
+bool plausibleFile(const std::string& ext, const std::string& path) {
+    struct stat st{};
+    if (stat(path.c_str(), &st) || !S_ISREG(st.st_mode) || st.st_size < 32) return false;
+    char head[256] = {};
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    ssize_t n = read(fd, head, sizeof head);
+    close(fd);
+    if (n < 12) return false;
+    const std::string h(head, (size_t)n);
+    auto has = [&](const char* s) { return h.compare(0, strlen(s), s) == 0; };
+    if (ext == "mp4" || ext == "mov") return h.compare(4, 4, "ftyp") == 0;
+    if (ext == "webm" || ext == "mkv") return has("\x1a\x45\xdf\xa3");
+    if (ext == "png") return has("\x89PNG");
+    if (ext == "jpg" || ext == "jpeg") return has("\xff\xd8");
+    if (ext == "gif") return has("GIF8");
+    if (ext == "pdf") return has("%PDF");
+    if (ext == "wav") return has("RIFF");
+    if (ext == "mp3") return has("ID3") || (uint8_t)h[0] == 0xff;
+    if (ext == "svg") return h.find("<svg") != std::string::npos || h.find("<?xml") != std::string::npos;
+    return has("PK");  // docx xlsx pptx zip
+}
 // Verdict from the first decisive word of the leading lines, tolerating
 // markdown and labels ("**Verdict:** CONTINUE"). Anything else reads as
 // "continue": an unclear audit never certifies completion.
@@ -1334,6 +1357,57 @@ std::string outcomeReason(const std::string& error) {
     return "error";
 }
 }  // namespace
+
+std::string missingDeliverables(const std::string& goal, const std::string& workspace) {
+    static const char* const kFormats[] = {"mp4", "mov", "webm", "mkv", "gif", "png", "jpg", "jpeg", "svg", "pdf",
+                                           "docx", "xlsx", "pptx", "wav", "mp3", "zip"};
+    static const char* const kMakers[] = {"save", "export", "render", "create", "make", "produce", "generate",
+                                          "write", "deliver", "output", "build", "record"};
+    const std::string low = toLower(goal);
+    std::set<std::string> words;
+    std::string w;
+    for (size_t i = 0; i <= low.size(); ++i) {
+        if (i < low.size() && ((low[i] >= 'a' && low[i] <= 'z') || (low[i] >= '0' && low[i] <= '9'))) { w += low[i]; continue; }
+        if (!w.empty()) words.insert(w);
+        w.clear();
+    }
+    bool makes = false;
+    for (const char* m : kMakers) makes = makes || words.count(m) || words.count(std::string(m) + "d");
+    if (!makes || workspace.empty()) return "";
+    std::vector<std::string> wanted;
+    for (const char* f : kFormats) if (words.count(f)) wanted.push_back(f);
+    if (wanted.empty()) return "";
+    std::map<std::string, std::string> firstBad;
+    std::set<std::string> found;
+    int budget = 20000;
+    std::vector<std::pair<std::string, int>> stack{{workspace, 0}};
+    while (!stack.empty() && budget > 0) {
+        auto [dir, depth] = stack.back();
+        stack.pop_back();
+        DIR* d = opendir(dir.c_str());
+        if (!d) continue;
+        while (dirent* e = readdir(d)) {
+            if (--budget <= 0) break;
+            const std::string name = e->d_name;
+            if (name == "." || name == ".." || name == ".git" || name == "node_modules" || name == ".venv") continue;
+            const std::string path = dir + "/" + name;
+            if (e->d_type == DT_DIR) { if (depth < 4) stack.push_back({path, depth + 1}); continue; }
+            size_t dot = name.rfind('.');
+            if (dot == std::string::npos) continue;
+            const std::string ext = toLower(name.substr(dot + 1));
+            if (std::find(wanted.begin(), wanted.end(), ext) == wanted.end()) continue;
+            if (plausibleFile(ext, path)) found.insert(ext); else if (!firstBad.count(ext)) firstBad[ext] = path;
+        }
+        closedir(d);
+    }
+    std::string out;
+    for (const auto& ext : wanted) {
+        if (found.count(ext)) continue;
+        out += firstBad.count(ext) ? "\n- " + firstBad[ext] + " exists but is empty or not a valid ." + ext + " file"
+                                   : "\n- no ." + ext + " file exists in the workspace";
+    }
+    return out.empty() ? "" : "The goal names an output format, but:" + out;
+}
 
 void Agent::recordOutcome(const std::string& scope, const std::string& reason, const std::string& detail) {
     struct timespec wall{};
@@ -2170,6 +2244,7 @@ std::string Agent::runGoal(const std::string& goal, int maxCycles) {
     if (goal.size() > 65536) return "goal exceeds 64 KiB limit";
     if (maxCycles < 1) return "goal cycle limit must be positive";
     goal_ = goal;
+    deliverableChecked_ = false;
     unverified_ = false;
     if (opts_.tools) opts_.tools->changedFiles.clear();
     if (originalRequest_.empty()) originalRequest_ = goal;
@@ -2295,6 +2370,31 @@ std::string Agent::continueGoal(int maxCycles) {
         if (cancelled()) return finishGoal("cancelled");
         if (!persistenceError_.empty()) return finishGoal("session persistence failed: " + persistenceError_);
         if (goalYield_ && goalYield_()) return finishGoal("", false, "yielded");
+        bool hookFailed = false;
+        if (!deliverableChecked_) {
+            const std::string gap = missingDeliverables(goal_, opts_.tools ? opts_.tools->workspace : "");
+            if (!gap.empty()) {
+                deliverableChecked_ = true;
+                goalPhase_ = "work";
+                goalNext_ = continuation() + "\n[goal audit] " + gap + "\nProduce it, or say exactly why that format is impossible, then verify the file itself (open/probe it).";
+                saveStats();
+                if (opts_.onNotice) opts_.onNotice("goal audit: named deliverable missing — continuing");
+                continue;
+            }
+        }
+        if (opts_.tools)
+            for (const auto& hook : opts_.goalHooks) {
+                ToolResult h = runHook(*opts_.tools, hook);
+                if (h.ok) continue;
+                goalPhase_ = "work";
+                goalNext_ = continuation() + "\n[goal_done hook failed] `" + hook + "`\n" + capToolResult(h.output) +
+                            "\nFix the cause and re-verify; the goal cannot be certified while this fails.";
+                saveStats();
+                if (opts_.onNotice) opts_.onNotice("goal_done hook failed: " + hook + " — continuing");
+                hookFailed = true;
+                break;
+            }
+        if (hookFailed) continue;
         // A small decision model can suggest a change of strategy, but may
         // never certify completion. The evidence auditor checks the full goal.
         const std::string auditSys =

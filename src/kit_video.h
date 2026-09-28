@@ -6,4 +6,5 @@
 namespace pocket {
 int kitVideo(const std::vector<std::string>& args);
 int kitFrame(const std::vector<std::string>& args);
+int kitVcheck(const std::vector<std::string>& args);  // mechanical faults in a finished video
 }

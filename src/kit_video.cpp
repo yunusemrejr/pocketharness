@@ -228,13 +228,13 @@ struct Cdp {
     }
 };
 
-const char* videoUsage = "usage: kit video SCENE.html OUT.mp4 --duration SECONDS [--size 1280x720] [--fps 30] [--audio FILE] [--timeout 120]";
+const char* videoUsage = "usage: kit video SCENE.html OUT.mp4 --duration SECONDS [--size 1280x720] [--fps 30] [--audio FILE] [--start SECONDS] [--timeout SECONDS]";
 const char* frameUsage = "usage: kit frame SCENE.html OUT.png [--time SECONDS] [--size 1280x720] [--timeout 120]";
 
 std::string render(const std::vector<std::string>& args, bool still) {
     if (args.size() < 2) return still ? frameUsage : videoUsage;
     int width = 1280, height = 720, fps = 30;
-    double duration = 0, at = 0, timeout = 120;
+    double duration = 0, at = 0, timeout = 0, start = 0;
     std::string audio;
     for (size_t i = 2; i < args.size(); i += 2) {
         if (i + 1 == args.size()) return "missing value for " + args[i];
@@ -253,14 +253,16 @@ std::string render(const std::vector<std::string>& args, bool still) {
             if (!number(value, n)) return "invalid numeric value for " + key;
             if (key == "--duration" && !still && n > 0 && n <= 120) duration = n;
             else if (key == "--time" && still && n >= 0 && n <= 86400) at = n;
+            else if (key == "--start" && !still && n >= 0 && n <= 86400) start = n;
             else if (key == "--fps" && !still && n >= 1 && n <= 60 && n == std::floor(n)) fps = (int)n;
-            else if (key == "--timeout" && n >= 1 && n <= 600) timeout = n;
+            else if (key == "--timeout" && n >= 1 && n <= 3600) timeout = n;
             else return "unknown or out-of-range option " + key;
         }
     }
     if (!still && (duration <= 0 || width % 2 || height % 2)) return "video needs --duration (0..120s) and even dimensions";
     int frames = still ? 1 : (int)std::ceil(duration * fps - 1e-9);
     if (frames < 1 || frames > 3600) return "render must contain 1..3600 frames; render longer projects in scenes";
+    if (timeout <= 0) timeout = std::min(3600.0, 120.0 + frames * 0.5);  // scales with the work; explicit --timeout wins
     if (!endsWith(toLower(args[1]), still ? ".png" : ".mp4")) return still ? "frame output must end in .png" : "video output must end in .mp4";
     std::error_code ec;
     auto source = std::filesystem::canonical(args[0], ec);
@@ -348,6 +350,7 @@ std::string render(const std::vector<std::string>& args, bool still) {
         encode.exe = ffmpeg;
         encode.argv = {ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-threads", "2",
             "-f", "image2pipe", "-framerate", std::to_string(fps), "-vcodec", "png", "-i", "pipe:0"};
+        if (!audio.empty() && start > 0) encode.argv.insert(encode.argv.end(), {"-ss", std::to_string(start)});
         if (!audio.empty()) encode.argv.insert(encode.argv.end(), {"-i", std::filesystem::absolute(audio).string()});
         encode.argv.insert(encode.argv.end(), {"-map", "0:v:0", "-c:v", "libx264", "-threads", "2", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"});
         if (!audio.empty()) encode.argv.insert(encode.argv.end(), {"-map", "1:a:0", "-af", "apad", "-c:a", "aac", "-b:a", "192k"});
@@ -362,13 +365,19 @@ std::string render(const std::vector<std::string>& args, bool still) {
     int64_t started = nowMs();
     for (int frame = 0; frame < frames; ++frame) {
         if (interrupted || nowMs() >= deadline) return interrupted ? "render cancelled" : "render time budget exhausted";
-        std::string seconds = json::stringify(still ? at : (double)frame / fps);
-        auto draw = cdp.evaluate("(async()=>{const t=" + seconds + "; await window.renderFrame(t); "
-            "for(const a of document.getAnimations()){a.pause();a.currentTime=t*1000;} "
-            "for(const s of document.querySelectorAll('svg')){if(s.pauseAnimations){s.pauseAnimations();s.setCurrentTime(t);}} return true;})()");
-        if (!draw.ok) return draw.error;
-        auto shot = cdp.call("Page.captureScreenshot", {{"format", "png"}, {"captureBeyondViewport", false}, {"fromSurface", true}});
-        if (!shot.ok) return shot.error;
+        std::string seconds = json::stringify(still ? at : start + (double)frame / fps);
+        // One transient capture stall (GC, heavy canvas) must not cost the whole render: redraw and retry once.
+        Result<json::Value> shot = Result<json::Value>::Err("");
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            auto draw = cdp.evaluate("(async()=>{const t=" + seconds + "; await window.renderFrame(t); "
+                "for(const a of document.getAnimations()){a.pause();a.currentTime=t*1000;} "
+                "for(const s of document.querySelectorAll('svg')){if(s.pauseAnimations){s.pauseAnimations();s.setCurrentTime(t);}} return true;})()");
+            if (!draw.ok) return "frame " + std::to_string(frame) + ": " + draw.error;
+            shot = cdp.call("Page.captureScreenshot", {{"format", "png"}, {"captureBeyondViewport", false}, {"fromSurface", true}});
+            if (shot.ok || interrupted || browser.done.load()) break;
+        }
+        if (!shot.ok) return "frame " + std::to_string(frame) + " of " + std::to_string(frames) + ": " + shot.error +
+            (still ? "" : " (the scene is too heavy for this frame; simplify it, or render in pieces with --start and join with ffmpeg concat)");
         auto png = pngBytes(shot.value.at("data").asStr(), (unsigned)width, (unsigned)height);
         if (!png.ok) return png.error;
         int fd = still ? output.fd : pictures.write.fd;
@@ -412,4 +421,124 @@ int runRender(const std::vector<std::string>& args, bool still) {
 }  // namespace
 int kitVideo(const std::vector<std::string>& args) { return runRender(args, false); }
 int kitFrame(const std::vector<std::string>& args) { return runRender(args, true); }
+namespace {
+// Number after "key" in an ffmpeg filter log line, "" when absent.
+std::string logValue(const std::string& line, const std::string& key) {
+    size_t p = line.find(key);
+    if (p == std::string::npos) return "";
+    p += key.size();
+    while (p < line.size() && line[p] == ' ') ++p;
+    size_t e = p;
+    while (e < line.size() && (isdigit((unsigned char)line[e]) || line[e] == '.' || line[e] == '-')) ++e;
+    return line.substr(p, e - p);
+}
+double logNumber(const std::string& line, const std::string& key) { return atof(logValue(line, key).c_str()); }
+double jsonNumber(const json::Value& v) { return v.isStr() ? atof(v.asStr().c_str()) : v.asNum(); }
+}  // namespace
+
+// Judge a finished video from its own bytes: streams, duration, black or frozen
+// spans, silence and clipping. Exit 0 = no mechanical fault found; that never
+// proves the video is good, only that these faults are absent.
+int kitVcheck(const std::vector<std::string>& args) {
+    const char* usage = "usage: kit vcheck FILE.mp4 [--duration EXPECTED_SECONDS]";
+    double expected = 0;
+    if (args.size() == 1 && args[0] == "--help") { puts(usage); return 0; }
+    if (args.empty() || args.size() == 2 || args.size() > 3 ||
+        (args.size() == 3 && (args[1] != "--duration" || !number(args[2], expected) || expected <= 0))) {
+        puts(usage);
+        return 2;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(args[0], ec)) {
+        fprintf(stderr, "pocket kit: not a file: %s\n", sanitizeTerminal(args[0]).c_str());
+        return 1;
+    }
+    const std::string ffprobe = whichExe("ffprobe"), ffmpeg = whichExe("ffmpeg");
+    if (ffprobe.empty() || ffmpeg.empty()) {
+        fprintf(stderr, "pocket kit: FFmpeg (ffmpeg and ffprobe) is needed to check video\n");
+        return 1;
+    }
+    SpawnOpts probe;
+    probe.exe = ffprobe;
+    probe.argv = {ffprobe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", args[0]};
+    probe.timeoutMs = 30000;
+    SpawnResult pr = spawn(probe);
+    auto info = json::parse(pr.out);
+    if (!pr.ok || pr.exitCode != 0 || !info.ok) {
+        printf("%s: PROBLEMS\n  PROBLEM: not readable as media: %s\n", sanitizeTerminal(args[0]).c_str(),
+               sanitizeTerminal(pr.err.substr(0, 300)).c_str());
+        return 1;
+    }
+    std::vector<std::string> problems, notes;
+    bool video = false, audio = false;
+    double vDur = 0, aDur = 0;
+    const double total = jsonNumber(info.value.at("format").at("duration"));
+    for (const auto& s : info.value.at("streams").asArr()) {
+        const std::string type = s.at("codec_type").asStr();
+        const double d = s.has("duration") ? jsonNumber(s.at("duration")) : total;
+        if (type == "video" && !video) {
+            video = true; vDur = d;
+            notes.push_back(s.at("codec_name").asStr() + " " + std::to_string(s.at("width").asInt()) + "x" +
+                            std::to_string(s.at("height").asInt()) + " @ " + s.at("r_frame_rate").asStr() + " fps");
+        } else if (type == "audio" && !audio) {
+            audio = true; aDur = d;
+            notes.push_back(s.at("codec_name").asStr() + " " + s.at("sample_rate").asStr() + " Hz");
+        }
+    }
+    char buf[200];
+    snprintf(buf, sizeof buf, "duration %.2fs", total);
+    notes.push_back(buf);
+    if (!video) problems.push_back("no video stream");
+    if (!audio) notes.push_back("no audio stream");
+    if (total <= 0) problems.push_back("unknown or zero duration");
+    if (expected > 0 && std::fabs(total - expected) > std::max(0.25, expected * 0.02)) {
+        snprintf(buf, sizeof buf, "duration %.2fs differs from the expected %.2fs", total, expected);
+        problems.push_back(buf);
+    }
+    if (video && audio && std::fabs(vDur - aDur) > 0.35) {
+        snprintf(buf, sizeof buf, "audio (%.2fs) and video (%.2fs) lengths differ: truncation or sync", aDur, vDur);
+        problems.push_back(buf);
+    }
+    if (video || audio) {
+        SpawnOpts scan;
+        scan.exe = ffmpeg;
+        scan.argv = {ffmpeg, "-hide_banner", "-nostats", "-nostdin", "-i", args[0]};
+        if (video) scan.argv.insert(scan.argv.end(), {"-vf", "blackdetect=d=0.4:pix_th=0.05,freezedetect=n=0.001:d=2"});
+        if (audio) scan.argv.insert(scan.argv.end(), {"-af", "volumedetect,silencedetect=n=-50dB:d=2"});
+        scan.argv.insert(scan.argv.end(), {"-f", "null", "-"});
+        scan.timeoutMs = 600000;
+        scan.outLimit = 4 << 20;
+        SpawnResult sr = spawn(scan);
+        if (!sr.ok || sr.timedOut || sr.exitCode != 0)
+            problems.push_back("decoding failed: " + sanitizeTerminal(sr.err.substr(sr.err.size() > 300 ? sr.err.size() - 300 : 0)));
+        int black = 0, frozen = 0, silent = 0;
+        double mean = 0, peak = -99;
+        bool haveVolume = false;
+        for (const auto& line : splitLines(sr.err)) {
+            if (line.find("black_start") != std::string::npos) {
+                snprintf(buf, sizeof buf, "black frames from %.1fs to %.1fs", logNumber(line, "black_start:"), logNumber(line, "black_end:"));
+                if (++black <= 3) problems.push_back(buf);
+            } else if (line.find("freeze_duration") != std::string::npos) {
+                snprintf(buf, sizeof buf, "picture frozen for %.1fs (fine only if the hold is intended)", logNumber(line, "freeze_duration:"));
+                if (++frozen <= 3) notes.push_back(buf);
+            } else if (line.find("silence_duration") != std::string::npos) {
+                snprintf(buf, sizeof buf, "silence of %.1fs ending at %.1fs", logNumber(line, "silence_duration:"), logNumber(line, "silence_end:"));
+                if (++silent <= 3) notes.push_back(buf);
+            } else if (line.find("mean_volume:") != std::string::npos) { mean = logNumber(line, "mean_volume:"); haveVolume = true; }
+            else if (line.find("max_volume:") != std::string::npos) peak = logNumber(line, "max_volume:");
+        }
+        if (audio && haveVolume) {
+            snprintf(buf, sizeof buf, "audio mean %.1f dB, peak %.1f dB", mean, peak);
+            notes.push_back(buf);
+            if (mean < -45) problems.push_back("audio is effectively silent");
+            if (peak >= -0.05) problems.push_back("audio peaks at full scale (clipping)");
+        }
+    }
+    printf("%s: %s\n", sanitizeTerminal(args[0]).c_str(), problems.empty() ? "no mechanical faults found" : "PROBLEMS");
+    for (const auto& n : notes) printf("  %s\n", sanitizeTerminal(n).c_str());
+    for (const auto& p : problems) printf("  PROBLEM: %s\n", p.c_str());
+    if (problems.empty()) puts("  (content is not judged: still look at frames and listen to the mix)");
+    return problems.empty() ? 0 : 1;
+}
+
 }  // namespace pocket
