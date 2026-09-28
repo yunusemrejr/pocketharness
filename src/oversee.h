@@ -68,6 +68,8 @@ std::map<std::string, double> decide(const Config& cfg, const json::Value& state
                                      double* cost = nullptr, std::atomic<bool>* cancel = nullptr,
                                      const std::function<void(const std::string&)>& activity = {});
 bool decideAvailable(const Config& cfg);
+// True when the remote Jev/Span judges can answer (key set, enabled, not paused).
+bool remoteAvailable(const Config& cfg);
 std::string judgeStatus(const Config& cfg);  // which judges are live
 // Start the configured local llama-server in the background (never waits)
 // when the remote judges are unavailable, so the first local decision does

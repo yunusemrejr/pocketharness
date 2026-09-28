@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.2
+
+- UI design doctrine: the bundled `ai-design-slop` skill (indigo/purple and
+  cream/terracotta slop generations, full tell checklist, nine-step procedure)
+  is required reading for interface work. Jev decides in the same batched call
+  as the skill hint whether a request is UI/UX/GUI work (no extra request; a
+  keyword fallback offline) and tells the agent to load it. Backstop: the
+  first write of an .html/.css/.jsx/.tsx/.vue/.svelte/.astro/.scss file
+  before the doctrine was read gets the same demand.
+- Disk guard: a runaway tool command can no longer fill the disk. An
+  agent-written ffmpeg filter ended in a bare `apad`, which pads forever. It
+  wrote 74 GiB of silence into one WAV in about 7 minutes, well inside the
+  15 minute bash timeout, and left the disk 100% full. Now bash commands are
+  stopped when they consume more than `disk_budget_gb` (default 40), or keep
+  writing below `disk_reserve_gb` free (default 10). Any single file is
+  capped at `max_file_gb` (default 32, `RLIMIT_FSIZE`), which also binds
+  background children. A session watchdog stops backgrounded tool processes
+  when free space is below the reserve and still falling. The model is told
+  why its command stopped and to bound the writer instead of rerunning it.
+  Project config cannot loosen these limits.
+
 ## 0.8.1
 
 - Speed: the review council no longer waits on a stalled reviewer. After

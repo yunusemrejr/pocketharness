@@ -1,6 +1,8 @@
 // PocketHarness - native tool implementations.
 #include "tools.h"
 
+#include <signal.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <dirent.h>
 
@@ -130,6 +132,15 @@ std::string afterChange(ToolEnv& env, const std::string& path, const std::string
         visual = visual || endsWith(lp, ext);
     // Once per file per turn: repeated small edits to one page cost a paid
     // judge call each and rarely change the verdict.
+    // Deterministic backstop for the Jev prompt-time verdict: writing a UI file
+    // without having read the design doctrine gets one firm demand.
+    if (firstTouch && !env.uiDocLoaded)
+        for (const char* ext : {".html", ".css", ".jsx", ".tsx", ".vue", ".svelte", ".astro", ".scss"})
+            if (endsWith(lp, ext)) {
+                out += "\n[harness] UI work: you have not read the design doctrine. Before continuing, run "
+                       "skill(action=load, name=\"" + std::string(kUiDocSkill) + "\") and fix what it flags here.";
+                break;
+            }
     if (visual && firstTouch && env.cfg && content.size() >= 300) {
         auto v = decide(*env.cfg, json::Object{{"file", path}, {"content", content.substr(0, 20000)}},
                         {{"generic", "Is this generic AI-template work (stock purple/blue gradients, emoji decoration, "
@@ -380,10 +391,30 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
     // `server &` keeps the output pipes open after the shell exits; stop
     // reading shortly after instead of blocking until the timeout.
     o.lingerMs = 1500;
-    o.childSetup = [cs]() { childEnterSandbox(cs); };
+    // Disk safety: a runaway writer (an unbounded ffmpeg apad once wrote 74 GiB
+    // of silence) is stopped before it fills the disk; the file cap also binds
+    // background children that outlive this call.
+    const uint64_t GiB = 1ULL << 30;
+    rlim_t maxFile = env.cfg && env.cfg->maxFileGb > 0 ? (rlim_t)env.cfg->maxFileGb * GiB : RLIM_INFINITY;
+    o.diskGuardPath = env.workspace;
+    o.diskBudgetBytes = env.cfg ? (uint64_t)env.cfg->diskBudgetGb * GiB : 40 * GiB;
+    o.diskReserveBytes = env.cfg ? (uint64_t)env.cfg->diskReserveGb * GiB : 10 * GiB;
+    startDiskWatchdog({env.workspace, env.sessionTmp}, o.diskReserveBytes);
+    o.childSetup = [cs, maxFile]() {
+        struct rlimit rl{maxFile, maxFile};
+        setrlimit(RLIMIT_FSIZE, &rl);
+        childEnterSandbox(cs);
+    };
 
     SpawnResult sr = spawn(o);
     std::string out;
+    if (!sr.diskGuard.empty()) {
+        r.output = "stopped by disk guard: " + sr.diskGuard +
+                   ". Something is writing far more data than intended (unbounded loop, infinite stream such as "
+                   "ffmpeg apad/aevalsrc without a duration, runaway log). Find and bound it before rerunning; "
+                   "delete the partial output.\n" + sr.out + sr.err;
+        return r;
+    }
     if (sr.cancelled) {
         r.output = "cancelled";
         return r;
@@ -405,6 +436,9 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
         out += "[stderr]\n" + sr.err;
     }
     if (sr.truncated) out += "[... output truncated ...]\n";
+    if (sr.termSig == SIGXFSZ || sr.exitCode == 128 + SIGXFSZ || sr.err.find("File too large") != std::string::npos)
+        out += "[note: a file reached the " + std::to_string(env.cfg ? env.cfg->maxFileGb : 32) +
+               " GiB max_file_gb cap - almost always a runaway writer; bound it, do not raise the cap]\n";
     if (sr.detached)
         out += "[note: background process(es) still running; their later output is not captured - redirect it "
                "to a file, e.g. cmd >$TMPDIR/cmd.log 2>&1 &]\n";
@@ -514,6 +548,7 @@ ToolResult toolSkill(ToolEnv& env, const json::Value& args) {
             return r;
         }
         emit(env, "skill load " + name);
+        if (name == kUiDocSkill) env.uiDocLoaded = true;
         r.ok = true;
         r.output = loaded.value +
                    "\n\n[harness] Tools here: read, write, edit, bash, skill. Where this skill names "
@@ -681,6 +716,17 @@ ChildUsage collectChildUsage(ToolEnv& env) {
     }
     closedir(d);
     return delta;
+}
+
+
+// Offline fallback for the Jev verdict that a request is UI/UX/GUI work.
+bool looksLikeUiWork(const std::string& text) {
+    std::string t = " " + toLower(text) + " ";
+    for (const char* k : {"landing page", "website", "web page", "webpage", "frontend", "front-end", " ui ", " ux ",
+                          "user interface", " gui ", "dashboard", "mockup", "wireframe", "stylesheet", " css",
+                          "tailwind", "navbar", "hero section", "figma", "redesign", "web app", ".html"})
+        if (t.find(k) != std::string::npos) return true;
+    return false;
 }
 
 }  // namespace pocket

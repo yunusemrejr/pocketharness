@@ -68,6 +68,11 @@ struct Config {
     int bashTimeoutSec = 120;
     int maxRounds = 100;  // model<->tool rounds per user turn before stopping
     long outputLimitBytes = 262144;  // 256 KiB per tool result
+    // Disk safety for tool commands, in GiB (0 disables that check): a runaway
+    // writer must never fill the user's disk.
+    int diskBudgetGb = 40;   // free space one bash command may consume
+    int diskReserveGb = 10;  // stop writers once free space is below this
+    int maxFileGb = 32;      // RLIMIT_FSIZE: largest file a tool process may write
     std::vector<std::string> allowRead;
     std::vector<std::string> allowWrite;
     std::vector<std::string> exposeEnv;

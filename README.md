@@ -137,7 +137,10 @@ Weak and strong models get the same standards, enforced by the harness:
    wisdom book, acceptance criteria, and the average outcome to avoid. The
    brief rides along with the request; the user's words win on conflict.
 2. **Skill hints.** BM25 finds candidate skills; Jev confirms relevance in
-   one batched call; the hint names them for loading.
+   one batched call; the hint names them for loading. The same call asks Jev
+   whether the request is UI/UX/GUI work and, if so, requires the bundled
+   `ai-design-slop` doctrine to be read first (writing a UI file without it
+   triggers the same demand).
 3. **Guardian on every change.** Writes/edits are scanned natively
    (placeholders, "rest unchanged" elisions, stubs, conflict markers,
    invalid JSON, AI-tell prose); UI and prose files also get a Jev taste
@@ -356,6 +359,9 @@ One transparent user config, optional project overlay. See
   "tool_network": true,
   "bash_timeout": 120,
   "output_limit": 262144,
+  "disk_budget_gb": 40,
+  "disk_reserve_gb": 10,
+  "max_file_gb": 32,
   "max_rounds": 100,
   "working_context_tokens": 96000,
   "allow_read": [],
@@ -374,8 +380,15 @@ decisions fall back locally within a bounded time budget. Local transcript
 judgments assist the worker but cannot independently certify goal completion or
 skip the review council. An existing externally started server is left running.
 
+Disk guard: a bash command is stopped when it consumes more than
+`disk_budget_gb` of free space, or keeps writing once free space is below
+`disk_reserve_gb`. No single file a tool process writes may exceed
+`max_file_gb` (`RLIMIT_FSIZE`, inherited by background children). A session
+watchdog also stops backgrounded tool processes when free space is below the
+reserve and still falling. `0` disables a check.
+
 Security-sensitive keys (`providers`, `tool_network`, `allow_read`,
-`allow_write`, `expose_env`, `local_lm`, hooks, timeouts, `max_rounds`) from **project**
+`allow_write`, `expose_env`, `local_lm`, hooks, timeouts, `max_rounds`, disk limits) from **project**
 config are ignored
 with a warning — a repository must never silently escalate its own authority,
 and especially never redirect provider endpoints (which decide where API

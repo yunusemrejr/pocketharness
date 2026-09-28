@@ -117,6 +117,18 @@ TEST(tools_Bash_Capture_And_Guard) {
     return "";
 }
 
+TEST(tools_Bash_Caps_File_Size) {
+    ToolFixture f;
+    CHECK(f.ok);
+    f.cfg.maxFileGb = 2;  // ulimit -f reports 1 KiB blocks
+    ToolResult r = runTool(f.env, "bash", R"({"command":"ulimit -f"})");
+    CHECK(r.ok && r.output.find("2097152") != std::string::npos);
+    f.cfg.maxFileGb = 0;
+    r = runTool(f.env, "bash", R"({"command":"ulimit -f"})");
+    CHECK(r.ok && r.output.find("unlimited") != std::string::npos);
+    return "";
+}
+
 TEST(tools_Staged_Native_Audio_Runs_Without_Network) {
     ToolFixture f;
     CHECK(f.ok);
@@ -350,5 +362,21 @@ TEST(tools_Edit_Tolerates_Whitespace_Drift_And_Pipe_Close) {
     // `yes | head` ends in SIGPIPE (141) under pipefail: that is success.
     r = runTool(f.env, "bash", R"({"command":"yes | head -n 2"})");
     CHECK(r.ok && r.output.find("exit 141") != std::string::npos);
+    return "";
+}
+
+TEST(tools_UI_Files_Demand_The_Design_Doctrine_Until_Loaded) {
+    CHECK(looksLikeUiWork("Build a landing page for my bakery"));
+    CHECK(looksLikeUiWork("redesign the settings screen UI"));
+    CHECK(!looksLikeUiWork("fix the parser off-by-one"));
+    ToolFixture f;
+    CHECK(f.ok);
+    ToolResult r = runTool(f.env, "write", R"({"path":"a.css","content":"body{margin:0}"})");
+    CHECK(r.ok && r.output.find(kUiDocSkill) != std::string::npos);
+    r = runTool(f.env, "write", R"({"path":"notes.txt","content":"hi"})");
+    CHECK(r.ok && r.output.find(kUiDocSkill) == std::string::npos);
+    f.env.uiDocLoaded = true;
+    r = runTool(f.env, "write", R"({"path":"b.css","content":"body{margin:0}"})");
+    CHECK(r.ok && r.output.find(kUiDocSkill) == std::string::npos);
     return "";
 }

@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -28,6 +29,12 @@ struct SpawnOpts {
     // After the leader exits, wait at most this long for inherited pipes to
     // close (background children keep them open). -1 = wait for EOF.
     long lingerMs = -1;
+    // Disk guard: stop the tree when the command has consumed more than
+    // diskBudgetBytes of free space on diskGuardPath's filesystem, or keeps
+    // writing once free space is below diskReserveBytes. 0 = off.
+    std::string diskGuardPath;
+    uint64_t diskBudgetBytes = 0;
+    uint64_t diskReserveBytes = 0;
 };
 
 struct SpawnResult {
@@ -41,6 +48,7 @@ struct SpawnResult {
     std::string out;
     std::string err;
     std::string error;  // spawn/wait failure description
+    std::string diskGuard;  // non-empty: the disk guard stopped the command (why)
 };
 
 // Run a child synchronously. Never invokes a shell.
@@ -49,6 +57,13 @@ SpawnResult spawn(const SpawnOpts& opts);
 // background servers included): TERM, up to graceMs, then KILL. Uses only
 // async-signal-safe calls, so fatal-signal handlers may call it.
 void killSessionProcesses(long graceMs = 1000);
+// Session-wide backstop for background groups that outlive their tool call:
+// while any tracked group lives, poll `paths` and stop every session group
+// when free space is below reserveBytes and still falling fast. Idempotent;
+// later calls replace the paths/reserve. reserveBytes 0 disables it.
+void startDiskWatchdog(std::vector<std::string> paths, uint64_t reserveBytes);
+// Free bytes available to unprivileged writers on path's filesystem, or -1.
+int64_t diskAvail(const std::string& path);
 
 // Resolve PATH in the child's environment and working directory, before fork.
 std::string whichExe(const std::string& name, const std::string& workdir = "",

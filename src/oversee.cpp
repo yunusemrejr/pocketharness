@@ -388,10 +388,6 @@ std::string remotePauseKey() {
     return "remote:" + stateDir() + ":" + std::to_string(std::hash<std::string>{}(key ? key : ""));
 }
 
-bool remoteAvailable(const Config& cfg) {
-    const char* key = getenv("OPENROUTER_API_KEY");
-    return cfg.jev && key && *key && !paused(remotePauseKey());
-}
 
 std::string remoteUnavailable(const Config& cfg) {
     if (!cfg.jev) return "disabled";
@@ -447,6 +443,11 @@ std::vector<Question> missingQuestions(const std::vector<Question>& qs, const st
 }
 
 }  // namespace
+
+bool remoteAvailable(const Config& cfg) {
+    const char* key = getenv("OPENROUTER_API_KEY");
+    return cfg.jev && key && *key && !paused(remotePauseKey());
+}
 
 DecisionBand decisionBand(double probability, double low, double high) {
     if (!std::isfinite(probability) || !std::isfinite(low) || !std::isfinite(high) ||

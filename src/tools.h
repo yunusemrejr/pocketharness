@@ -50,12 +50,17 @@ struct ToolEnv {
     std::vector<UndoEntry> undo;              // newest last, max kMaxUndo
     std::vector<std::string> changedFiles;    // paths written this turn (agent resets)
     long bashRuns = 0;                        // successful+failed bash calls (verification signal)
+    bool uiDocLoaded = false;                 // ai-design-slop read this session (UI work gate)
     double sideCost = 0;                      // USD spent by tool-side judges (agent collects)
     std::vector<ChatImage> viewImages;        // images `read` this batch (agent attaches them)
     std::map<std::string, ChildUsage> childUsage;
 };
 
 inline constexpr size_t kMaxUndo = 64;
+// Bundled UI-design doctrine: agents must read it before UI/UX/GUI work.
+inline constexpr const char* kUiDocSkill = "ai-design-slop";
+// Offline fallback for the Jev "is this UI work?" verdict.
+bool looksLikeUiWork(const std::string& text);
 
 struct ToolResult {
     bool ok = false;

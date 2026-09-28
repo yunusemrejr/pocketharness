@@ -580,21 +580,36 @@ int pocketMain(int argc, char** argv) {
         if (!needsBrief(text)) return "";
         auto hits = skillSearch(skillDiscover(workspace), text);
         if (hits.size() > 3) hits.resize(3);
-        if (hits.empty()) return "";
         std::vector<Question> qs;
         for (size_t i = 0; i < hits.size(); ++i)
             qs.push_back({"s" + std::to_string(i), "Would the guide \"" + hits[i].name + ": " + hits[i].preview.substr(0, 200) +
                                                        "\" materially help an expert do this task well?"});
+        // Same batched call: is this UI/UX/GUI work? Then the design doctrine is required reading.
+        // Remote Jev answers it for free in the batch; a local LM pays one inference per question, so
+        // offline it is only asked when a keyword already suspects UI work.
+        const bool askUi = remoteAvailable(cfg) || looksLikeUiWork(text);
+        if (askUi) qs.push_back({"ui", "Does this task involve designing, building or restyling a user interface, user experience, "
+                            "web page or any graphical/terminal interface?"});
+        if (qs.empty()) return "";
         auto p = decide(cfg, json::Object{{"task", text.substr(0, 2000)}}, qs, false, cost, tools.cancel, tools.onEvent);
+        bool ui = p.count("ui") ? p["ui"] >= 0.7 : looksLikeUiWork(text);
         std::vector<std::string> keep;
         for (size_t i = 0; i < hits.size(); ++i)
             // Without a verdict, only a skill the request names (fuzzily) is offered:
             // a bare BM25 word overlap is noise, not relevance.
-            if (p.empty() ? i == 0 && fuzzyScore(hits[i].name, text) >= 0.8 : p["s" + std::to_string(i)] >= 0.7)
+            if (hits[i].name != kUiDocSkill &&
+                (p.empty() ? i == 0 && fuzzyScore(hits[i].name, text) >= 0.8 : p["s" + std::to_string(i)] >= 0.7))
                 keep.push_back(hits[i].name);
-        if (keep.empty()) return "";
-        return "[harness] Relevant skill" + std::string(keep.size() > 1 ? "s: " : ": ") + join(keep, ", ") +
-               " — load with skill(action=load, name=...) before starting.";
+        std::string out;
+        if (ui && !tools.uiDocLoaded)
+            out = "[harness] This is UI/UX work. Before designing or writing any interface, you MUST load the design "
+                  "doctrine: skill(action=load, name=\"" + std::string(kUiDocSkill) +
+                  "\"). Defaults (indigo/purple gradients, cream/terracotta serif, Inter, identical icon cards, "
+                  "invented stats) are defects.";
+        if (!keep.empty())
+            out += (out.empty() ? "" : "\n") + std::string("[harness] Relevant skill") + (keep.size() > 1 ? "s: " : ": ") +
+                   join(keep, ", ") + " — load with skill(action=load, name=...) before starting.";
+        return out;
     };
     ao.thinking = thinking;
     ao.maxRounds = optMaxRounds > 0 ? optMaxRounds : cfg.maxRounds;

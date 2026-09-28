@@ -257,3 +257,38 @@ TEST(process_Session_Exit_Stops_Background_Groups) {
     CHECK(gone);
     return "";
 }
+
+TEST(process_Disk_Guard_Stops_Runaway_Writer) {
+    std::string dir = makeTempDir("pocket-disk");
+    CHECK(!dir.empty());
+    SpawnOpts opts;
+    opts.exe = "/bin/sh";
+    // Throttled, endless writer: the shape of an unbounded ffmpeg apad.
+    opts.argv = {"sh", "-c", "while :; do head -c 4194304 /dev/zero >> big; sleep 0.02; done"};
+    opts.workdir = dir;
+    opts.timeoutMs = 20000;
+    opts.diskGuardPath = dir;
+    opts.diskBudgetBytes = 16 << 20;
+    auto start = nowMs();
+    auto result = spawn(opts);
+    CHECK(!result.ok && !result.timedOut);
+    CHECK(result.diskGuard.find("per-command budget") != std::string::npos);
+    CHECK(nowMs() - start < 5000);
+    rmRf(dir);
+    return "";
+}
+
+TEST(process_Disk_Guard_Allows_Small_Writes) {
+    std::string dir = makeTempDir("pocket-disk-ok");
+    CHECK(!dir.empty());
+    SpawnOpts opts;
+    opts.exe = "/bin/sh";
+    opts.argv = {"sh", "-c", "head -c 1048576 /dev/zero > small; sleep 0.6; echo done"};
+    opts.workdir = dir;
+    opts.diskGuardPath = dir;
+    opts.diskBudgetBytes = 64 << 20;
+    auto result = spawn(opts);
+    CHECK(result.ok && result.exitCode == 0 && result.diskGuard.empty() && result.out == "done\n");
+    rmRf(dir);
+    return "";
+}

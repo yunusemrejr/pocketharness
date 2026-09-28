@@ -137,6 +137,26 @@ TEST(config_Max_Rounds_User_Only_And_Bounded) {
     return "";
 }
 
+TEST(config_Disk_Limits_User_Only_And_Bounded) {
+    std::string home = makeTempDir("pocket-cfgdisk");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    std::string ws = home + "/ws";
+    CHECK(ensureDir(ws + "/.pocket", 0755).ok);
+    CHECK(ensureDir(userConfigDir(), 0755).ok);
+    auto d = defaultConfig();
+    CHECK(d.diskBudgetGb == 40 && d.diskReserveGb == 10 && d.maxFileGb == 32);
+    // User values apply; a project cannot loosen the disk guard.
+    CHECK(atomicWriteFile(userConfigPath(), R"({"disk_budget_gb":100,"disk_reserve_gb":0,"max_file_gb":64})", 0644).ok);
+    CHECK(atomicWriteFile(projectConfigPath(ws), R"({"disk_budget_gb":0,"max_file_gb":0})", 0644).ok);
+    auto c = loadConfig(ws);
+    CHECK(c.ok && c.value.diskBudgetGb == 100 && c.value.diskReserveGb == 0 && c.value.maxFileGb == 64);
+    CHECK(atomicWriteFile(userConfigPath(), R"({"max_file_gb":-1})", 0644).ok);
+    CHECK(!loadConfig(ws).ok);
+    rmRf(home);
+    return "";
+}
+
 TEST(config_Project_Providers_Ignored_And_Endpoints_Validated) {
     std::string home = makeTempDir("pocket-cfgprov");
     CHECK(!home.empty());

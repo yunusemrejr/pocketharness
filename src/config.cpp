@@ -329,6 +329,13 @@ VoidResult parseInto(Config& cfg, const json::Value& v, bool isProject,
             return typeErr("output_limit", "1024..8388608 bytes");
         cfg.outputLimitBytes = t;
     }
+    for (auto [key, dst] : {std::pair{"disk_budget_gb", &cfg.diskBudgetGb}, std::pair{"disk_reserve_gb", &cfg.diskReserveGb},
+                            std::pair{"max_file_gb", &cfg.maxFileGb}}) {
+        if (!secKey(key)) continue;
+        long g = integer(o.at(key));
+        if (g < 0 || g > 65536) return typeErr(key, "0..65536 GiB (0 = off)");
+        *dst = (int)g;
+    }
     auto strList = [&](const char* k, std::vector<std::string>& dst) -> VoidResult {
         const auto& a = o.at(k);
         if (!a.isArr()) return typeErr(k, "an array of strings");
@@ -460,7 +467,8 @@ VoidResult stageChildConfig(const Config& cfg, const std::string& childHome) {
         {"default_model", model}, {"thinking", cfg.thinking}, {"review", cfg.review}, {"autonomy", cfg.autonomy},
         {"jev", cfg.jev}, {"working_context_tokens", cfg.workingContextTokens},
         {"max_rounds", cfg.maxRounds}, {"bash_timeout", cfg.bashTimeoutSec},
-        {"tool_network", cfg.toolNetwork}, {"output_limit", cfg.outputLimitBytes}, {"expose_env", exposed}};
+        {"tool_network", cfg.toolNetwork}, {"output_limit", cfg.outputLimitBytes}, {"expose_env", exposed},
+        {"disk_budget_gb", cfg.diskBudgetGb}, {"disk_reserve_gb", cfg.diskReserveGb}, {"max_file_gb", cfg.maxFileGb}};
     // The fake HOME is tool-writable. Anchor every parent directory so a model
     // cannot redirect the trusted harness into a symlink outside scratch.
     int fd = open(childHome.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);

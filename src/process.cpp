@@ -2,6 +2,7 @@
 #include "process.h"
 
 #include <algorithm>
+#include <chrono>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -11,7 +12,12 @@
 #include <sys/wait.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
+
+#include <deque>
+#include <mutex>
+#include <thread>
 
 namespace pocket {
 
@@ -41,7 +47,86 @@ void untrackGroup(pid_t pg) {
         if (slot.compare_exchange_strong(cur, 0)) return;
     }
 }
+
+bool anyGroupAlive() {
+    for (auto& slot : g_groups) {
+        pid_t pg = slot.load();
+        if (pg > 0 && groupAlive(pg)) return true;
+    }
+    return false;
+}
+
+std::string gib(int64_t bytes) {
+    char b[32];
+    snprintf(b, sizeof(b), "%.1f GiB", (double)bytes / (1LL << 30));
+    return b;
+}
+
+// Below the reserve a command may still write this much before it is stopped,
+// so short commands keep working on an already tight disk.
+constexpr int64_t kLowDiskSlack = 256LL << 20;
+// Watchdog: below the reserve, this much consumed within kTripWindowMs trips it.
+constexpr int64_t kTripDrop = 1LL << 30;
+constexpr int64_t kTripWindowMs = 30000;
+
+std::atomic<unsigned> g_diskTrips{0};  // bumped each time the watchdog stops the session's groups
+struct Watch {
+    std::mutex m;
+    std::vector<std::string> paths;
+    uint64_t reserve = 0;
+    bool started = false;
+} g_watch;
+
+void watchdogLoop() {
+    std::vector<std::deque<std::pair<int64_t, int64_t>>> hist;  // per path: (ms, avail)
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::vector<std::string> paths;
+        int64_t reserve;
+        {
+            std::lock_guard<std::mutex> lock(g_watch.m);
+            paths = g_watch.paths;
+            reserve = (int64_t)g_watch.reserve;
+        }
+        if (hist.size() != paths.size() || reserve <= 0 || !anyGroupAlive()) {
+            hist.assign(paths.size(), {});
+            continue;
+        }
+        int64_t now = nowMs();
+        bool trip = false;
+        for (size_t i = 0; i < paths.size(); ++i) {
+            int64_t avail = diskAvail(paths[i]);
+            if (avail < 0) continue;
+            auto& h = hist[i];
+            while (!h.empty() && now - h.front().first > kTripWindowMs) h.pop_front();
+            h.emplace_back(now, avail);
+            int64_t peak = 0;
+            for (const auto& [t, a] : h) peak = std::max(peak, a);
+            if (avail < reserve && peak - avail >= kTripDrop) trip = true;
+        }
+        if (trip) {
+            g_diskTrips.fetch_add(1);
+            killSessionProcesses(1000);
+            hist.assign(paths.size(), {});
+        }
+    }
+}
 }  // namespace
+
+int64_t diskAvail(const std::string& path) {
+    struct statvfs sv{};
+    if (path.empty() || statvfs(path.c_str(), &sv) != 0) return -1;
+    return (int64_t)sv.f_bavail * (int64_t)sv.f_frsize;
+}
+
+void startDiskWatchdog(std::vector<std::string> paths, uint64_t reserveBytes) {
+    std::lock_guard<std::mutex> lock(g_watch.m);
+    g_watch.paths = std::move(paths);
+    g_watch.reserve = reserveBytes;
+    if (g_watch.started || reserveBytes == 0) return;
+    g_watch.started = true;
+    std::thread(watchdogLoop).detach();
+}
 
 void killSessionProcesses(long graceMs) {
     bool any = false;
@@ -195,6 +280,10 @@ SpawnResult spawn(const SpawnOpts& opts) {
     bool reaped = false;
     int64_t reapedAt = -1;
 
+    const int64_t diskStart = (opts.diskBudgetBytes || opts.diskReserveBytes) ? diskAvail(opts.diskGuardPath) : -1;
+    int64_t nextDiskCheck = start;
+    const unsigned tripsAtStart = g_diskTrips.load();
+
     auto elapsed = [&]() { return nowMs() - start; };
     auto terminate = [&] {
         if (terminateAt >= 0) return;
@@ -214,6 +303,19 @@ SpawnResult spawn(const SpawnOpts& opts) {
                     r.cancelled = true;
                 terminate();
             }
+        }
+        if (diskStart >= 0 && terminateAt < 0 && nowMs() >= nextDiskCheck) {
+            nextDiskCheck = nowMs() + 250;
+            int64_t avail = diskAvail(opts.diskGuardPath);
+            int64_t used = avail >= 0 ? diskStart - avail : 0;
+            if (opts.diskBudgetBytes && used > (int64_t)opts.diskBudgetBytes)
+                r.diskGuard = "command consumed " + gib(used) + " of disk, over the " +
+                              gib((int64_t)opts.diskBudgetBytes) + " per-command budget";
+            else if (opts.diskReserveBytes && avail >= 0 && avail < (int64_t)opts.diskReserveBytes &&
+                     used > kLowDiskSlack)
+                r.diskGuard = "free disk fell to " + gib(avail) + ", below the " +
+                              gib((int64_t)opts.diskReserveBytes) + " reserve, while the command kept writing";
+            if (!r.diskGuard.empty()) terminate();
         }
         if (terminateAt >= 0 && !killed && nowMs() - terminateAt >= std::clamp(opts.terminateGraceMs, 0L, 5000L)) {
             killed = true;
@@ -305,10 +407,12 @@ SpawnResult spawn(const SpawnOpts& opts) {
     // A group whose members all exited is done; one with a live background
     // member stays tracked so session exit can stop it.
     if (reaped && !groupAlive(pid)) untrackGroup(pid);
+    if (r.diskGuard.empty() && g_diskTrips.load() != tripsAtStart)
+        r.diskGuard = "the session disk watchdog stopped all tool processes: free disk below the reserve and falling";
     if (!reaped) return r;
     if (WIFEXITED(status)) {
         r.exitCode = WEXITSTATUS(status);
-        r.ok = !r.timedOut && !r.cancelled && !(opts.stopOnLimit && r.truncated);
+        r.ok = !r.timedOut && !r.cancelled && r.diskGuard.empty() && !(opts.stopOnLimit && r.truncated);
     } else if (WIFSIGNALED(status)) {
         r.termSig = WTERMSIG(status);
         r.ok = false;
