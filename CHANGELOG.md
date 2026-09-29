@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.11.3
+
+Composer and footer redraw cost, on the path taken for every keystroke and
+every streamed token.
+
+- The wrap loop took a fast path for printable ASCII, skipping the decode, the
+  width lookup and — the expensive part — a `substr` that allocated a fresh
+  `std::string` for **every glyph**. A 200 000-character draft re-wrapped on
+  each keystroke went from 9.7 ms to 3.7 ms, with byte-identical output. Tabs,
+  control bytes and multi-byte or wide characters still take the general path.
+- The footer built its rows once to size the footer and again to draw it, so
+  every redraw wrapped the whole status block twice. It is now built once and
+  passed to the draw.
+- Live process-group tracking grew from 256 to 1024 slots, so a long goal that
+  leaves many dev servers running still has every group reaped on exit.
+- Reading an image over the 5 MiB cap now reports its real size and the limit;
+  it used to say "over 5 MiB or unreadable" for both a too-big and a broken file.
+
+Tests: 345 -> 347. The layout test pins the exact-width wrap, tab stops, control
+bytes and a wide glyph at a wrap boundary; dropping the fast path's trailing
+wrap makes it fail, so it guards the equivalence rather than just passing.
+
 ## 0.11.2
 
 Thread-ownership fix for the TUI footer, and judge registration hardening.

@@ -25,7 +25,14 @@ namespace {
 // Process groups this session started that may still hold members (a tool's
 // backgrounded server outlives its call). Lock-free slots: the fatal-signal
 // path reads them.
-constexpr int kGroupSlots = 256;
+//
+// A slot is held for as long as its group is alive, so this bounds the number
+// of *simultaneously live* groups, not the number of spawns — a long goal that
+// leaves dev servers running across a whole session accumulates them. 1024
+// slots is 4 KiB of static memory and far above any realistic count; a full
+// table still degrades safely (the group is simply not tracked), it just stops
+// being reaped on abnormal exit.
+constexpr int kGroupSlots = 1024;
 std::atomic<pid_t> g_groups[kGroupSlots];
 
 bool groupAlive(pid_t pg) { return kill(-pg, 0) == 0 || errno != ESRCH; }

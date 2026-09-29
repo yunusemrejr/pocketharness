@@ -847,6 +847,19 @@ TuiInputLayout layoutTuiInput(const std::vector<std::string>& lines, size_t row,
                 out.cursorRow = out.rows.size() - 1;
                 out.cursorCol = cell;
             }
+            // Fast path for plain printable ASCII: no decode, no width lookup
+            // and, above all, no substr. The general path allocated a fresh
+            // std::string per glyph, so a large paste cost one heap allocation
+            // per character on every keystroke.
+            unsigned char lead = (unsigned char)text[i];
+            if (lead >= 0x20 && lead < 0x7f) {
+                if (cell + 1 > width) nextRow();
+                out.rows.back() += (char)lead;
+                ++cell;
+                if (cell >= width) nextRow();
+                ++i;
+                continue;
+            }
             size_t end = stepFwd(text, i);
             std::string glyph = text.substr(i, end - i);
             size_t n = glyph == "\t" ? 8 - cell % 8 : visibleWidth(glyph);
@@ -1189,8 +1202,7 @@ struct BottomBar {
         }
         return result;
     }
-    void drawKpi(bool save) {
-        auto lines = statusRows();
+    void drawKpi(bool save, const std::vector<std::string>& lines) {
         std::string out;
         if (save) out += "\0337";
         for (int i = 0; i < footerH; ++i) {
@@ -1205,7 +1217,7 @@ struct BottomBar {
         int64_t now = nowMs();
         if (now - lastKpi < 250) return;
         lastKpi = now;
-        drawKpi(true);  // save/restore: never disturbs the stream cursor
+        drawKpi(true, statusRows());  // save/restore: never disturbs the stream cursor
     }
     void draw() {
         ed->pinned = active;
@@ -1232,7 +1244,10 @@ struct BottomBar {
             cols = c;
             firstDraw = true;
         }
-        footerH = std::min(fixedFooterH ? fixedFooterH : (int)statusRows().size(), std::max(1, rows / 2));
+        // Built once: statusRows() wraps the whole footer, and this draw used
+        // to build it again inside drawKpi on every keystroke and redraw.
+        auto status = statusRows();
+        footerH = std::min(fixedFooterH ? fixedFooterH : (int)status.size(), std::max(1, rows / 2));
         auto view = ed->layout();
         size_t maxH = (size_t)std::max(1, rows - footerH - 4);
         size_t start = view.cursorRow >= maxH ? view.cursorRow - maxH + 1 : 0;
@@ -1253,7 +1268,7 @@ struct BottomBar {
         for (int i = 0; i < inputH && start + (size_t)i < view.rows.size(); ++i)
             out += gotoRc(inputTop + i) + view.rows[start + (size_t)i];
         writeAll(STDOUT_FILENO, out);
-        drawKpi(false);
+        drawKpi(false, status);
         writeAll(STDOUT_FILENO, gotoRc(inputTop + (int)(view.cursorRow - start), (int)view.cursorCol + 1));
         inTranscript = false;
     }

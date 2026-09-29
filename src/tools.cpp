@@ -181,8 +181,14 @@ ToolResult toolRead(ToolEnv& env, const json::Value& args) {
     std::string mime = hn > 0 ? sniffImageMime(std::string_view(head, (size_t)hn)) : "";
     if (!mime.empty()) {
         auto bytes = boxRead(*env.auth, path, kMaxImageBytes);
-        if (!bytes.ok) return {false, "read: image over 5 MiB or unreadable: " + path +
-                                  " (capture smaller: pocket kit shot URL out.png 1280x800; for video use pocket kit vsheet)"};
+        if (!bytes.ok) {
+            struct stat st {};
+            bool tooBig = fstat(fd.value, &st) == 0 && (size_t)st.st_size > kMaxImageBytes;
+            return {false, tooBig ? "read: image is " + std::to_string((long long)st.st_size >> 10) + " KiB, over the " +
+                                        std::to_string(kMaxImageBytes >> 20) + " MiB limit: " + path +
+                                        " (capture smaller: pocket kit shot URL out.png 1280x800; for video use pocket kit vsheet)"
+                                  : "read: cannot read image: " + bytes.error};
+        }
         if (env.viewImages.size() >= kMaxImagesPerMessage) return {false, "read: too many images in one batch"};
         env.viewImages.push_back({mime, base64Encode(bytes.value)});
         emit(env, "view " + path);

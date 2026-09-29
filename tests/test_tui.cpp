@@ -919,6 +919,40 @@ TEST(tui_Long_Streaming_Line_Stays_In_Viewport) {
     return "";
 }
 
+TEST(tui_Editor_Layout_Ascii_Fast_Path_Matches_Decoded_Path) {
+    // Printable ASCII takes a decode-free path; everything else (tabs, control
+    // bytes, multi-byte and wide characters) must still go through the decoder,
+    // and the two must agree on wrapping and cursor placement.
+    const int widths[] = {1, 2, 3, 7, 8, 40};
+    for (int w : widths) {
+        // Exactly filling the width must leave the cursor on the next row.
+        auto exact = layoutTuiInput({std::string((size_t)w, 'a')}, 0, (size_t)w, "", (size_t)w);
+        CHECK(exact.cursorRow == 1 && exact.cursorCol == 0);
+        // A wide (2-cell) glyph at the boundary must not be split.
+        auto wide = layoutTuiInput({std::string((size_t)w - 1, 'a') + "\xe4\xb8\x80"}, 0, (size_t)w + 1, "", (size_t)w);
+        for (const auto& row : wide.rows) CHECK(visibleWidth(row) <= (size_t)w);
+        CHECK(wide.cursorCol <= (size_t)w);
+        // Tab stops still advance to the next multiple of 8 from the cell.
+        auto tab = layoutTuiInput({"a\tb"}, 0, 3, "", 40);
+        CHECK_EQ(tab.rows.size(), (size_t)1);
+        CHECK_EQ(visibleWidth(tab.rows[0]), (size_t)9);
+        // A control byte is not ASCII-printable, so it cannot take the fast
+        // path; sanitizeTerminal drops the escape and its argument first, so
+        // only "a" survives and the cursor lands right after it.
+        auto ctl = layoutTuiInput({"a\x1b" "b"}, 0, 2, "", 40);
+        CHECK_EQ(ctl.rows.size(), (size_t)1);
+        CHECK_EQ(ctl.rows[0], std::string("a"));
+        CHECK(ctl.cursorCol == 1);
+    }
+    // Mixed ASCII and multi-byte across a wrap boundary.
+    auto mixed = layoutTuiInput({"hello \xc3\xa9 world"}, 0, 6, "> ", 9);
+    for (const auto& row : mixed.rows) CHECK(visibleWidth(row) <= 9);
+    CHECK_EQ(mixed.rows[0], std::string("> hello \xc3\xa9"));
+    CHECK_EQ(mixed.cursorRow, (size_t)0);
+    CHECK_EQ(mixed.cursorCol, (size_t)8);  // after "> hello " plus the wide glyph
+    return "";
+}
+
 TEST(tui_Editor_Layout_Wrap_And_Tabs) {
     auto exact = layoutTuiInput({"abcdef"}, 0, 6, "> ", 8);
     CHECK(exact.rows == std::vector<std::string>({"> abcdef", ""}));

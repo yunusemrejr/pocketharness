@@ -71,6 +71,19 @@ TEST(tools_Read_Offset_Past_End_Fails_Without_Scanning) {
     return "";
 }
 
+TEST(tools_Read_Oversize_Image_Reports_Size_Not_A_Vague_Error) {
+    ToolFixture f;
+    CHECK(f.ok);
+    // A PNG signature followed by padding past the 5 MiB image cap.
+    std::string png = "\x89PNG\r\n\x1a\n" + std::string((5u << 20) + 4096, '\0');
+    CHECK(atomicWriteFile(f.ws + "/big.png", png, 0644).ok);
+    ToolResult r = runTool(f.env, "read", R"({"path":"big.png"})");
+    CHECK(!r.ok);
+    CHECK(r.output.find("KiB, over the 5 MiB limit") != std::string::npos);
+    CHECK(r.output.find("unreadable") == std::string::npos);
+    return "";
+}
+
 TEST(tools_Read_Write_Edit) {
     ToolFixture f;
     CHECK(f.ok);
