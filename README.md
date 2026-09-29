@@ -457,7 +457,7 @@ produces precise errors, never silent guesses.
 Built-in providers (just export the key): `openrouter orcarouter deepseek
 friendli together deepinfra cerebras groq mistral xai gemini nvidia
 fireworks moonshot zai agnes atria longcat ollama-cloud qwen runinfra
-streamlake xiaomi stepfun kimi-coding minimax anthropic openai codex`, plus
+streamlake xiaomi stepfun kimi-coding minimax minimax-plan anthropic openai codex`, plus
 local `ollama lmstudio llamacpp`. `codex` uses your ChatGPT login from
 `~/.codex/auth.json` (read-only: run `codex` to refresh it) over the Codex
 Responses API. Use `provider:model-id` directly. The local presets point to loopback

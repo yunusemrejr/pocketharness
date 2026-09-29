@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.0
+
+MiniMax Token Plan support.
+
+- New built-in `minimax-plan` provider: the OpenAI-compatible Token Plan
+  endpoint (`https://api.minimax.io/v1`, key in `MINIMAX_TOKEN_PLAN_API_KEY`).
+  Subscription keys (`sk-cp-...`) are a separate credential from pay-as-you-go
+  `MINIMAX_API_KEY`, so the existing `minimax` Anthropic provider is unchanged.
+  Use `minimax-plan:MiniMax-M3` (1M context) directly, or add aliases for the
+  plan's M-series models with `token_parameter: max_completion_tokens` and
+  `reasoning: none` (MiniMax Chat Completions has no `reasoning_effort` field).
+
 ## 0.10.0
 
 Automatic quality gates: security, backend, performance, DRY, UI slop and SVG.

@@ -63,6 +63,7 @@ Config defaultConfig() {
         {"stepfun", "openai", "https://api.stepfun.ai/step_plan/v1", "STEPFUN_API_KEY"},
         {"kimi-coding", "anthropic", "https://api.kimi.com/coding", "KIMI_API_KEY"},
         {"minimax", "anthropic", "https://api.minimax.io/anthropic", "MINIMAX_API_KEY"},
+        {"minimax-plan", "openai", "https://api.minimax.io/v1", "MINIMAX_TOKEN_PLAN_API_KEY"},
         {"anthropic", "anthropic", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY"},
         {"openai", "openai", "https://api.openai.com/v1", "OPENAI_API_KEY"},
         {"codex", "codex", "https://chatgpt.com/backend-api", ""},  // ChatGPT login (~/.codex/auth.json)

@@ -26,6 +26,25 @@ TEST(config_ResolveModel) {
     return "";
 }
 
+TEST(config_MinimaxPlan_Builtin) {
+    Config c = defaultConfig();
+    // Token Plan subscription keys (sk-cp-...) are a separate credential from
+    // pay-as-you-go MINIMAX_API_KEY, on the OpenAI-compatible /v1 endpoint.
+    auto r = resolveModel(c, "minimax-plan:MiniMax-M3");
+    CHECK(r.ok);
+    CHECK_EQ(r.value.provider.name, std::string("minimax-plan"));
+    CHECK_EQ(r.value.provider.protocol, std::string("openai"));
+    CHECK_EQ(r.value.provider.baseUrl, std::string("https://api.minimax.io/v1"));
+    CHECK_EQ(r.value.provider.keyEnv, std::string("MINIMAX_TOKEN_PLAN_API_KEY"));
+    CHECK_EQ(r.value.model, std::string("MiniMax-M3"));
+    // The pay-as-you-go Anthropic endpoint is unchanged.
+    r = resolveModel(c, "minimax:MiniMax-M3");
+    CHECK(r.ok);
+    CHECK_EQ(r.value.provider.protocol, std::string("anthropic"));
+    CHECK_EQ(r.value.provider.keyEnv, std::string("MINIMAX_API_KEY"));
+    return "";
+}
+
 TEST(config_Loopback_Keyless) {
     CHECK(isLoopbackHttp("http://127.0.0.1:1234/v1"));
     CHECK(isLoopbackHttp("http://localhost:11434/v1"));
