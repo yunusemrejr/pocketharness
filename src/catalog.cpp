@@ -156,10 +156,11 @@ const CatalogModel* catalogFind(const std::vector<CatalogModel>& all, const std:
     return nullptr;
 }
 
-std::string catalogRefresh(const Config& cfg) {
+std::string catalogRefresh(const Config& cfg, std::atomic<bool>* cancel) {
     std::lock_guard<std::mutex> lk(g_refreshMu);
     std::vector<const ProviderCfg*> todo;
     for (const auto& p : cfg.providers) {
+        if (cancel && cancel->load()) return "catalog: cancelled before any provider answered";
         auto k = providerApiKey(p);
         // Loopback daemons are skipped unless running: the probe costs 5s otherwise.
         if (k.ok && !isLoopbackHttp(p.baseUrl) && p.protocol != "codex") todo.push_back(&p);
@@ -167,8 +168,13 @@ std::string catalogRefresh(const Config& cfg) {
     std::vector<std::vector<CatalogModel>> got(todo.size());
     std::vector<std::thread> threads;
     for (size_t i = 0; i < todo.size(); ++i)
-        threads.emplace_back([&, i] { got[i] = parseCatalog(todo[i]->name, fetchModelsBody(*todo[i], 12000)); });
+        threads.emplace_back([&, i] {
+            got[i] = parseCatalog(todo[i]->name, fetchModelsBody(*todo[i], 12000, cancel));
+        });
     for (auto& t : threads) t.join();
+    // A partial refresh is worse than none: rewriting the cache now would drop
+    // listings for every provider the interrupt cut off.
+    if (cancel && cancel->load()) return "catalog: cancelled, cache left unchanged";
     json::Value cache = readCache();
     long now = (long)time(nullptr), models = 0, ok = 0;
     for (size_t i = 0; i < todo.size(); ++i) {
@@ -224,8 +230,8 @@ std::string catalogLabel(const CatalogModel& m) {
     return s;
 }
 
-void catalogApply(const Config& cfg, ResolvedModel& m) {
-    auto all = catalogLoad(cfg);
+void catalogApplyFrom(const Config& cfg, const std::vector<CatalogModel>& all, ResolvedModel& m,
+                      std::atomic<bool>* cancel) {
     const CatalogModel* c = catalogFind(all, m.provider.name, m.model);
     bool pinned = hasExplicitContext(cfg, m.provider.name, m.model);
     if (c && c->reasoning == 0 && m.options.reasoning == "auto") m.options.reasoning = "none";
@@ -233,8 +239,14 @@ void catalogApply(const Config& cfg, ResolvedModel& m) {
     if (c) m.inPrice = c->inPrice, m.outPrice = c->outPrice;
     if (pinned) return;
     if (c && c->context > 0) { m.context = c->context; return; }
-    long live = fetchModelContext(m.provider, m.model);
+    // The catalog did not know this model, so ask the provider directly. That
+    // is a blocking network call: honour cancel so a UI can escape it.
+    long live = fetchModelContext(m.provider, m.model, cancel);
     if (live > 0) m.context = live;
+}
+
+void catalogApply(const Config& cfg, ResolvedModel& m, std::atomic<bool>* cancel) {
+    catalogApplyFrom(cfg, catalogLoad(cfg), m, cancel);
 }
 
 }  // namespace pocket

@@ -283,6 +283,26 @@ TEST(tui_Followup_Typed_During_Response) {
     return "";
 }
 
+TEST(tui_Multibyte_Split_Across_Writes_Is_Not_Split_Again) {
+    TuiFixture t;
+    CHECK(t.ready());
+    // A multi-byte character split across two writes used to reach the editor
+    // as a lone lead byte, so a cursor command in the next read landed inside
+    // the sequence and corrupted it.
+    CHECK(t.send("\xc3"));
+    CHECK(t.send("\xa9ok\r"));
+    CHECK(t.waitFor("REPLY:\"\xc3\xa9ok\""));
+    // The 3-byte and 4-byte forms must survive the same split.
+    CHECK(t.send("\xe2"));
+    CHECK(t.send("\x82\xacok\r"));
+    CHECK(t.waitFor("REPLY:\"\xe2\x82\xacok\""));
+    CHECK(t.send("\xf0\x9f"));
+    CHECK(t.send("\x98\x80ok\r"));
+    CHECK(t.waitFor("REPLY:\"\xf0\x9f\x98\x80ok\""));
+    CHECK(t.quit());
+    return "";
+}
+
 TEST(tui_Paste_Multiline_And_Command_Boundary) {
     TuiFixture t;
     CHECK(t.ready());

@@ -206,13 +206,16 @@ Result<std::string> httpRequest(const std::string& url, const std::string& secre
 std::string providerAuthHeader(const ProviderCfg& prov, const std::string& key);
 // Raw GET {base}/models body, cached per endpoint/auth ("" on failure).
 // Successes expire after 10 minutes; transient failures after 5 seconds.
-std::string fetchModelsBody(const ProviderCfg& prov, long timeoutMs);
+// `cancel` aborts the in-flight probe so a blocked UI stays interruptible.
+std::string fetchModelsBody(const ProviderCfg& prov, long timeoutMs,
+                            std::atomic<bool>* cancel = nullptr);
 // Apply one learned quirk (see brain.h) to model options.
 void applyQuirk(ModelOptions& o, const std::string& quirk);
 
 // Live context window via GET {base}/models, cached per process. Secret
 // staging is internal (parent-only dir); needs no caller tmp dir.
 // -1 on any failure (offline, auth, unpublished id): callers keep static.
-long fetchModelContext(const ProviderCfg& prov, const std::string& modelId);
+long fetchModelContext(const ProviderCfg& prov, const std::string& modelId,
+                       std::atomic<bool>* cancel = nullptr);
 
 }  // namespace pocket

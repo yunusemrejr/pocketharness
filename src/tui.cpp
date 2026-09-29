@@ -1628,15 +1628,21 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
     cancel.store(false);
     agent.setGoalYield([&] { return queuedReady.load(); });
     int64_t lastStatus = 0;
+    // Only the thread running the turn may snapshot Agent. It owns messages_,
+    // stats_ and goal_, so it is the sole thread that can read them safely.
+    // /double runs tools on two evidence workers and the reconcile pass streams
+    // on a third, and those reach the same callbacks: snapshotting from there
+    // races the turn thread over std::string and std::variant members, which
+    // crashes rather than merely showing a wrong number.
+    std::thread::id turnThread;
     auto updateStatus = [&](bool force = false) {
+        if (std::this_thread::get_id() != turnThread) return;
         int64_t now = nowMs();
         if (force || now - lastStatus >= 250) {
             lastStatus = now;
             post(Kind::Status, kpiText(opts, agent, termWidth()), goalDescription(agent));
         }
     };
-    // These callbacks execute only on the agent worker. Agent stats and goal
-    // strings are therefore never read concurrently by the editor thread.
     agent.setCallbacks(
         [&](std::string_view text) { if (!cancel.load()) post(Kind::Token, std::string(text)); updateStatus(); },
         // Notices may announce a lifecycle transition. Publish its snapshot
@@ -1670,6 +1676,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
         return events.approval > 0 && !cancel.load();
     };
     std::thread worker([&] {
+        turnThread = std::this_thread::get_id();  // the only thread allowed to snapshot
         std::string error;
         try { error = resume ? agent.resumeGoal(input) : goal ? agent.runGoal(input) : agent.runTurn(input); }
         catch (const std::exception& e) { error = e.what(); }
@@ -2191,8 +2198,11 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             return;
         }
         if (!hasExplicitContext(*opts.cfg, rm.value.provider.name, rm.value.model)) {
+            // The probe is a blocking network call; Ctrl-C reaches it through
+            // the gate's cancel instead of waiting out the 5s timeout.
             InputGate gate(g_approval ? g_approval->in : nullptr);
-            long live = fetchModelContext(rm.value.provider, rm.value.model);
+            auto* probeCancel = g_approval && g_approval->in ? g_approval->in->cancel : nullptr;
+            long live = fetchModelContext(rm.value.provider, rm.value.model, probeCancel);
             if (live > 0) rm.value.context = live;
         }
         if (!opts.sessionId.empty()) {
@@ -2274,9 +2284,20 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             return true;
         }
         std::string roleName = kRoles[r.index];
-        std::string spec = specArg.empty() ? pickModel(roleName + " model · type to search " + std::to_string(catalogLoad(*opts.cfg).size()) +
-                                         " catalog models (provider:model works too)",
-                                     "", roleName != "main", roleName == "review") : specArg;
+        // One catalog read serves the picker title and every model below; the
+        // council path used to re-read and re-parse the whole cache per model.
+        std::vector<CatalogModel> catalog;
+        bool catalogLoaded = false;
+        auto ensureCatalog = [&] {
+            if (!catalogLoaded) { catalog = catalogLoad(*opts.cfg); catalogLoaded = true; }
+        };
+        std::string spec = specArg;
+        if (specArg.empty()) {
+            ensureCatalog();
+            spec = pickModel(roleName + " model · type to search " + std::to_string(catalog.size()) +
+                                 " catalog models (provider:model works too)",
+                             "", roleName != "main", roleName == "review");
+        }
         if (spec.empty()) { say("(cancelled)\n"); return true; }
         if (spec == "-" && roleName == "main") { say("main role cannot be cleared\n"); return true; }
         if (roleName != "review" && spec.find(',') != std::string::npos) {
@@ -2285,13 +2306,18 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         }
         std::vector<ResolvedModel> resolved;
         if (spec != "-") {
+            // Resolving an unknown model can block on a live /models probe, so
+            // the gate is what makes Ctrl-C reach it instead of freezing.
+            InputGate gate(g_approval ? g_approval->in : nullptr);
+            auto* probeCancel = g_approval && g_approval->in ? g_approval->in->cancel : nullptr;
+            ensureCatalog();
             std::string selections = spec;
             std::replace(selections.begin(), selections.end(), ',', '\n');
             for (const std::string& one : splitLines(selections)) {
                 if (trim(one).empty()) { say("empty model in selection\n"); return true; }
                 auto rm = resolveModel(*opts.cfg, trim(one));
                 if (!rm.ok) { say("error: " + rm.error + "\n"); return true; }
-                catalogApply(*opts.cfg, rm.value);
+                catalogApplyFrom(*opts.cfg, catalog, rm.value, probeCancel);
                 resolved.push_back(rm.value);
             }
         }
@@ -2339,7 +2365,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
     if (cmd == "catalog") {
         InputGate gate(g_approval ? g_approval->in : nullptr);
         say("refreshing catalog from every keyed provider...\n");
-        say(catalogRefresh(*opts.cfg) + "\n");
+        say(catalogRefresh(*opts.cfg, g_approval && g_approval->in ? g_approval->in->cancel : nullptr) + "\n");
         return true;
     }
     if (cmd == "thinking") {
@@ -2510,6 +2536,27 @@ int tuiRun(TuiOpts& opts) {
     SharedInput shared;
     shared.cancel = &cancel;
     std::thread watcher(watcherMain, &shared);
+    // Every exit path must restore the terminal and join the watcher. A
+    // joinable std::thread unwinds into std::terminate, and a live join or a
+    // throw past the normal tail would leave the scroll region and bracketed
+    // paste set, which the user has to clear with `reset` by hand.
+    struct Restore {
+        SharedInput& shared;
+        std::thread& watcher;
+        BottomBar& bar;
+        TermGuard& term;
+        ~Restore() {
+            shared.stop.store(true);
+            shared.cv.notify_all();
+            if (watcher.joinable()) watcher.join();
+            g_approval = nullptr;
+            bar.teardown();
+            writeAll(STDOUT_FILENO, "\033[?2004l");
+            term.leave();
+            g_term = nullptr;
+            writeAll(STDOUT_FILENO, "\n");
+        }
+    } restore{shared, watcher, bar, term};
     ApprovalCtx actx{&shared};
     g_approval = &actx;
     opts.tools->askApproval = [&](const std::string& cmd, const std::string& reason) {
@@ -2632,16 +2679,7 @@ int tuiRun(TuiOpts& opts) {
         }
     }
 
-    shared.stop.store(true);
-    shared.cv.notify_all();
-    if (watcher.joinable()) watcher.join();
-    g_approval = nullptr;
-    bar.teardown();
-    writeAll(STDOUT_FILENO, "\033[?2004l");
-    term.leave();
-    g_term = nullptr;
-    writeAll(STDOUT_FILENO, "\n");
-    return rc;
+    return rc;  // restore{} performs the teardown above on this and every other path
 }
 
 int lineRun(TuiOpts& opts) {

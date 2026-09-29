@@ -33,7 +33,7 @@ const CatalogModel* catalogFind(const std::vector<CatalogModel>& all, const std:
 // the cache. Providers that fail keep their previous entries. Returns a
 // one-line summary. The async variant (a detached `pocket --refresh-catalog`
 // process) runs only when the cache is >24h old.
-std::string catalogRefresh(const Config& cfg);
+std::string catalogRefresh(const Config& cfg, std::atomic<bool>* cancel = nullptr);
 void catalogRefreshIfStale(const Config& cfg);
 
 // "provider:id  256k  $0.30/$1.20  think vision" for pickers.
@@ -41,6 +41,10 @@ std::string catalogLabel(const CatalogModel& m);
 
 // Refine a resolved model from the catalog: live context (unless pinned in
 // config) and reasoning=none when the provider says the model can't think.
-void catalogApply(const Config& cfg, ResolvedModel& m);
+void catalogApply(const Config& cfg, ResolvedModel& m, std::atomic<bool>* cancel = nullptr);
+// Same, against an already-loaded catalog. Assigning a council re-reads and
+// re-parses the whole cache per model without this.
+void catalogApplyFrom(const Config& cfg, const std::vector<CatalogModel>& all, ResolvedModel& m,
+                      std::atomic<bool>* cancel);
 
 }  // namespace pocket

@@ -3,6 +3,7 @@
 
 #include <signal.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
 
@@ -189,6 +190,15 @@ ToolResult toolRead(ToolEnv& env, const json::Value& args) {
                           " bytes — attached to the next message for visual inspection"};
     }
     size_t cap = env.cfg ? env.cfg->outputLimitBytes : 262144;
+    // A line number can never exceed the byte count, so an offset past the file
+    // size is unsatisfiable. Saying so now saves scanning the whole 64 MiB
+    // budget first just to report "offset beyond EOF".
+    if (offset > 1) {
+        struct stat st {};
+        if (fstat(fd.value, &st) == 0 && st.st_size > 0 && (long long)offset > (long long)st.st_size)
+            return {false, "read: offset " + std::to_string(offset) + " is past the end of " + path + " (" +
+                              std::to_string((long long)st.st_size) + " bytes)"};
+    }
     std::string out = path + " (from line " + std::to_string(offset) + "):\n";
     long line = 1, emitted = 0;
     size_t scanned = 0;

@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.11.1
+
+TUI robustness and interruptibility, plus catalog and transport cleanups.
+
+Session flow:
+
+- The TUI now restores the terminal on *every* exit path, including an
+  exception. A throw used to unwind past the teardown tail and leave the
+  scroll region and bracketed paste set, and a joinable watcher thread
+  unwound straight into `std::terminate`. Both now run through one guard.
+- The status/KPI snapshot is taken only on the thread running the turn, which
+  owns `messages_`, the stats and the goal string. `/double` runs tools on two
+  evidence workers and the reconcile pass streams on a third, and those reach
+  the same callbacks: snapshotting from them raced the turn thread over
+  `std::string` and `std::variant` members, which can abort the process.
+- `/models <role> <specs>` no longer freezes. Resolving an unknown model can
+  block on a live `GET /models` probe and the command had no input gate at
+  all, so the TUI looked dead for up to 5s per model with no way out.
+- `/catalog` and the model probe honour Ctrl-C. Both take the gate's cancel
+  flag, so an interrupt aborts the in-flight request instead of waiting out the
+  12s per-provider timeout. An interrupted refresh leaves the cache unchanged
+  rather than rewriting it from a partial answer.
+
+Efficiency:
+
+- Assigning a role reads and parses the model catalog once instead of once per
+  selected model (plus once more for the picker title). A three-model review
+  council did four full parses before the first prompt.
+- `spawn` claims a process-group slot without syscalls. Pruning dead groups
+  costs one `kill(2)` per occupied slot and ran on every spawn, putting ~512
+  syscalls between each tool launch and its first poll; it now only runs when
+  the table is actually full.
+- The Codex backend read and parsed `~/.codex/auth.json` and decoded a JWT
+  twice per request, once inside `providerApiKey` and again for the account id.
+
+Correctness:
+
+- `read` with an offset past the end of a file now fails immediately with the
+  file size. A line number can never exceed the byte count, so the request was
+  already unsatisfiable, but it scanned the whole 64 MiB budget first just to
+  report "offset beyond EOF".
+
+Tests: 341 -> 343.
+
 ## 0.11.0
 
 MiniMax Token Plan support, plus goal-flow and session-flow fixes.

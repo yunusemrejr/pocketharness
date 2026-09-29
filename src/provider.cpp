@@ -959,10 +959,11 @@ std::string providerAuthHeader(const ProviderCfg& prov, const std::string& key) 
     return prov.protocol == "anthropic" ? "x-api-key: " + key : "Authorization: Bearer " + key;
 }
 
-std::string fetchModelsBody(const ProviderCfg& prov, long timeoutMs) {
+std::string fetchModelsBody(const ProviderCfg& prov, long timeoutMs, std::atomic<bool>* cancel) {
     struct Entry { std::string body; int64_t expires; };
     static std::map<std::string, Entry> cache;
     static std::mutex mu;
+    if (cancel && cancel->load()) return "";
     auto k = providerApiKey(prov);
     if (!k.ok) return "";  // an unset key must not poison later authenticated discovery
     std::string key = json::stringify(json::Array{stateDir(), prov.baseUrl, prov.protocol, prov.keyEnv, k.value});
@@ -976,7 +977,7 @@ std::string fetchModelsBody(const ProviderCfg& prov, long timeoutMs) {
         std::vector<std::string> hdrs;
         if (prov.protocol == "anthropic") hdrs.push_back("anthropic-version: 2023-06-01");
         auto r = httpRequest(joinUrl(prov.baseUrl, "/models"), providerAuthHeader(prov, k.value),
-                             "", timeoutMs, hdrs);
+                             "", timeoutMs, hdrs, cancel);
         if (r.ok) catalog = std::move(r.value);
     }
     std::lock_guard<std::mutex> lk(mu);
@@ -991,19 +992,32 @@ std::string fetchModelsBody(const ProviderCfg& prov, long timeoutMs) {
     return catalog;
 }
 
-long fetchModelContext(const ProviderCfg& prov, const std::string& modelId) {
-    return parseModelsContext(fetchModelsBody(prov, 5000), modelId);
+long fetchModelContext(const ProviderCfg& prov, const std::string& modelId, std::atomic<bool>* cancel) {
+    return parseModelsContext(fetchModelsBody(prov, 5000, cancel), modelId);
 }
 
 Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks& cb) {
     const std::string& proto = req.model.provider.protocol;
     if (proto != "openai" && proto != "anthropic" && proto != "codex")
         return Result<ChatResponse>::Err("unsupported protocol");
-    auto key = providerApiKey(req.model.provider);
-    if (!key.ok) return Result<ChatResponse>::Err(key.error);
+    // providerApiKey already reads and parses the Codex credentials to get its
+    // token; asking again for the account id doubled a file read plus a JWT
+    // decode on every single Codex request.
     bool isCodex = proto == "codex";
+    CodexAuth codex;
+    Result<std::string> key;
+    if (isCodex) {
+        auto a = codexAuth();
+        if (!a.ok) return Result<ChatResponse>::Err(a.error);
+        codex = a.value;
+        key = Result<std::string>::Ok(a.value.token);
+    } else {
+        key = providerApiKey(req.model.provider);
+        if (!key.ok) return Result<ChatResponse>::Err(key.error);
+    }
     bool stream = req.stream || isCodex;  // the Codex backend only streams
-    std::string accountId = isCodex ? codexAuth().value.accountId : "";
+    static const std::string kNoAccount;  // only the Codex backend carries one
+    const std::string& accountId = isCodex ? codex.accountId : kNoAccount;
 
     bool isOpenAi = proto == "openai";
     json::Value body = isOpenAi ? buildOpenAiBody(req) : isCodex ? buildCodexBody(req) : buildAnthropicBody(req);

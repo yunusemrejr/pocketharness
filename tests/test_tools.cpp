@@ -53,6 +53,24 @@ struct ToolFixture {
 };
 }  // namespace
 
+TEST(tools_Read_Offset_Past_End_Fails_Without_Scanning) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(runTool(f.env, "write", R"({"path":"small.txt","content":"a\nb\nc\n"})").ok);
+    // A line number can never exceed the byte count, so this is unsatisfiable
+    // and must be reported without walking the whole scan budget first.
+    ToolResult r = runTool(f.env, "read", R"({"path":"small.txt","offset":1000000})");
+    CHECK(!r.ok);
+    CHECK(r.output.find("past the end") != std::string::npos);
+    // A satisfiable offset near the end still works.
+    r = runTool(f.env, "read", R"({"path":"small.txt","offset":3,"limit":1})");
+    CHECK(r.ok && r.output.find("3| c") != std::string::npos);
+    // The last valid line number is still accepted.
+    r = runTool(f.env, "read", R"({"path":"small.txt","offset":3,"limit":5})");
+    CHECK(r.ok && r.output.find("3| c") != std::string::npos);
+    return "";
+}
+
 TEST(tools_Read_Write_Edit) {
     ToolFixture f;
     CHECK(f.ok);

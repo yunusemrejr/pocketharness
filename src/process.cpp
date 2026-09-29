@@ -31,14 +31,23 @@ std::atomic<pid_t> g_groups[kGroupSlots];
 bool groupAlive(pid_t pg) { return kill(-pg, 0) == 0 || errno != ESRCH; }
 
 void trackGroup(pid_t pg) {
-    for (auto& slot : g_groups) {  // prune dead groups first: pgids get reused
+    // Claim a free slot with no syscalls first. Pruning costs one kill(2) per
+    // occupied slot, and doing that on every spawn put ~512 syscalls between
+    // each tool launch and its first poll.
+    auto claim = [&] {
+        for (auto& slot : g_groups) {
+            pid_t empty = 0;
+            if (slot.compare_exchange_strong(empty, pg)) return true;
+        }
+        return false;
+    };
+    if (claim()) return;
+    // Table full: reclaim slots whose group is gone (pgids get reused).
+    for (auto& slot : g_groups) {
         pid_t old = slot.load();
         if (old > 0 && !groupAlive(old)) slot.compare_exchange_strong(old, 0);
     }
-    for (auto& slot : g_groups) {
-        pid_t empty = 0;
-        if (slot.compare_exchange_strong(empty, pg)) return;
-    }
+    claim();  // still full only with 256 genuinely live groups
 }
 
 void untrackGroup(pid_t pg) {
