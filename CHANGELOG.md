@@ -2,7 +2,7 @@
 
 ## 0.11.0
 
-MiniMax Token Plan support.
+MiniMax Token Plan support, plus goal-flow and session-flow fixes.
 
 - New built-in `minimax-plan` provider: the OpenAI-compatible Token Plan
   endpoint (`https://api.minimax.io/v1`, key in `MINIMAX_TOKEN_PLAN_API_KEY`).
@@ -11,6 +11,44 @@ MiniMax Token Plan support.
   Use `minimax-plan:MiniMax-M3` (1M context) directly, or add aliases for the
   plan's M-series models with `token_parameter: max_completion_tokens` and
   `reasoning: none` (MiniMax Chat Completions has no `reasoning_effort` field).
+
+Goal completion:
+
+- The deliverable gate no longer forges artifacts. A format only counts as a
+  requested output when it is in an output position — trailing ("as mp4"),
+  after an output preposition ("to svg"), or heading an artifact noun ("a pdf
+  report") — and goals that produce source ("write a script that converts webm
+  to mp4", "add an mp4 export button") are exempt. Previously those goals were
+  pushed into creating files they never asked for, littering the workspace.
+- The gate is evaluated once per goal instead of on every audit cycle, which
+  repeated a full recursive workspace walk (up to 20k entries) for nothing.
+
+Session flow:
+
+- Line mode (piped or redirected I/O) handles Ctrl-C. The first interrupt asks
+  for a graceful cancel so the turn unwinds, usage is flushed and tool children
+  are reaped; a second restores the default action to escape a wedged turn.
+  Previously the default action killed the process mid-turn.
+- Keystrokes typed while a tool-approval prompt is up are no longer discarded.
+  Typeahead is re-queued so a buffered "yes do X" stays a follow-up and a
+  message started mid-prompt survives.
+
+Correctness:
+
+- `${TMPDIR}/x`, `$TMPDIR/x` and a bare `$TMPDIR` all expand to the session
+  scratch path. Previously only the bare form matched, so the others resolved
+  inside the workspace and created a literal `$TMPDIR` directory in the repo.
+- `ensureDir` separates every path component. A one-character prefix was never
+  followed by a separator, so `a/b` created `a` and then `ab`.
+- Serialising a JSON number no longer casts out-of-range doubles to `long long`
+  (undefined behaviour, reachable from any large number in a provider reply).
+- `spawn` skips a failed `poll` before reading `revents`, which was undefined
+  on any non-`EINTR` error.
+- Overwriting a file larger than 4 MiB now says so. The undo pre-image is not
+  captured at that size, and the result previously implied `/undo` could
+  restore the original.
+- A signal during the session-listing preview read no longer makes a session
+  vanish from `--sessions`.
 
 ## 0.10.0
 

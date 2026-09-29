@@ -1378,19 +1378,56 @@ std::string missingDeliverables(const std::string& goal, const std::string& work
                                            "docx", "xlsx", "pptx", "wav", "mp3", "zip"};
     static const char* const kMakers[] = {"save", "export", "render", "create", "make", "produce", "generate",
                                           "write", "deliver", "output", "build", "record"};
+    // A goal that produces source names file formats incidentally ("converts
+    // webm to mp4", "a png logo"). Forcing an artifact there forges work the
+    // goal never asked for and litters the workspace, so code goals are exempt.
+    static const char* const kCode[] = {"script", "parser", "parse", "converter", "convert", "code", "function",
+                                        "class", "method", "api", "endpoint", "unit", "test", "bug", "crash",
+                                        "player", "library", "package", "module", "handler", "reader", "writer",
+                                        "loader", "decoder", "encoder", "refactor", "support", "button", "app",
+                                        "server", "cli", "sdk", "tool", "shell", "bash", "python", "node"};
+    // A format is a requested artifact only in an output position: it ends the
+    // goal ("as mp4" / a trailing "mp4"), follows an output preposition
+    // ("as"/"to"/"into"/"format"), or heads an artifact noun ("a pdf report").
+    // Anywhere else it is subject matter the goal merely mentions.
+    static const char* const kOutputPos[] = {"as", "to", "into", "format"};
+    static const char* const kArtifacts[] = {"file", "files", "video", "videos", "clip", "clips", "image",
+                                             "images", "picture", "pictures", "photo", "photos", "graphic",
+                                             "graphics", "chart", "charts", "report", "reports", "document",
+                                             "documents", "animation", "animations", "render", "renders",
+                                             "track", "audio", "sheet", "sheets", "deck", "slides", "archive"};
     const std::string low = toLower(goal);
+    std::vector<std::string> toks;
     std::set<std::string> words;
     std::string w;
     for (size_t i = 0; i <= low.size(); ++i) {
         if (i < low.size() && ((low[i] >= 'a' && low[i] <= 'z') || (low[i] >= '0' && low[i] <= '9'))) { w += low[i]; continue; }
-        if (!w.empty()) words.insert(w);
+        if (!w.empty()) { words.insert(w); toks.push_back(w); }
         w.clear();
     }
     bool makes = false;
     for (const char* m : kMakers) makes = makes || words.count(m) || words.count(std::string(m) + "d");
     if (!makes || workspace.empty()) return "";
+    // Accept singular or plural so "scripts"/"tests"/"buttons" still exempt.
+    for (const auto& t : toks) {
+        std::string stem = t.size() > 1 && t.back() == 's' ? t.substr(0, t.size() - 1) : t;
+        for (const char* c : kCode) if (stem == c) return "";
+    }
+    auto isFormat = [&](const std::string& t) {
+        for (const char* f : kFormats) if (t == f) return true;
+        return false;
+    };
     std::vector<std::string> wanted;
-    for (const char* f : kFormats) if (words.count(f)) wanted.push_back(f);
+    for (size_t i = 0; i < toks.size(); ++i) {
+        if (!isFormat(toks[i])) continue;
+        bool outputPos = i + 1 == toks.size();
+        if (!outputPos && i > 0)
+            for (const char* p : kOutputPos) if (toks[i - 1] == p) { outputPos = true; break; }
+        if (!outputPos && i + 1 < toks.size())
+            for (const char* a : kArtifacts) if (toks[i + 1] == a) { outputPos = true; break; }
+        if (outputPos && std::find(wanted.begin(), wanted.end(), toks[i]) == wanted.end())
+            wanted.push_back(toks[i]);
+    }
     if (wanted.empty()) return "";
     std::map<std::string, std::string> firstBad;
     std::set<std::string> found;
@@ -2382,9 +2419,13 @@ std::string Agent::continueGoal(int maxCycles) {
         if (goalYield_ && goalYield_()) return finishGoal("", false, "yielded");
         bool hookFailed = false;
         if (!deliverableChecked_) {
+            // Checked once per goal. Re-walking the workspace (up to 20k entries)
+            // on every later cycle bought nothing: a gap already flips the flag,
+            // and a pass is not invalidated by the agent's later edits — the
+            // evidence auditor re-checks the goal itself.
+            deliverableChecked_ = true;
             const std::string gap = missingDeliverables(goal_, opts_.tools ? opts_.tools->workspace : "");
             if (!gap.empty()) {
-                deliverableChecked_ = true;
                 goalPhase_ = "work";
                 goalNext_ = continuation() + "\n[goal audit] " + gap + "\nProduce it, or say exactly why that format is impossible, then verify the file itself (open/probe it).";
                 saveStats();

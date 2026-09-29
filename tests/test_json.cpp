@@ -104,3 +104,22 @@ TEST(json_Serialize_Only_Unicode_Scalars) {
     CHECK_EQ(stringify(Value(std::string("a\0b", 3))), std::string("\"a\\u0000b\""));
     return "";
 }
+
+TEST(json_Serialize_Numbers_Outside_Long_Long_Stay_Finite) {
+    // Casting a huge double to long long is undefined behaviour, so the range
+    // guard must run before the cast, not after it. These arrive from any
+    // provider that echoes a large numeric field back.
+    for (const char* text : {"1e300", "-1e300", "1e308", "1e17"}) {
+        auto p = parse(text);
+        CHECK(p.ok);
+        std::string out = stringify(p.value);
+        CHECK(out.find("inf") == std::string::npos);
+        CHECK(out.find("nan") == std::string::npos);
+        CHECK(!out.empty());
+    }
+    // In-range integers still serialize as plain integers, not 1e+15.
+    CHECK_EQ(stringify(parse("42").value), std::string("42"));
+    CHECK_EQ(stringify(parse("-42").value), std::string("-42"));
+    CHECK_EQ(stringify(parse("0").value), std::string("0"));
+    return "";
+}

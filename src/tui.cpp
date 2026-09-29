@@ -103,6 +103,19 @@ void onTstp(int) {
     g_tstp = 1;
 }
 
+// Line mode has no in-band Ctrl-C handling, so the default action kills the
+// process mid-turn: no usage flush, no child cleanup, and a session file left
+// claiming to be active. The first interrupt asks for a graceful cancel and
+// lets the turn unwind; a second restores the default so a wedged turn can
+// still be escaped by hand.
+std::atomic<bool>* g_lineCancel = nullptr;
+void onLineInterrupt(int sig) {
+    int saved = errno;
+    if (g_lineCancel && !g_lineCancel->exchange(true)) { errno = saved; return; }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 struct SignalGuard {
     static constexpr int signals[] = {SIGINT, SIGTERM, SIGHUP, SIGPIPE, SIGWINCH, SIGTSTP};
     struct sigaction previous[std::size(signals)] {};
@@ -1744,9 +1757,15 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
             if (consumed) draw();
             return consumed;
         }
-        for (char c : chunk) {
+        // Typeahead typed while the prompt is up is never thrown away. The bytes
+        // are re-queued so the next line edit sees them: a buffered "yes do X"
+        // must stay a follow-up, and a message started mid-prompt must survive.
+        std::string leftover;
+        for (size_t i = 0; i < chunk.size(); ++i) {
+            char c = chunk[i];
             int answer = c == 'y' || c == 'Y' ? 1 : c == 'n' || c == 'N' || c == '\r' || c == '\n' || c == 0x1b || c == 3 || c == 4 ? -1 : 0;
-            if (!answer) continue;
+            if (!answer) { leftover += c; continue; }
+            leftover.append(chunk, i + 1, std::string::npos);
             if (c == 0x1b || c == 3 || c == 4) interrupt();
             {
                 std::lock_guard<std::mutex> lock(events.mu);
@@ -1759,6 +1778,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
             draw();
             break;
         }
+        if (!leftover.empty()) g_stdinPend = leftover + g_stdinPend;
         return true;
     };
     bool exitFlag = false;
@@ -2632,6 +2652,22 @@ int lineRun(TuiOpts& opts) {
     std::atomic<bool> cancel{false};
     opts.tools->cancel = &cancel;
     agent.setCancel(&cancel);
+    struct LineSignals {
+        std::atomic<bool>* prev;
+        struct sigaction old {};
+        LineSignals(std::atomic<bool>& c) : prev(g_lineCancel) {
+            g_lineCancel = &c;
+            struct sigaction sa{};
+            sa.sa_handler = onLineInterrupt;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = 0;  // no SA_RESTART: a blocking read must return EINTR
+            sigaction(SIGINT, &sa, &old);
+        }
+        ~LineSignals() {
+            g_lineCancel = prev;
+            sigaction(SIGINT, &old, nullptr);
+        }
+    } lineSignals{cancel};
     struct ResetCallbacks {
         Agent& agent;
         ToolEnv& tools;

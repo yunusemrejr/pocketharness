@@ -244,8 +244,12 @@ ToolResult toolWrite(ToolEnv& env, const json::Value& args) {
     r.ok = true;
     rememberUndo(env, path, old, existed, content);
     close(lease.fd); lease.fd = -1;  // hooks may launch a recursive Pocket
-    r.output = "wrote " + path + " (" + std::to_string(content.size()) + " bytes)" +
-               afterChange(env, path, content);
+    r.output = "wrote " + path + " (" + std::to_string(content.size()) + " bytes)";
+    // The pre-image is only read up to 4 MiB. Overwriting a larger existing
+    // file is unrecoverable, and saying nothing would leave the model
+    // believing /undo can bring the original back.
+    if (existed && !old.ok) r.output += " [no undo pre-image: previous content exceeded 4 MiB]";
+    r.output += afterChange(env, path, content);
     return r;
 }
 
@@ -674,9 +678,22 @@ ToolResult runTool(ToolEnv& env, const std::string& name, const std::string& arg
     // model was never offered is refused here, not just filtered upstream.
     if (env.readOnly && name != "read" && name != "bash")
         return {false, name + " is unavailable in a read-only evidence pass"};
-    if ((name == "read" || name == "write" || name == "edit") && startsWith(args.at("path").asStr(), "$TMPDIR/")) {
-        if (env.sessionTmp.empty()) return {false, "session scratch unavailable"};
-        args.asObj()["path"] = env.sessionTmp + "/" + args.at("path").asStr().substr(8);
+    if (name == "read" || name == "write" || name == "edit") {
+        // Models write $TMPDIR, ${TMPDIR} and a bare $TMPDIR interchangeably.
+        // Every spelling must expand here: passed through verbatim it resolves
+        // inside the workspace and litters the user's repository with a
+        // literal "$TMPDIR" directory that then shows up in git status.
+        const std::string p = args.at("path").asStr();
+        std::string rest;
+        bool scratch = true;
+        if (startsWith(p, "${TMPDIR}")) rest = p.substr(9);
+        else if (startsWith(p, "$TMPDIR/")) rest = p.substr(8);
+        else if (p == "$TMPDIR") rest.clear();
+        else scratch = false;
+        if (scratch) {
+            if (env.sessionTmp.empty()) return {false, "session scratch unavailable"};
+            args.asObj()["path"] = rest.empty() ? env.sessionTmp : env.sessionTmp + "/" + rest;
+        }
     }
     ToolResult done;
     bool dispatched = true;

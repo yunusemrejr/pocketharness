@@ -434,7 +434,8 @@ void writeValue(std::string& out, const Value& v, int indent, int cur) {
         out += std::get<bool>(v.data) ? "true" : "false";
     } else if (v.isNum()) {
         double d = std::get<double>(v.data);
-        if (std::isfinite(d) && d == (long long)d && d < 1e15 && d > -1e15) {
+        // Range-check before the cast: (long long)1e300 is undefined behaviour.
+        if (std::isfinite(d) && d > -1e15 && d < 1e15 && d == (long long)d) {
             out += std::to_string((long long)d);
         } else if (std::isfinite(d)) {
             char buf[32];

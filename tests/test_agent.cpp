@@ -2833,6 +2833,65 @@ TEST(agent_Missing_Deliverables_Checks_Named_Format) {
     CHECK(ensureDir(ws + "/build", 0755).ok);
     CHECK(atomicWriteFile(ws + "/build/real.mp4", std::string("\0\0\0\x18" "ftypisom", 12) + std::string(40, 'x'), 0644).ok);
     CHECK(missingDeliverables("save as mp4", ws).empty());
+    // A format named incidentally is not a request to produce one. The gate
+    // must not forge artifacts (and extra workspace files) the goal never asked for.
+    CHECK(missingDeliverables("write a script that converts webm to mp4", ws).empty());
+    CHECK(missingDeliverables("build a landing page with a png logo", ws).empty());
+    CHECK(missingDeliverables("add an mp4 export button to the app", ws).empty());
+    // Output positions still fire, with or without an explicit preposition.
+    CHECK(missingDeliverables("export the chart to svg", ws).find("no .svg") != std::string::npos);
+    CHECK(missingDeliverables("produce a pdf report", ws).find("no .pdf") != std::string::npos);
     rmRf(ws);
+    return "";
+}
+
+TEST(agent_Goal_Deliverable_Gate_Fires_Once_And_Skips_Code_Goals) {
+    std::string home = makeTempDir("pocket-dg");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    Config cfg = defaultConfig();
+    ToolEnv env;
+    env.cfg = &cfg;
+    env.workspace = home;
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    AgentOpts opts;
+    opts.model = resolveModel(cfg, "glm").value;
+    opts.sessionId = id.value;
+    opts.tools = &env;
+    opts.maxRounds = 2;
+    int audits = 0, gapNotices = 0;
+    opts.onNotice = [&](const std::string& s) {
+        if (s.find("named deliverable missing") != std::string::npos) ++gapNotices;
+    };
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish";
+        else if (req.system.find("audit") != std::string::npos) { ++audits; r.text = "CONTINUE"; }
+        else r.text = "Still working on it.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    // A real artifact request with no .mp4 present is chased once, not every cycle.
+    Agent a(opts);
+    CHECK(a.runGoal("save a short video as mp4", 3).find("goal not confirmed") != std::string::npos);
+    CHECK_EQ(gapNotices, 1);
+    CHECK_EQ(audits, 2);  // the gate spent cycle 0; the other two reached the auditor
+
+    // A code goal that merely names a format must never trigger the gate, and
+    // must be certifiable immediately by the auditor.
+    gapNotices = 0;
+    audits = 0;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish";
+        else if (req.system.find("audit") != std::string::npos) { ++audits; r.text = "DONE"; }
+        else r.text = "Implemented the converter and its tests.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent b(opts);
+    CHECK(b.runGoal("write a script that converts webm to mp4", 3).empty());
+    CHECK_EQ(gapNotices, 0);
+    CHECK_EQ(audits, 1);
+    rmRf(home);
     return "";
 }

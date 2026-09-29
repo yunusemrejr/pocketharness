@@ -450,7 +450,10 @@ std::vector<SessionInfo> sessionList(size_t max, const std::string& workspace) {
         int fd = openRegular(si.path, O_RDONLY);
         if (fd < 0) continue;
         char prefix[65536];
-        ssize_t n = read(fd, prefix, sizeof(prefix));
+        // A signal during the preview read must not drop the session from the
+        // listing entirely; every other read here retries on EINTR.
+        ssize_t n;
+        while ((n = read(fd, prefix, sizeof(prefix))) < 0 && errno == EINTR) {}
         close(fd);
         if (n < 0) continue;
         for (const auto& line : splitLines(std::string(prefix, n))) {

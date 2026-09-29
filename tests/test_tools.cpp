@@ -99,6 +99,24 @@ TEST(tools_Private_Scratch_Uses_The_Same_Path_Across_Native_Tools) {
     return "";
 }
 
+TEST(tools_Private_Scratch_Expands_Every_Tmpdir_Spelling) {
+    ToolFixture f;
+    CHECK(f.ok);
+    CHECK(authorityAddWriteRoot(f.auth, f.tmp).ok);
+    // Models write ${TMPDIR} and a bare $TMPDIR as readily as $TMPDIR/x. An
+    // unexpanded form resolves inside the workspace and leaves a literal
+    // "$TMPDIR" directory in the user's repository.
+    CHECK(runTool(f.env, "write", R"({"path":"${TMPDIR}/braced.txt","content":"b"})").ok);
+    CHECK(readFileBounded(f.tmp + "/braced.txt", 100).value == "b");
+    CHECK(runTool(f.env, "write", R"({"path":"$TMPDIR/plain.txt","content":"p"})").ok);
+    CHECK(readFileBounded(f.tmp + "/plain.txt", 100).value == "p");
+    // A bare $TMPDIR resolves to the scratch root, which is a directory: the
+    // write is refused instead of creating a file literally named "$TMPDIR".
+    CHECK(!runTool(f.env, "write", R"({"path":"$TMPDIR","content":"root"})").ok);
+    CHECK(access((f.base + "/$TMPDIR").c_str(), F_OK) != 0);
+    return "";
+}
+
 TEST(tools_Bash_Capture_And_Guard) {
     ToolFixture f;
     CHECK(f.ok);

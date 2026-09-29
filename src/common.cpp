@@ -217,9 +217,10 @@ VoidResult ensureDir(const std::string& path, mode_t mode) {
         if (j == std::string::npos) j = path.size();
         std::string part = path.substr(i, j - i);
         if (!part.empty() && part != ".") {
-            if (cur.size() > 1) cur += "/";
+            // Separate from the previous component. A one-character prefix
+            // ("a/b") is still a component, so the length test cannot gate this.
+            if (!cur.empty() && cur.back() != '/') cur += "/";
             if (cur.empty()) cur = part;
-            else if (cur != "/") cur += part;
             else cur += part;
             if (mkdir(cur.c_str(), mode) != 0 && errno != EEXIST)
                 return VoidResult::Err("cannot create dir " + cur);

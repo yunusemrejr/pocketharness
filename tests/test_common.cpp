@@ -29,3 +29,22 @@ TEST(common_Terminal_CSI_Punctuation_Does_Not_Eat_Text) {
     CHECK_EQ(pocket::sanitizeTerminal("a\0337b"), std::string("ab"));
     return "";
 }
+
+TEST(common_EnsureDir_Separates_Every_Relative_Component) {
+    std::string ws = makeTempDir("pocket-ed");
+    CHECK(!ws.empty());
+    // A one-character prefix is still a component: "a/b" must not mkdir "ab".
+    CHECK(ensureDir(ws + "/a/b/c", 0755).ok);
+    CHECK(access((ws + "/a/b/c").c_str(), F_OK) == 0);
+    CHECK(access((ws + "/a/bc").c_str(), F_OK) != 0);
+    CHECK(access((ws + "/ab").c_str(), F_OK) != 0);
+    // Repeated and absolute separators stay well-formed.
+    CHECK(ensureDir(ws + "/a//b//c", 0755).ok);
+    CHECK(ensureDir(ws + "/a/b/./c", 0755).ok);
+    // A relative output path is what "pocket kit mix a/b/out.wav" resolves to.
+    CHECK(ensureDir(ws + "/out/dir", 0755).ok);
+    CHECK(writeOutputFile(ws + "/out/dir/f.txt", "x").ok);
+    CHECK_EQ(readFileBounded(ws + "/out/dir/f.txt", 10).value, std::string("x"));
+    rmRf(ws);
+    return "";
+}

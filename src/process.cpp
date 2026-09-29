@@ -332,7 +332,7 @@ SpawnResult spawn(const SpawnOpts& opts) {
         fds[3].fd = reaped ? -1 : exitFd;
         fds[3].events = POLLIN;
         int pr = poll(fds, 4, 50);
-        if (pr < 0 && errno == EINTR) continue;
+        if (pr < 0) continue;  // revents is only defined once poll succeeds
         // stdin feed
         if (inOpen && (fds[2].revents & (POLLOUT | POLLERR | POLLHUP))) {
             if (inOff < opts.stdinData.size()) {
@@ -351,7 +351,6 @@ SpawnResult spawn(const SpawnOpts& opts) {
                 pin[1] = -1;
             }
         }
-        if (pr < 0) continue;
         auto drain = [&](int& fd, std::string& dst, bool isErr) {
             // Fairness: an endless stdout writer must not starve stderr,
             // timeout checks or cancellation.
