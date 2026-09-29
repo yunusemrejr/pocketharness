@@ -8,7 +8,7 @@ LDLIBS ?= -lpthread
 
 SRC := src/common.cpp src/json.cpp src/config.cpp src/session.cpp src/skills.cpp \
        src/sandbox.cpp src/process.cpp src/provider.cpp src/tools.cpp src/agent.cpp \
-       src/brain.cpp src/catalog.cpp src/kit.cpp src/kit_audio.cpp src/kit_studio.cpp src/kit_media.cpp src/kit_video.cpp src/kit_ops.cpp src/oversee.cpp src/wisdom.cpp \
+       src/brain.cpp src/catalog.cpp src/kit.cpp src/kit_audio.cpp src/kit_studio.cpp src/kit_media.cpp src/kit_video.cpp src/kit_ops.cpp src/kit_lint.cpp src/oversee.cpp src/wisdom.cpp \
        src/tui.cpp src/main.cpp
 OBJ := $(SRC:.cpp=.o)
 BIN := pocket

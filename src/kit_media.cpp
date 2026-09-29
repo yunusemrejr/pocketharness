@@ -348,7 +348,7 @@ int say(const std::vector<std::string>& a) {
     }
     for (size_t b = 0; b < beatSpan.size(); ++b)
         jb.push_back(json::Object{{"beat", (int)b + 1}, {"s", std::round(beatSpan[b].first * 1000) / 1000}, {"e", std::round(beatSpan[b].second * 1000) / 1000}});
-    auto w1 = atomicWriteFile(base + ".json", json::stringify(json::Object{
+    auto w1 = writeOutputFile(base + ".json", json::stringify(json::Object{
         {"duration", std::round(duration * 1000) / 1000}, {"voice", voice.name}, {"timing", "sentence times are measured; word times are estimated from syllables"},
         {"beats", jb}, {"sentences", js}}, true));
     if (!w1.ok) return fail(w1.error);
@@ -385,7 +385,7 @@ int say(const std::vector<std::string>& a) {
         css += "\n--u" + std::to_string(i + 1) + "-s:" + secs(sentences[i].start) + ";--u" + std::to_string(i + 1) + "-e:" + secs(sentences[i].end) + ";";
     css += "\n}\n";
     for (auto pr : {std::pair<std::string, std::string>{".srt", srt}, {".captions.html", html}, {".cues.css", css}}) {
-        auto w = atomicWriteFile(base + pr.first, pr.second);
+        auto w = writeOutputFile(base + pr.first, pr.second);
         if (!w.ok) return fail(w.error);
     }
     printf("%s: %.2fs, %zu sentences in %zu beats, voice %s, synthesised in %.1fs\n", out.c_str(), duration, sentences.size(), beats.size(),

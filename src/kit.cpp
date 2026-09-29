@@ -2,6 +2,7 @@
 #include "kit.h"
 #include "kit_audio.h"
 #include "config.h"
+#include "kit_lint.h"
 #include "kit_media.h"
 #include "kit_ops.h"
 #include "kit_studio.h"
@@ -834,11 +835,11 @@ int kitMain(int argc, char** argv) {
         "  music OUT.wav          generative stereo score: --style ambient/lofi/corporate/cinematic/tech/upbeat --duration --key --seed\n"
         "  mix OUT.wav            cue-sheet mixer: --voice --music (auto-ducked) --at SEC:FILE, loudness-normalised + limited\n"
         "  img FILE...            image type + dimensions (png/jpeg/gif/webp/svg)\n"
-        "  svg FILE               SVG lint: structure, viewBox, ids, animation count\n"
+        "  svg FILE               SVG structure: viewBox, ids, animation count (kit lint covers the rest)\n"
         "  spring [k] [c] [m]     physical spring -> CSS linear() easing + duration\n"
         "  wav OUT \"C4:.25 R:.25\"  music to WAV: chords C4+E4, tracks a|b, drums K/S/H, saw> prefix\n"
         "  audio FILE.wav         loudness, peak, clipping, pitch, silence\n"
-        "  slop FILE...           placeholders, stubs, conflict markers, AI-tell prose\n"
+        "  lint [PATH...]         security, perf, DRY, backend/coding patterns, UI slop + a11y, SVG hygiene, stubs (runs automatically on every write)\n"
         "  find QUERY             ranked code search (BM25 over chunks; no index to maintain)\n"
         "  sym NAME|.             definitions of NAME (\".\" = outline of every declaration)\n"
         "  refs NAME              whole-word references to NAME\n"
@@ -849,11 +850,16 @@ int kitMain(int argc, char** argv) {
         "  csv FILE               dataset profile: types, missing, stats, class balance\n"
         "  bench [-n N] 'CMD'      timing: min/median/p95 wall, CPU, peak RSS\n"
         "  probe [DIR]            host: OS, CPU, memory, disk, GPU, toolchain\n";
-    // `kit SUB --help` is a question, not a failure: print that line, exit 0.
-    if (!a.empty() && (a[0] == "--help" || a[0] == "-h")) {
-        for (const auto& line : splitLines(kHelp))
-            if (startsWith(line, "  " + sub + " ")) { printf("usage: pocket kit %s\n", trim(line).c_str()); return 0; }
-    }
+    // `kit SUB --help`, and a bare `kit SUB` whose first argument is required, are questions,
+    // not failures: print that line, exit 0 (agents probe usage this way).
+    for (const auto& line : splitLines(kHelp))
+        if (startsWith(line, "  " + sub + " ")) {
+            std::string rest = trim(line.substr(3 + sub.size()));
+            if ((!a.empty() && (a[0] == "--help" || a[0] == "-h")) || (a.empty() && !rest.empty() && rest[0] != '[')) {
+                printf("usage: pocket kit %s\n", trim(line).c_str());
+                return 0;
+            }
+        }
     if (sub == "--help" || sub == "-h") sub = "help";
     if (sub == "web") return kitWeb(a);
     if (sub == "search") return kitSearch(a);
@@ -876,6 +882,7 @@ int kitMain(int argc, char** argv) {
     if (sub == "svg") return kitSvg(a);
     if (sub == "spring") return kitSpring(a);
     if (sub == "slop") return kitSlop(a);
+    if (sub == "lint") return kitLint(a);
     if (sub == "find") return kitFind(a);
     if (sub == "sym") return kitSym(a, false);
     if (sub == "refs") return kitSym(a, true);

@@ -6,6 +6,7 @@
 
 #include "../src/common.h"
 #include "../src/kit.h"
+#include "../src/kit_lint.h"
 
 using namespace pocket;
 using namespace pocket::test;
@@ -246,5 +247,67 @@ TEST(kit_Csv_Seo_And_Bench_Commands) {
     CHECK(kitCall({"bench", "-n", "1", "exit 2"}).code == 1);
     CHECK(kitCall({"wait", "1", "0.3"}).code == 1);
     rmRf(dir);
+    return "";
+}
+
+namespace {
+bool lintHas(const std::vector<std::string>& v, const std::string& needle) {
+    for (const auto& x : v)
+        if (x.find(needle) != std::string::npos) return true;
+    return false;
+}
+}  // namespace
+
+TEST(lint_Security_And_Backend_Rules) {
+    auto py = lintScan("a.py", "import requests\ndef f(x, acc=[]):\n    requests.get(x)\n    cur.execute(\"select * from t where a=%s\" % x)\n"
+                                "    subprocess.run(x, shell=True)\n    try:\n        pass\n    except:\n        pass\n", 'L');
+    CHECK(lintHas(py, "mutable default"));
+    CHECK(lintHas(py, "without timeout"));
+    CHECK(lintHas(py, "SQL built"));
+    CHECK(lintHas(py, "shell=True"));
+    CHECK(lintHas(py, "bare except"));
+    auto c = lintScan("a.c", "int m(){ gets(b);\n fgets(b,8,stdin);\n strcpy(a,b); }\n");
+    CHECK(lintHas(c, "gets cannot bound") && lintHas(c, "unbounded copy"));
+    CHECK(!lintHas(c, "L2"));
+    auto js = lintScan("a.js", "for (const id of ids) {\n  const r = await db.query(sql, [id]);\n}\neval(x);\n");
+    CHECK(lintHas(js, "inside a loop") && lintHas(js, "dynamic code"));
+    return "";
+}
+
+TEST(lint_Secrets_Flag_Literals_But_Not_Config_Reads) {
+    CHECK(lintHas(lintScan("a.js", "const password = \"hunter2hunter2\";\n"), "hard-coded secret"));
+    CHECK(lintHas(lintScan("a.js", "k = 'AKIAABCDEFGHIJKLMNOP'\n"), "credential-shaped"));
+    CHECK(lintScan("a.js", "const password = process.env.PASSWORD;\nif (token == \"abcdefgh12\") {}\nconst maxTokens = 1;\n").empty());
+    CHECK(lintScan("tests/test_a.py", "password = 'hunter2hunter2'\n").empty());  // fixtures are exempt
+    return "";
+}
+
+TEST(lint_Ui_Slop_A11y_And_Contrast) {
+    std::string page = "<html><head><style>\nbody { font-family: 'Inter', sans-serif; }\n"
+                       ".b { background: linear-gradient(90deg,#6366f1,#ec4899); color:#ccc; background-color:#fff; }\n"
+                       "</style></head><body><img src=a.png><h1>Build faster. Ship smarter.</h1></body></html>\n";
+    auto f = lintScan("p.html", page);
+    for (const char* n : {"AI type", "indigo/purple gradient", "contrast below", "without alt", "no lang", "no viewport", "names no capability"})
+        CHECK(lintHas(f, n));
+    std::string good = "<!doctype html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width\"></head>"
+                       "<body><style>p{color:#111;background:#fff;font-family:'Fraunces',serif}</style><img src=a.png alt=\"a chart\"></body></html>\n";
+    CHECK(lintScan("g.html", good).empty());
+    return "";
+}
+
+TEST(lint_Svg_Hygiene) {
+    auto f = lintScan("a.svg", "<svg viewBox=\"0 0 1 1\"><script>x()</script><text>t</text></svg>\n");
+    CHECK(lintHas(f, "<script>") && lintHas(f, "accessible name") && lintHas(f, "<text>"));
+    CHECK(lintScan("ok.svg", "<svg viewBox=\"0 0 8 8\" role=\"img\"><title>Dot</title><circle cx=\"4\" cy=\"4\" r=\"3\"/></svg>\n").empty());
+    return "";
+}
+
+TEST(lint_Dry_Flags_Repeated_Blocks_And_Skips_Vendored) {
+    std::string block;
+    for (int i = 0; i < 6; ++i) block += "    result.push_back(computeSomethingLong(argumentNumber" + std::to_string(i) + ", other));\n";
+    auto f = lintScan("a.cpp", "void a() {\n" + block + "}\nvoid b() {\n" + block + "}\n");
+    CHECK(lintHas(f, "repeated within this file"));
+    CHECK(lintScan("node_modules/x/a.js", "eval(x);\n").empty());
+    CHECK(lintScan("notes.txt", "eval(x);\n").empty());
     return "";
 }

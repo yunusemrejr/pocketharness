@@ -4,6 +4,8 @@ description: >-
   How to assess, audit, and judge SVG designs and files — the quality checklist (viewBox, scaling, currentColor vs hardcoded fills, paths vs primitives, file size & node count, accessibility: title/desc/role/aria, gradients/masks/filters correctness and cost), the icon-set consistency audit (grid, stroke weight, optical size, "does it belong?" test), inline vs <img> vs <symbol>/sprite vs CSS-mask loading decision, optimization (SVGO: what to keep, what it breaks), security (scripts, external refs, nested SVG exposure), and a scoring rubric you can apply to "is this SVG good?". Use when reviewing an SVG (icon, illustration, logo, chart) before shipping, deciding how to load it, or when an icon set "doesn't feel consistent" and you need the names for why.
 ---
 
+> Mechanical first pass: `pocket kit lint FILE.svg` checks scripts, external refs, embedded rasters, precision waste, filters, `<text>`, accessible name and unused ids; it also runs on every write. Then render with `pocket kit shot` and judge the design by eye.
+
 # SVG assessment (judging vector design & files)
 
 `custom-svg` is how to *make* SVG; this is how to *judge* it. An assessment has two objects: the **design** (does it read, is it consistent, is it the right weight for its slot?) and the **file** (does it scale, style, load, and behave?). Most bad SVGs fail one side *because of* the other — the 400-node "simple" icon that is heavy *and* wrong-weight. This skill, `custom-svg`, `design-systems`, and the W3C SVG 2 spec (for the a11y attributes) are the references.

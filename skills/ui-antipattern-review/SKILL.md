@@ -3,6 +3,8 @@ name: ui-antipattern-review
 description: "Detect and repair generic, inaccessible or incoherent UI design using concrete visual evidence."
 ---
 
+> Mechanical first pass: `pocket kit lint PAGE` flags the default AI palettes/fonts, glow halos, emoji icons, invented stats, buzzword copy, low contrast, missing alt/lang/viewport/focus ring and absent reduced-motion; it runs automatically on every write. It cannot judge taste: run the swap test by hand.
+
 # UI Anti-pattern Review
 
 Use for UI audits and preventing formulaic layouts. Judge purpose and execution; colors and shapes alone do not establish defects.

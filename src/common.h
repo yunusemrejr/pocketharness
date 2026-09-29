@@ -14,7 +14,7 @@
 namespace pocket {
 
 // Version of the harness binary.
-inline constexpr const char* kVersion = "0.9.0";
+inline constexpr const char* kVersion = "0.10.0";
 
 // ---------------------------------------------------------------------------
 // Result<T>: minimal error-or-value. Errors are human-readable strings.
@@ -65,6 +65,10 @@ Result<std::string> readFileBounded(const std::string& path, size_t maxBytes);
 
 // Write data atomically: tmp file in same directory + rename + fsync.
 VoidResult atomicWriteFile(const std::string& path, const std::string& data, mode_t mode = 0644);
+
+// atomicWriteFile that first creates the missing parent directories: for generated
+// media where a nonexistent output folder is never the intent (screenshots stay strict).
+VoidResult writeOutputFile(const std::string& path, const std::string& data);
 
 // Append a line + fsync (for JSONL sessions).
 VoidResult appendLine(const std::string& path, const std::string& line);

@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.10.0
+
+Automatic quality gates: security, backend, performance, DRY, UI slop and SVG.
+
+- New `kit lint [PATH...]`: one table-driven native rule engine (`src/kit_lint.cpp`)
+  for JS/TS, Python, C/C++, shell, Go, PHP, Java, SQL, HTML/CSS/JSX/Vue and SVG.
+  Security (hard-coded secrets and token shapes, SQL built from strings, shell
+  injection, eval, weak hashes, disabled TLS verification, unsafe C string calls),
+  backend (HTTP calls without timeout, error objects sent to clients, wildcard
+  CORS, JWT without expiry, cookies without httpOnly), efficiency (queries and
+  fetches inside loops, SELECT *, sync I/O in servers, transition: all), coding
+  patterns (mutable defaults, bare except, empty catch, suppressed checks, deep
+  nesting), DRY (duplicated blocks within and across files), UI/accessibility
+  (WCAG contrast per CSS rule, missing alt/lang/viewport, removed focus ring,
+  text under 12px, animation without reduced-motion) and slop (indigo/purple
+  gradients, Tailwind indigo demo accents, cream + terracotta, Inter/Space
+  Grotesk/Geist/Instrument Serif, glow halos, emoji icons, invented stats,
+  buzzword copy) plus SVG hygiene (scripts, external refs, embedded rasters,
+  editor metadata, wasted coordinate precision, filters, text, no accessible name,
+  unused ids). Findings are aggregated per rule with line numbers.
+- It runs without being asked: every `write`/`edit` returns its findings (medium and
+  up on first touch, high on later edits), and before a turn ends the changed files
+  get one whole-change sweep (high findings plus cross-file duplication) that sends
+  the agent back to fix them. Test files, vendored and generated paths are exempt
+  from secret and duplication rules.
+- Bare `pocket kit SUB` with a required argument prints its usage and exits 0 instead
+  of reading as a failed tool call.
+- Bash timeouts now say how to run long jobs (background + poll, or a larger timeout);
+  an oversized image read says how to capture a smaller one.
+- Generated media (`wav`, `sfx`, `music`, `mix`, `say`) creates missing output
+  directories; a temp-file failure now names the OS error.
+- DRY in the harness itself: one seccomp loader for both sandbox profiles, one shared
+  tail for the twin first-pass prompts. The awareness block's superpower list is shorter.
+
 ## 0.9.0
 
 Motion video, rebuilt around what a publishable video needs.

@@ -830,6 +830,21 @@ struct SeccompData {
     uint64_t args[6];
 };
 
+// Install a classic-BPF seccomp filter: 0 ok, 1 unsupported by this kernel, -1 failed.
+int loadSeccomp(struct sock_filter* f, size_t n) {
+    struct sock_fprog {
+        uint16_t len;
+        struct sock_filter* filter;
+    } prog{(uint16_t)n, f};
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -1;
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
+        if (errno == EINVAL || errno == ENOSYS) return 1;
+        return -1;
+    }
+    return 0;
+}
+
+
 int seccompDenyInet() {
 #if defined(__x86_64__)
     const uint32_t kArch = AUDIT_ARCH_X86_64;
@@ -871,16 +886,7 @@ int seccompDenyInet() {
     f[5].jf = 0;  // 5 -> 6
     f[6].jt = 0;  // 6 -> 7 DENY
     f[6].jf = 1;  // 6 -> 8 ALLOW
-    struct sock_fprog {
-        uint16_t len;
-        struct sock_filter* filter;
-    } prog{(uint16_t)(sizeof(f) / sizeof(f[0])), f};
-    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -1;
-    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
-        if (errno == EINVAL || errno == ENOSYS) return 1;
-        return -1;
-    }
-    return 0;
+    return loadSeccomp(f, sizeof(f) / sizeof(f[0]));
 }
 
 // Trusted provider-curl profile: network is the point, so sockets stay
@@ -899,16 +905,7 @@ int providerSeccomp() {
         {(uint16_t)(BPF_RET | BPF_K), 0, 0, (uint32_t)SECCOMP_RET_ALLOW},       // idx 2
         {(uint16_t)(BPF_RET | BPF_K), 0, 0, (uint32_t)SECCOMP_RET_KILL_PROCESS},  // idx 3
     };
-    struct sock_fprog {
-        uint16_t len;
-        struct sock_filter* filter;
-    } prog{(uint16_t)(sizeof(f) / sizeof(f[0])), f};
-    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -1;
-    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
-        if (errno == EINVAL || errno == ENOSYS) return 1;
-        return -1;
-    }
-    return 0;
+    return loadSeccomp(f, sizeof(f) / sizeof(f[0]));
 }
 
 void childWarn(const char* msg) {

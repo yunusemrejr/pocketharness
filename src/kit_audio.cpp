@@ -77,7 +77,7 @@ double oscillator(const std::string& wave, double phase, double step) {
 
 int writeWav(const std::string& path, const Result<std::string>& wav, int rate) {
     if (!wav.ok) return fail(wav.error);
-    const auto saved = atomicWriteFile(path, wav.value);
+    const auto saved = writeOutputFile(path, wav.value);
     if (!saved.ok) return fail(saved.error);
     printf("%s: %.3fs mono PCM16 %d Hz\n", path.c_str(), (wav.value.size() - 44) / (2.0 * rate), rate);
     return 0;

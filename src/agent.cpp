@@ -19,6 +19,7 @@
 
 #include "brain.h"
 #include "config.h"
+#include "kit_lint.h"
 #include "session.h"
 #include "wisdom.h"
 
@@ -1218,6 +1219,20 @@ std::string Agent::stopGate(const std::string& text) {
             return "[stop hook failed] `" + hook + "`\n" + capToolResult(h.output) + "\nFix the cause, then finish.";
         }
     bool changed = opts_.tools && !opts_.tools->changedFiles.empty();
+    // Whole-change sweep once per turn: High findings anywhere, plus duplication across the
+    // changed files that no single write could see.
+    if (changed && !linted_) {
+        linted_ = true;
+        std::string found = lintPaths(opts_.tools->changedFiles, 'H');
+        std::string dup;
+        for (const auto& l : splitLines(lintPaths(opts_.tools->changedFiles, 'M')))
+            if (l.find("[dry/") != std::string::npos) dup += l + "\n";
+        if (!found.empty() || !dup.empty()) {
+            ++stats_.nudges;
+            if (opts_.onNotice) opts_.onNotice("overseer: lint findings in changed files");
+            return "[lint] Fix before finishing (or state why a finding is a false positive):\n" + capToolResult(found + dup);
+        }
+    }
     if ((opts_.review || goalMode) && changed && !reviewed_) {
         reviewed_ = true;
         return councilReview();
@@ -1428,20 +1443,21 @@ namespace {
 // Per-instance tails for the twin first pass. The shared history prefix
 // stays byte-identical (cache-friendly); only this trailing instruction
 // differs, so the second stream can reuse the warmed prefix.
-const char* kDoubleLensA =
-    "[double] You are instance A of two independent first-pass analyses of this conversation's latest "
-    "request. Instance B is analyzing the same request right now in a separate stream: you cannot see its "
-    "output and it cannot see yours, so work fully independently and do NOT hedge toward an imagined "
-    "consensus — a distinct view is more useful than premature agreement. Solve constructively: find the "
-    "most direct sound approach and justify it with evidence. Analyze the latest user request against the "
-    "full conversation above and write a compact brief with exactly these sections:\n"
+const std::string kDoubleSections =
     "1. Understanding — what is actually being asked (one or two sentences).\n"
     "2. Plan — the concrete steps you would take, in order.\n"
     "3. Proposed actions — specific tool operations (reads, searches, edits, commands), one per line.\n"
     "4. Risks — what could go wrong, what is uncertain, what must be verified.\n"
     "5. Assumptions — what you take for granted.\n"
     "Keep it under ~400 words. Analysis only: do not execute anything and do not address the user.";
-const char* kDoubleLensB =
+const std::string kDoubleLensA =
+    "[double] You are instance A of two independent first-pass analyses of this conversation's latest "
+    "request. Instance B is analyzing the same request right now in a separate stream: you cannot see its "
+    "output and it cannot see yours, so work fully independently and do NOT hedge toward an imagined "
+    "consensus — a distinct view is more useful than premature agreement. Solve constructively: find the "
+    "most direct sound approach and justify it with evidence. Analyze the latest user request against the "
+    "full conversation above and write a compact brief with exactly these sections:\n" + kDoubleSections;
+const std::string kDoubleLensB =
     "[double] You are instance B of two independent first-pass analyses of this conversation's latest "
     "request. Instance A is analyzing the same request right now in a separate stream: you cannot see its "
     "output and it cannot see yours, so work fully independently and do NOT hedge toward an imagined "
@@ -1449,13 +1465,7 @@ const char* kDoubleLensB =
     "request and hunt specifically for hidden assumptions, failure modes, alternative approaches, edge "
     "cases, and overlooked constraints. Disagree with the obvious plan wherever the evidence supports it, "
     "and name what a hasty first pass would miss. Analyze the latest user request against the full "
-    "conversation above and write a compact brief with exactly these sections:\n"
-    "1. Understanding — what is actually being asked (one or two sentences).\n"
-    "2. Plan — the concrete steps you would take, in order.\n"
-    "3. Proposed actions — specific tool operations (reads, searches, edits, commands), one per line.\n"
-    "4. Risks — what could go wrong, what is uncertain, what must be verified.\n"
-    "5. Assumptions — what you take for granted.\n"
-    "Keep it under ~400 words. Analysis only: do not execute anything and do not address the user.";
+    "conversation above and write a compact brief with exactly these sections:\n" + kDoubleSections;
 const char* kDoubleReconcileSystem =
     "You reconcile two independent first-pass analyses (A and B) of one user request into a single unified "
     "plan. Identify agreements, contradictions, missing considerations, stronger evidence, weaker assumptions, "
@@ -1957,7 +1967,7 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
     } turnEnd{this};
     if (!continuation) turnStart_ = messages_.size();
     turnNudges_ = turnGates_ = 0;
-    verifyNudged_ = reviewed_ = false;
+    verifyNudged_ = reviewed_ = linted_ = false;
     hookNagged_.clear();
     if (!continuation && goalStatus_ != GoalStatus::Active) {
         unverified_ = false;

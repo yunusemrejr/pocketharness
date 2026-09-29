@@ -14,6 +14,7 @@
 #include "agent.h"
 #include "brain.h"
 #include "kit.h"
+#include "kit_lint.h"
 #include "oversee.h"
 #include "process.h"
 #include "skills.h"
@@ -120,10 +121,14 @@ std::string afterChange(ToolEnv& env, const std::string& path, const std::string
     if (!env.sessionId.empty())
         (void)sessionWorkspacePublish(env.workspace, env.sessionId, "changed", path);
     std::string out;
+    // Stubs first, then the rule engine (security, perf, DRY, UI, SVG); later edits of a
+    // file only repeat what is High so a legacy file is not re-reported every time.
     auto findings = slopScan(path, content);
+    for (auto& f : lintScan(path, content, firstTouch ? 'M' : 'H')) findings.push_back(std::move(f));
     if (!findings.empty()) {
         out += "\n[quality] fix before finishing:";
-        for (size_t i = 0; i < findings.size() && i < 8; ++i) out += "\n  " + findings[i];
+        for (size_t i = 0; i < findings.size() && i < 10; ++i) out += "\n  " + findings[i];
+        if (findings.size() > 10) out += "\n  (+" + std::to_string(findings.size() - 10) + " more: pocket kit lint " + path + ")";
     }
     // Taste check: Jev spots template-grade UI and copy that no regex can.
     std::string lp = toLower(path);
@@ -175,7 +180,8 @@ ToolResult toolRead(ToolEnv& env, const json::Value& args) {
     std::string mime = hn > 0 ? sniffImageMime(std::string_view(head, (size_t)hn)) : "";
     if (!mime.empty()) {
         auto bytes = boxRead(*env.auth, path, kMaxImageBytes);
-        if (!bytes.ok) return {false, "read: image over 5 MiB or unreadable: " + path};
+        if (!bytes.ok) return {false, "read: image over 5 MiB or unreadable: " + path +
+                                  " (capture smaller: pocket kit shot URL out.png 1280x800; for video use pocket kit vsheet)"};
         if (env.viewImages.size() >= kMaxImagesPerMessage) return {false, "read: too many images in one batch"};
         env.viewImages.push_back({mime, base64Encode(bytes.value)});
         emit(env, "view " + path);
@@ -453,7 +459,8 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
         return r;
     }
     if (sr.timedOut) {
-        out = "timeout after " + std::to_string(timeoutSec) + "s (killed)\n";
+        out = "timeout after " + std::to_string(timeoutSec) + "s (killed). Long jobs: run in the background "
+              "(cmd >$TMPDIR/job.log 2>&1 &) and poll the log, or pass a larger timeout (max 3600).\n";
         r.output = out + sr.out + sr.err;
         return r;  // ok=false signals failure to the model
     }

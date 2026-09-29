@@ -1,6 +1,7 @@
 // PocketHarness - shared helpers implementation.
 #include "common.h"
 
+#include <cstring>
 #include <fcntl.h>
 #include <pwd.h>
 #include <sys/stat.h>
@@ -149,7 +150,7 @@ Result<std::string> readFileBounded(const std::string& path, size_t maxBytes) {
 VoidResult atomicWriteFile(const std::string& path, const std::string& data, mode_t mode) {
     std::string tmp = path + ".tmp." + randHex(4);
     int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
-    if (fd < 0) return VoidResult::Err("cannot write temp file for " + path);
+    if (fd < 0) return VoidResult::Err("cannot write temp file for " + path + ": " + strerror(errno));
     size_t off = 0;
     while (off < data.size()) {
         ssize_t n = write(fd, data.data() + off, data.size() - off);
@@ -172,6 +173,15 @@ VoidResult atomicWriteFile(const std::string& path, const std::string& data, mod
         return VoidResult::Err("rename failed for " + path);
     }
     return VoidResult::Ok();
+}
+
+VoidResult writeOutputFile(const std::string& path, const std::string& data) {
+    size_t slash = path.find_last_of('/');
+    if (slash != std::string::npos && slash > 0) {
+        auto d = ensureDir(path.substr(0, slash));
+        if (!d.ok) return d;
+    }
+    return atomicWriteFile(path, data);
 }
 
 VoidResult appendLine(const std::string& path, const std::string& line) {

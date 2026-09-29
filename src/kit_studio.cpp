@@ -135,7 +135,7 @@ Result<void> saveStereoWav(const std::string& path, const Stereo& s) {
     o.reserve(44 + s.size() * 4);
     for (size_t i = 0; i < s.size(); ++i)
         for (float v : {s.l[i], s.r[i]}) put(o, uint16_t(int16_t(std::lround(std::clamp(v, -1.f, 1.f) * 32767))), 2);
-    auto saved = atomicWriteFile(path, o);
+    auto saved = writeOutputFile(path, o);
     return saved.ok ? Result<void>::Ok() : Result<void>::Err(saved.error);
 }
 

@@ -281,10 +281,16 @@ pocket kit theme "topic words"                    palette + font pair from the s
 pocket kit asset search|get|font ...              CC0 3D models/HDRIs/textures, open images/audio, Google Fonts, three.js
 pocket kit sfx OUT.wav whoosh [--duration .6]   seeded native sound effects
 pocket kit img FILE...      png/jpeg/gif/webp/svg type + dimensions
-pocket kit svg FILE         structure, viewBox, ids, animation count
+pocket kit svg FILE         structure, viewBox, ids, animation count (lint covers hygiene)
 pocket kit spring K C M     physical spring → CSS linear() easing + duration
 pocket kit wav OUT "C4+E4+G4:1 | saw> C2:.5 C2 | K:.25 H S H"   chords, mixed tracks, drums
 pocket kit audio FILE.wav   loudness, peak, clipping, pitch, silence
+pocket kit lint [PATH...]   one rule engine: security (secrets, injection, weak crypto, TLS off, unsafe C), backend
+                            (SQL concat, no timeouts, leaky errors, loose CORS/cookies/JWT), perf (I/O in loops, SELECT *),
+                            DRY (duplicated blocks across files), coding patterns, UI slop + a11y (default AI palettes and
+                            fonts, glow halos, contrast, focus, alt, lang, reduced motion) and SVG (scripts, external refs,
+                            embedded rasters, wasted precision, filters, no accessible name). --min h|m|l. Also runs on
+                            every write and on the changed files before a turn ends: agents never have to ask for it.
 pocket kit slop FILE...     placeholders, stubs, conflict markers, AI-tell prose
 pocket kit find QUERY       ranked code search (BM25 over chunks, no index)
 pocket kit sym NAME|.       definitions (outline with ".") — LSP-lite

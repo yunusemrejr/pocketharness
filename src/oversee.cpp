@@ -724,16 +724,14 @@ std::string awarenessBlock(const std::string& ws, const Config& cfg, bool allowN
     s += "- work is checkpointed every " + std::to_string(maxRounds) + " tool rounds and goals resume automatically "
          "after each checkpoint while progress continues: never cut scope or skip acceptance criteria to fit it; "
          "repeated identical calls are stopped\n";
-    s += "- every write/edit is quality-scanned; ";
+    s += "- every write/edit is scanned for stubs, security, perf, duplication, UI and SVG faults; ";
     s += cfg.review ? "an overseer reviews changed work before a turn ends\n" : "reviews are off\n";
-    s += "Superpowers: `pocket kit` via bash — web, search, dom, shot, frame, video, vcheck, vsheet, say (neural narration), music, mix, theme, asset, img, svg, spring, wav, sfx, audio, slop, "
-         "find/sym/refs (code index), probe, ports, wait, net, seo, csv, bench; run `pocket kit` for usage. "
-         "Start a dev server in the background, then `pocket kit wait PORT` (never a fixed sleep); `pocket kit ports` "
-         "names the pid on a port before you kill anything. To see a UI, "
-         "`pocket kit shot file://$PWD/page.html out.png 1280x800`, then read out.png: images you read are "
-         "shown to you. Timed scenes are HTML with CSS/SVG animation (or window.renderFrame(seconds)); "
-         "`pocket kit frame scene.html still.png --time 2` or `pocket kit video scene.html clip.mp4 --duration 6`; "
-         "Chromium renders and FFmpeg encodes when installed. Any video request: load the video-studio skill first (kit say/music/mix/theme/asset, lint, vsheet, vcheck). "
+    s += "Superpowers: `pocket kit` via bash (run `pocket kit` for usage). lint: security, perf, DRY, UI/a11y slop, SVG, stubs "
+         "(runs on every write and on changed files before a turn ends). find/sym/refs: code index. web/search/dom/shot: "
+         "research and visual QA. frame/video/vcheck/vsheet/say/music/mix/theme/asset: motion (load the video-studio skill "
+         "first). Also img, svg, spring, wav, sfx, audio, ports, wait, net, seo, csv, bench, probe. Start a dev server in the "
+         "background, then `pocket kit wait PORT` (never a fixed sleep); `pocket kit ports` names the pid before you kill "
+         "anything. To see a UI: `pocket kit shot file://$PWD/page.html out.png 1280x800`, then read out.png. "
          "Discover and load the relevant skill before adapting its installed examples; check current help, "
          "run a small real case, and inspect the result before claiming success.\n";
     std::string mem = projectDir(ws) + "/memory.md";

@@ -309,7 +309,7 @@ class Agent {
     // Per-turn overseer state.
     size_t turnStart_ = 0;
     int turnNudges_ = 0, turnGates_ = 0;
-    bool unverified_ = false, verifyNudged_ = false, reviewed_ = false, calmNext_ = false;
+    bool unverified_ = false, verifyNudged_ = false, reviewed_ = false, linted_ = false, calmNext_ = false;
     std::string thinkNow_ = "high";  // adaptive thinking: level for the next request
     std::vector<std::string> blind_;  // model specs that rejected image input this session
     std::map<std::string, int> hookNagged_;  // stop-hook failures nagged this turn

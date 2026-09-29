@@ -412,3 +412,14 @@ TEST(tools_Rendering_A_Video_Waits_Once_For_The_Video_Doctrine) {
     CHECK(r.ok && r.output.find("this stop happens once") == std::string::npos);
     return "";
 }
+
+TEST(tools_Write_Reports_Lint_Findings_Without_Being_Asked) {
+    ToolFixture f;
+    CHECK(f.ok);
+    ToolResult r = runTool(f.env, "write", R"({"path":"api.py","content":"import requests\ndef go(u, acc=[]):\n    return requests.get(u)\n"})");
+    CHECK(r.ok && r.output.find("[quality]") != std::string::npos && r.output.find("mutable default") != std::string::npos &&
+          r.output.find("without timeout") != std::string::npos);
+    r = runTool(f.env, "write", R"({"path":"ok.py","content":"def go(u):\n    return u\n"})");
+    CHECK(r.ok && r.output.find("[quality]") == std::string::npos);
+    return "";
+}
