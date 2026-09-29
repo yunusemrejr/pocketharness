@@ -346,6 +346,29 @@ TEST(tui_Escape_Holds_Queue_And_Preserves_Draft) {
     return "";
 }
 
+TEST(tui_Footer_Follows_Commands_Without_Reading_A_Live_Turn) {
+    TuiFixture t;
+    CHECK(t.ready());
+    // Assert on the footer only: the echoed input also contains "thinking high",
+    // so that substring proves nothing. The footer renders "· thinking high"
+    // with no colon; /session prints "· thinking: high".
+    CHECK(t.waitFor("· thinking off"));
+    // The footer renders a cached snapshot rather than reading the live agent,
+    // so a command that changes what it displays must republish it.
+    CHECK(t.send("/thinking high\r"));
+    CHECK(t.waitFor("thinking: high"));
+    CHECK(t.waitFor("· thinking high"));
+    // ...and the turn thread must keep refreshing it during work.
+    CHECK(t.send("first\r"));
+    CHECK(t.waitFor("FIRST_RUNNING"));
+    CHECK(t.waitFor("· thinking high"));
+    CHECK(t.waitFor("ctx "));
+    t.finishFirst();
+    CHECK(t.waitFor("REPLY:\"first\""));
+    CHECK(t.quit());
+    return "";
+}
+
 TEST(tui_Working_Footer_Shows_Liveness_And_Elapsed) {
     TuiFixture t;
     CHECK(t.ready());

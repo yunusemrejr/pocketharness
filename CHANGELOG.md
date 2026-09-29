@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.11.2
+
+Thread-ownership fix for the TUI footer, and judge registration hardening.
+
+- The footer no longer reads the live agent. It redraws on every streamed token
+  and built its text by walking `Agent`'s messages on the editor thread while
+  the turn worker appended to them; that is a `std::vector` reallocation under
+  a concurrent read, which aborts the process in `std::get` of a half-moved
+  `json::Value`. The turn thread already publishes the same text through its
+  Status event, so the footer renders that snapshot instead, and `/model`,
+  `/thinking` and role assignment republish it. No visible change: the footer
+  still tracks the running turn at the same 250 ms cadence.
+- Local-judge registration now serialises on its own mutex. It mutates the
+  shared users-file bookkeeping, and the fatal-signal path reads it
+  concurrently, which is undefined behaviour; two judges registering at once
+  could also overwrite the tracked descriptor and leak the other.
+
+Tests: 343 -> 345.
+
 ## 0.11.1
 
 TUI robustness and interruptibility, plus catalog and transport cleanups.

@@ -2,6 +2,9 @@
 #include "mini.h"
 
 #include <cmath>
+#include <thread>
+#include <vector>
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/wait.h>
@@ -423,5 +426,38 @@ TEST(oversee_Local_Server_Stops_Only_When_Last_Session_Leaves) {
     CHECK(stopped);
     CHECK(access(pidFile.c_str(), F_OK) != 0);
     if (stopped) cleanup.server = -1;
+    return "";
+}
+
+// Concurrent registration used to race on the shared users-file bookkeeping:
+// two judges could both open the file, and the loser overwrote g_usersFd and
+// leaked its descriptor. assertNoLeakedUsersFd turns that into a hard check.
+static int openFdCount() {
+    DIR* d = opendir("/proc/self/fd");
+    if (!d) return -1;
+    int n = 0;
+    while (readdir(d)) ++n;
+    closedir(d);
+    return n;
+}
+
+TEST(oversee_Concurrent_Judge_Warm_Registers_Once_And_Leaks_Nothing) {
+    std::string home = makeTempDir("pocket-warm");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    Config cfg;
+    cfg.jev = false;  // stay local: no remote judge, no network
+    cfg.localLm.model = home + "/none.gguf";  // configured but absent: never spawns
+    cfg.localLm.port = 18997;
+    CHECK(ensureDir(stateDir(), 0700).ok);
+    int before = openFdCount();
+    CHECK(before >= 0);
+    std::vector<std::thread> warmers;
+    for (int i = 0; i < 8; ++i) warmers.emplace_back([&] { judgeWarm(cfg); });
+    for (auto& t : warmers) t.join();
+    judgeShutdown();  // drop the share so the accounting is back to zero
+    int after = openFdCount();
+    // One users-file descriptor is the most a correct registration can hold.
+    CHECK(after <= before + 1);
     return "";
 }

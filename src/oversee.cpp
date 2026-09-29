@@ -39,9 +39,15 @@ std::map<int, int64_t> g_serverSpawned;  // spawn time: a model load gets a boun
 // for its lifetime (the kernel drops it even on SIGKILL). The exiting session
 // stops the server only when it can take LOCK_EX, i.e. no live session is
 // left. Paths are prebuilt so the fatal-signal path stays async-signal-safe.
+//
+// The bookkeeping below is read by the async-signal release path, so it cannot
+// be a lock. Registration is the other writer and does serialise: two judges
+// registering at once used to race on the shared buffers, and the loser
+// overwrote g_usersFd and leaked its descriptor.
 int g_usersFd = -1;
 char g_usersPath[1024], g_pidPath[1024], g_portArg[32];
 size_t g_portArgLen = 0;
+std::mutex g_usersMu;
 std::map<std::string, int64_t> g_pausedUntil;
 std::map<std::string, double> g_judgeCache;
 std::map<std::string, std::map<std::string, double>> g_decideCache;
@@ -179,6 +185,7 @@ void releaseLocalServer();
 
 void registerLocalUser(const Config& cfg) {
     if (cfg.localLm.model.empty() || !ensureDir(stateDir(), 0700).ok) return;
+    std::lock_guard<std::mutex> lk(g_usersMu);  // not g_localMu: callers take it later
     std::string base = stateDir() + "/judge-" + std::to_string(cfg.localLm.port);
     if (base.size() + 8 >= sizeof g_usersPath) return;
     if (g_usersFd >= 0) {

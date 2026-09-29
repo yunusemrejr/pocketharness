@@ -1109,6 +1109,15 @@ std::string tpsText(const AgentStats& st) {
     return b;
 }
 
+// The footer's KPI text, owned solely by the editor thread. The bar redraws on
+// every token, and building this live meant walking Agent's messages on the
+// editor thread while the turn worker appended to them — a std::vector
+// reallocation under a concurrent read, which aborts on std::get of a
+// half-moved json::Value. The turn thread publishes fresh text through the
+// Status event; commands refresh it when they change provider/model/thinking,
+// which is safe because no turn is running then.
+std::string g_footerKpi;
+
 std::string kpiText(TuiOpts& opts, Agent& agent, int) {
     const AgentStats& st = agent.stats();
     long max = agent.contextMax();
@@ -1706,7 +1715,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
                 if (startsWith(t, "✓ ") || startsWith(t, "✗ ")) activity = "working";
                 else activity = startsWith(t, "$ ") ? "bash" : t.substr(0, t.find(' '));
             } else if (event.kind == Kind::Approval) activity = "awaiting approval";
-            if (event.kind == Kind::Status) { status = event.text; goalStatus = event.extra; }
+            if (event.kind == Kind::Status) { status = event.text; goalStatus = event.extra; g_footerKpi = event.text; }
             else if (event.kind == Kind::Done) { finished = true; result = event.text; }
             else if (event.kind == Kind::Approval) {
                 waitingApproval = event;
@@ -2215,6 +2224,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         opts.model = rm.value;
         opts.cfg->defaultModel = rm.value.spec;
         agent.setModel(rm.value, opts.thinking);
+        g_footerKpi = kpiText(opts, agent, termWidth());
         say("model: " + rm.value.spec + "\n");
     };
     auto setLevel = [&](const std::string& t) {
@@ -2228,6 +2238,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
         opts.thinking = t;
         opts.cfg->thinking = t;
         agent.setModel(opts.model, t);
+        g_footerKpi = kpiText(opts, agent, termWidth());
         say("thinking: " + t + "\n");
     };
     auto pickModel = [&](const std::string& title, const std::string& initial, bool allowNone, bool allowMany = false) -> std::string {
@@ -2345,6 +2356,7 @@ bool runCommand(TuiOpts& opts, Agent& agent, const std::string& input) {
             opts.cfg->defaultModel = opts.model.spec;
             agent.setModel(opts.model, opts.thinking);
         } else agent.setRole(roleName, resolved);
+        g_footerKpi = kpiText(opts, agent, termWidth());
         say(roleName + ": " + (spec == "-" ? "cleared" : spec) + " (saved)\n");
         return true;
     }
@@ -2511,8 +2523,9 @@ int tuiRun(TuiOpts& opts) {
     QueuedInput queue;
     BottomBar bar;
     bar.ed = &ed;
-    bar.kpi = [&](int cols) {
-        return kpiText(opts, agent, cols) + (queue.messages.empty() ? "" :
+    g_footerKpi = kpiText(opts, agent, termWidth());
+    bar.kpi = [&](int) {
+        return g_footerKpi + (queue.messages.empty() ? "" :
             "\nqueued " + std::to_string(queue.messages.size()) + (queue.held ? " · held · /queue resume" : " · ready"));
     };
     bar.setup();
