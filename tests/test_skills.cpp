@@ -92,7 +92,8 @@ std::vector<SkillMeta> workflowCatalog() {
                              "local-webapp-workflows", "algorithm-design", "ml-engineering", "llm-fine-tuning",
                              "google-colab-training", "music-composition", "audio-processing", "browser-animation-engineering",
                              "search-discoverability", "natural-editorial-writing", "anti-ai-slop", "linux-network-engineering",
-                             "network-traffic-analysis", "packet-trace-analysis", "local-network-analysis", "linux", "ubuntu-operations"})
+                             "network-traffic-analysis", "packet-trace-analysis", "local-network-analysis", "linux", "ubuntu-operations",
+                             "threejs", "threejs-animation-engineering", "blender-production"})
         all.push_back({name, "bundled", name, "", "skills/" + std::string(name) + "/SKILL.md"});
     return all;
 }
@@ -177,6 +178,50 @@ TEST(skills_AutoSelect_Audio_Is_Independent_Of_Video) {
     auto gif = skillAutoSelect(all, "Create a GIF animation");
     CHECK(!gif.video);
     CHECK(selected(gif, "browser-animation-engineering"));
+    auto sound = skillAutoSelect(all, "Compose music and edit the sound");
+    CHECK(selected(sound, "music-composition") && selected(sound, "audio-processing"));
+    CHECK(!sound.video && !selected(sound, "video-studio"));
+    CHECK(skillAutoSelect(all, "That argument sounds good").skills.empty());
+    CHECK(skillAutoSelect(all, "Sound judgment matters").skills.empty());
+    return "";
+}
+
+TEST(skills_AutoSelect_Concrete_3D_Assets_And_Animation) {
+    const auto all = workflowCatalog();
+    for (const auto* task : {"Preview a glTF 3D asset with Three.js", "Inspect model.GLB", "Render a 3D model viewer"}) {
+        const auto result = skillAutoSelect(all, task);
+        CHECK(selected(result, "threejs"));
+        CHECK(!selected(result, "blender-production"));
+        CHECK(result.skills.size() <= 4);
+    }
+    auto motion = skillAutoSelect(all, "Create a Three.js 3D model animation");
+    CHECK(selected(motion, "threejs") && selected(motion, "threejs-animation-engineering"));
+    CHECK(!selected(motion, "browser-animation-engineering"));
+    auto generic3D = skillAutoSelect(all, "Create a 3D animation");
+    CHECK(selected(generic3D, "threejs") && selected(generic3D, "threejs-animation-engineering"));
+    CHECK(!selected(generic3D, "browser-animation-engineering"));
+    auto uiVideo = skillAutoSelect(all, "Create a website video with a Three.js 3D model animation");
+    CHECK(uiVideo.ui && uiVideo.video);
+    CHECK(selected(uiVideo, "threejs") && selected(uiVideo, "threejs-animation-engineering"));
+    CHECK_EQ(uiVideo.skills.size(), size_t(4));
+    CHECK(!selected(uiVideo, "browser-animation-engineering"));
+    auto loaded = skillAutoSelect(all, "Preview a GLB with Three.js", {"threejs", "project-workflows"});
+    CHECK(loaded.skills.empty());
+    auto namedLoaded = skillAutoSelect(all, "Use threejs and threejs-animation-engineering for the 3D model animation",
+                                       {"threejs", "threejs-animation-engineering", "project-workflows"});
+    CHECK(namedLoaded.skills.empty());
+    auto capped = skillAutoSelect(all, "Create a Three.js 3D model animation", {}, 1);
+    CHECK_EQ(capped.skills.size(), size_t(1));
+    CHECK_EQ(capped.skills[0].name, std::string("threejs"));
+    CHECK(skillAutoSelect(all, "Preview a GLB with Three.js", {}, 0).skills.empty());
+    auto modeling = skillAutoSelect(all, "Model and rig a creature in Blender");
+    CHECK(selected(modeling, "blender-production"));
+    CHECK(!selected(modeling, "threejs"));
+    auto unavailable = skillAutoSelect({all[0]}, "Preview a GLB with Three.js");
+    CHECK_EQ(unavailable.skills.size(), size_t(1));
+    CHECK_EQ(unavailable.skills[0].name, std::string("project-workflows"));
+    CHECK(skillAutoSelect(all, "A 3D printer service needs attention").skills.empty());
+    CHECK(skillAutoSelect(all, "The gltfactory description is available").skills.empty());
     return "";
 }
 
@@ -194,6 +239,12 @@ TEST(skills_AutoSelect_Project_Manifest_And_Explicit_Runtime) {
     auto explicitRuntime = skillAutoSelect(all, "Write a Python script", {}, 4, ws);
     CHECK(selected(explicitRuntime, "python-software-engineering"));
     CHECK(!selected(explicitRuntime, "modern-frontend-frameworks"));
+    auto asset = skillAutoSelect(all, "Fix the glTF 3D asset preview", {}, 4, ws);
+    CHECK(selected(asset, "threejs"));
+    CHECK(!selected(asset, "modern-frontend-frameworks"));
+    auto audio = skillAutoSelect(all, "Improve the music and edit the sound", {}, 4, ws);
+    CHECK(selected(audio, "music-composition") && selected(audio, "audio-processing"));
+    CHECK(!selected(audio, "modern-frontend-frameworks") && !selected(audio, "project-workflows"));
     auto resumed = skillAutoSelect(all, "Fix the failing test", {"modern-frontend-frameworks", "project-workflows"}, 4, ws);
     CHECK(resumed.skills.empty());
     rmRf(ws);

@@ -173,6 +173,15 @@ SkillSelection skillAutoSelect(const std::vector<SkillMeta>& all, const std::str
     const bool tuning = has({"fine tuning", "finetuning", "fine tune", "finetune", "lora", "qlora", "peft", "sft"});
     const bool colab = has({"colab", "google colab"});
     const bool ml = has({"machine learning", "ml", "model training", "classification", "regression model", "neural network"});
+    const bool blender = has({"blender"}) &&
+                         has({"model", "modeling", "modelling", "rig", "rigging", "sculpt", "sculpting", "retopology"});
+    const bool threejs = has({"threejs", "three js", "gltf", "glb"}) ||
+                         (!blender && has({"3d model", "3d models", "3d asset", "3d assets", "3d scene", "3d scenes",
+                                           "3d viewer", "3d animation"}));
+    const bool music = has({"music", "compose a song", "compose song", "songwriting", "melody", "midi", "soundtrack"});
+    const bool audio = has({"audio", "sound editing", "sound edit", "edit sound", "edit the sound", "edit its sound", "edit a sound",
+                            "editing sound", "trim sound", "trim the sound", "mix sound", "mix the sound", "noise reduction",
+                            "denoise", "loudness", "mix audio"});
     const bool seo = has({"seo", "search discoverability", "search engine", "crawlability", "canonical", "robots txt",
                          "sitemap", "structured data", "indexability", "meta description", "title tags", "schema org"});
     const bool proseArtifact = has({"article", "blog post", "essay", "email", "proposal", "copy", "prose", "paragraph",
@@ -193,7 +202,7 @@ SkillSelection skillAutoSelect(const std::vector<SkillMeta>& all, const std::str
     if (seo && !has({"design", "redesign", "restyle", "layout", "css", "ui", "ux", "gui", "visual", "build", "create"}))
         result.ui = false;  // a source metadata audit is not a visual redesign
     const bool work = php || node || react || browser || go || rust || java || python || shell || cpp || c || desktop ||
-                      localWeb || algorithm || tuning || colab || ml || result.ui || result.video || animation || delivery;
+                      localWeb || algorithm || tuning || colab || ml || threejs || blender || result.ui || result.video || animation || delivery;
 
     // Preserve named skills first, then mandatory craft and actual delivery needs.
     for (const auto& skill : all)
@@ -210,6 +219,9 @@ SkillSelection skillAutoSelect(const std::vector<SkillMeta>& all, const std::str
     if (linux) add("linux");
     if (linux && has({"ubuntu"})) add("ubuntu-operations");
     if (delivery) add("shared-hosting-deployment");
+    if (threejs) add("threejs");
+    if (animation && threejs) add("threejs-animation-engineering");
+    if (blender) add("blender-production");
     if (work) add("project-workflows");
     if (colab) add("google-colab-training");
     if (tuning) add("llm-fine-tuning");
@@ -228,10 +240,9 @@ SkillSelection skillAutoSelect(const std::vector<SkillMeta>& all, const std::str
     if (localWeb) add("local-webapp-workflows");
     if (algorithm) add("algorithm-design");
     if (ml && !tuning) add("ml-engineering");
-    if (animation && !result.video) add("browser-animation-engineering");
-    if (has({"music", "compose a song", "compose song", "songwriting", "melody", "midi", "soundtrack"})) add("music-composition");
-    if (has({"audio", "sound editing", "sound edit", "noise reduction", "denoise", "loudness", "mix audio"}))
-        add("audio-processing");
+    if (animation && !result.video && !threejs && !blender) add("browser-animation-engineering");
+    if (music) add("music-composition");
+    if (audio) add("audio-processing");
 
     // A generic implementation request can still route from actual manifests.
     // Explicit task runtimes win; project detection never runs commands or scans
@@ -240,6 +251,7 @@ SkillSelection skillAutoSelect(const std::vector<SkillMeta>& all, const std::str
     const bool documentationOnly = has({"readme", "markdown", "documentation", "docs", "changelog", "typo", "spelling", "grammar"}) &&
                                    !has({"implement", "debug", "code", "function", "parser", "test", "tests", "crash"});
     if (!workspace.empty() && !explicitRuntime && !documentationOnly && !seo && !writing && !network && !packet && !lan && !linux &&
+        !threejs && !blender && !result.video && !animation && !music && !audio &&
         has({"implement", "fix", "debug", "refactor", "optimize", "improve", "build", "test", "tests", "bug", "failure"})) {
         auto exists = [&](const char* file) {
             struct stat st;

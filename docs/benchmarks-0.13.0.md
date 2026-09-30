@@ -11,9 +11,10 @@ source revisions with the same updated fixture and compiler.
 
 Delivery note: the 0.13.0 tag was blocked before publication by GCC 13's
 `-Werror=range-loop-construct` in an existing audio test. The delivered version
-is 0.13.1, with those two test bindings changed to references and the version
-string updated. The measured execution implementation is otherwise unchanged;
-the original measurement filenames remain intact.
+is 0.13.2, with those two test bindings changed to references, the version string
+updated, and explicit 3D/combined sound-editing workflow selection completed
+during installation acceptance. Those routes are outside the measured tasks;
+the measured execution paths and original measurement filenames remain intact.
 
 ## Controlled agent fixtures
 

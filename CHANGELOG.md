@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.13.2
+
+Complete automatic media workflow selection on top of the execution, quality,
+native diagnostics and media improvements in 0.13.1 below.
+
+- Select the existing Three.js guide and local glTF/GLB preflight/preview
+  workflow for explicit 3D assets and scenes. Choose the specialized 3D
+  animation guide instead of overlapping generic browser animation guidance.
+- Select Blender production guidance for explicit Blender/modeling requests;
+  keep generic 3D printer references out of rendering workflows.
+- Recognize combined music creation and sound editing, while keeping bare
+  sound references inert. Skip unrelated project manifest discovery for these
+  explicit media tasks, and retain loaded-guide deduplication and selection caps.
+- Preserve the strict GCC 13 warning fix from 0.13.1. The original measured
+  execution paths and their unresolved live-complex regression are documented
+  in `docs/benchmarks-0.13.0.md`.
+
 ## 0.13.1
 
 More precise execution, targeted quality checks and bounded native diagnostics.
