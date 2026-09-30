@@ -142,12 +142,12 @@ TEST(audio_PCM_And_Float_Formats_Have_Correct_Sign_And_Scale) {
 TEST(audio_Rejects_Truncated_Chunks_And_Dangerous_Formats) {
     const std::string good = fixture(1, 16, 1, {0, 1, 2, 3});
     for (size_t n = 0; n < good.size(); ++n) CHECK(!analyzeWav(good.substr(0, n)).ok);
-    for (const auto [offset, value] : std::vector<std::pair<size_t, uint32_t>>{
+    for (const auto& [offset, value] : std::vector<std::pair<size_t, uint32_t>>{
             {4, 0xffffffff}, {16, 0xffffffff}, {26, 0}, {26, 2}, {34, 0}, {34, 1}, {34, 9},
             {34, 0xffffffff}, {38, 0}, {50, 0xffffffff}, {50, 1}}) {
         std::string bad = good; setLe(bad, offset, value, 4); CHECK(!analyzeWav(bad).ok);
     }
-    for (const auto [offset, value] : std::vector<std::pair<size_t, uint32_t>>{
+    for (const auto& [offset, value] : std::vector<std::pair<size_t, uint32_t>>{
             {30, 2}, {30, 3}, {32, 0}, {32, 33}, {42, 0}, {42, 3}, {44, 0}, {44, 12}}) {
         std::string bad = good; setLe(bad, offset, value, 2); CHECK(!analyzeWav(bad).ok);
     }

@@ -1,8 +1,12 @@
 # Changelog
 
-## 0.13.0
+## 0.13.1
 
 More precise execution, targeted quality checks and bounded native diagnostics.
+
+The 0.13.0 tag was blocked before publication by GCC 13's strict range-loop
+warning in an existing audio test. Fix the copied bindings and retain the
+strict warning policy; 0.13.1 includes the changes measured below.
 
 - Compact the stable system prompt and repeated guide protocol. Reuse exact
   large tool results before relevance judgment only while their original
