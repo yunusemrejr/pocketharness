@@ -1,0 +1,455 @@
+{
+  "method": "5 sequential pairs, alternating order, 40ms model latency and 12ms judge/observer latency; deterministic offline token estimates",
+  "rows": [
+    {
+      "phase": "before",
+      "repeat": 0,
+      "result": {
+        "cases": [
+          {
+            "case": "simple-title-edit",
+            "completion_ms": 278,
+            "coordination_calls": 4,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 3615,
+            "fixture_output_tokens": 100,
+            "initial_thinking": "high",
+            "main_wire_bytes": 9506,
+            "model_requests": 5,
+            "observer_calls": 0,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 2
+          },
+          {
+            "case": "complex-steady-progress",
+            "completion_ms": 1256,
+            "coordination_calls": 6,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 45633,
+            "fixture_output_tokens": 580,
+            "initial_thinking": "high",
+            "main_wire_bytes": 177047,
+            "model_requests": 29,
+            "observer_calls": 2,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 26
+          }
+        ],
+        "decision_latency_ms": 12,
+        "fixture_latency_ms": 40,
+        "measurement": "offline deterministic fixture; token estimates are not live API usage"
+      }
+    },
+    {
+      "phase": "after",
+      "repeat": 0,
+      "result": {
+        "cases": [
+          {
+            "case": "simple-title-edit",
+            "completion_ms": 190,
+            "coordination_calls": 2,
+            "correct": true,
+            "decision_calls": 1,
+            "error": "",
+            "fixture_input_tokens": 2342,
+            "fixture_output_tokens": 80,
+            "initial_thinking": "low",
+            "main_wire_bytes": 9025,
+            "model_requests": 4,
+            "observer_calls": 0,
+            "planning_requests": 0,
+            "review_requests": 1,
+            "tool_calls": 2
+          },
+          {
+            "case": "complex-steady-progress",
+            "completion_ms": 1233,
+            "coordination_calls": 4,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 45633,
+            "fixture_output_tokens": 580,
+            "initial_thinking": "high",
+            "main_wire_bytes": 177047,
+            "model_requests": 29,
+            "observer_calls": 0,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 26
+          }
+        ],
+        "decision_latency_ms": 12,
+        "fixture_latency_ms": 40,
+        "measurement": "offline deterministic fixture; token estimates are not live API usage"
+      }
+    },
+    {
+      "phase": "after",
+      "repeat": 1,
+      "result": {
+        "cases": [
+          {
+            "case": "simple-title-edit",
+            "completion_ms": 190,
+            "coordination_calls": 2,
+            "correct": true,
+            "decision_calls": 1,
+            "error": "",
+            "fixture_input_tokens": 2342,
+            "fixture_output_tokens": 80,
+            "initial_thinking": "low",
+            "main_wire_bytes": 9025,
+            "model_requests": 4,
+            "observer_calls": 0,
+            "planning_requests": 0,
+            "review_requests": 1,
+            "tool_calls": 2
+          },
+          {
+            "case": "complex-steady-progress",
+            "completion_ms": 1232,
+            "coordination_calls": 4,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 45633,
+            "fixture_output_tokens": 580,
+            "initial_thinking": "high",
+            "main_wire_bytes": 177047,
+            "model_requests": 29,
+            "observer_calls": 0,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 26
+          }
+        ],
+        "decision_latency_ms": 12,
+        "fixture_latency_ms": 40,
+        "measurement": "offline deterministic fixture; token estimates are not live API usage"
+      }
+    },
+    {
+      "phase": "before",
+      "repeat": 1,
+      "result": {
+        "cases": [
+          {
+            "case": "simple-title-edit",
+            "completion_ms": 263,
+            "coordination_calls": 4,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 3615,
+            "fixture_output_tokens": 100,
+            "initial_thinking": "high",
+            "main_wire_bytes": 9506,
+            "model_requests": 5,
+            "observer_calls": 0,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 2
+          },
+          {
+            "case": "complex-steady-progress",
+            "completion_ms": 1258,
+            "coordination_calls": 6,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 45633,
+            "fixture_output_tokens": 580,
+            "initial_thinking": "high",
+            "main_wire_bytes": 177047,
+            "model_requests": 29,
+            "observer_calls": 2,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 26
+          }
+        ],
+        "decision_latency_ms": 12,
+        "fixture_latency_ms": 40,
+        "measurement": "offline deterministic fixture; token estimates are not live API usage"
+      }
+    },
+    {
+      "phase": "before",
+      "repeat": 2,
+      "result": {
+        "cases": [
+          {
+            "case": "simple-title-edit",
+            "completion_ms": 263,
+            "coordination_calls": 4,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 3615,
+            "fixture_output_tokens": 100,
+            "initial_thinking": "high",
+            "main_wire_bytes": 9506,
+            "model_requests": 5,
+            "observer_calls": 0,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 2
+          },
+          {
+            "case": "complex-steady-progress",
+            "completion_ms": 1256,
+            "coordination_calls": 6,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 45633,
+            "fixture_output_tokens": 580,
+            "initial_thinking": "high",
+            "main_wire_bytes": 177047,
+            "model_requests": 29,
+            "observer_calls": 2,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 26
+          }
+        ],
+        "decision_latency_ms": 12,
+        "fixture_latency_ms": 40,
+        "measurement": "offline deterministic fixture; token estimates are not live API usage"
+      }
+    },
+    {
+      "phase": "after",
+      "repeat": 2,
+      "result": {
+        "cases": [
+          {
+            "case": "simple-title-edit",
+            "completion_ms": 191,
+            "coordination_calls": 2,
+            "correct": true,
+            "decision_calls": 1,
+            "error": "",
+            "fixture_input_tokens": 2342,
+            "fixture_output_tokens": 80,
+            "initial_thinking": "low",
+            "main_wire_bytes": 9025,
+            "model_requests": 4,
+            "observer_calls": 0,
+            "planning_requests": 0,
+            "review_requests": 1,
+            "tool_calls": 2
+          },
+          {
+            "case": "complex-steady-progress",
+            "completion_ms": 1231,
+            "coordination_calls": 4,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 45633,
+            "fixture_output_tokens": 580,
+            "initial_thinking": "high",
+            "main_wire_bytes": 177047,
+            "model_requests": 29,
+            "observer_calls": 0,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 26
+          }
+        ],
+        "decision_latency_ms": 12,
+        "fixture_latency_ms": 40,
+        "measurement": "offline deterministic fixture; token estimates are not live API usage"
+      }
+    },
+    {
+      "phase": "after",
+      "repeat": 3,
+      "result": {
+        "cases": [
+          {
+            "case": "simple-title-edit",
+            "completion_ms": 191,
+            "coordination_calls": 2,
+            "correct": true,
+            "decision_calls": 1,
+            "error": "",
+            "fixture_input_tokens": 2342,
+            "fixture_output_tokens": 80,
+            "initial_thinking": "low",
+            "main_wire_bytes": 9025,
+            "model_requests": 4,
+            "observer_calls": 0,
+            "planning_requests": 0,
+            "review_requests": 1,
+            "tool_calls": 2
+          },
+          {
+            "case": "complex-steady-progress",
+            "completion_ms": 1234,
+            "coordination_calls": 4,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 45633,
+            "fixture_output_tokens": 580,
+            "initial_thinking": "high",
+            "main_wire_bytes": 177047,
+            "model_requests": 29,
+            "observer_calls": 0,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 26
+          }
+        ],
+        "decision_latency_ms": 12,
+        "fixture_latency_ms": 40,
+        "measurement": "offline deterministic fixture; token estimates are not live API usage"
+      }
+    },
+    {
+      "phase": "before",
+      "repeat": 3,
+      "result": {
+        "cases": [
+          {
+            "case": "simple-title-edit",
+            "completion_ms": 263,
+            "coordination_calls": 4,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 3615,
+            "fixture_output_tokens": 100,
+            "initial_thinking": "high",
+            "main_wire_bytes": 9506,
+            "model_requests": 5,
+            "observer_calls": 0,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 2
+          },
+          {
+            "case": "complex-steady-progress",
+            "completion_ms": 1256,
+            "coordination_calls": 6,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 45633,
+            "fixture_output_tokens": 580,
+            "initial_thinking": "high",
+            "main_wire_bytes": 177047,
+            "model_requests": 29,
+            "observer_calls": 2,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 26
+          }
+        ],
+        "decision_latency_ms": 12,
+        "fixture_latency_ms": 40,
+        "measurement": "offline deterministic fixture; token estimates are not live API usage"
+      }
+    },
+    {
+      "phase": "before",
+      "repeat": 4,
+      "result": {
+        "cases": [
+          {
+            "case": "simple-title-edit",
+            "completion_ms": 265,
+            "coordination_calls": 4,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 3615,
+            "fixture_output_tokens": 100,
+            "initial_thinking": "high",
+            "main_wire_bytes": 9506,
+            "model_requests": 5,
+            "observer_calls": 0,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 2
+          },
+          {
+            "case": "complex-steady-progress",
+            "completion_ms": 1258,
+            "coordination_calls": 6,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 45633,
+            "fixture_output_tokens": 580,
+            "initial_thinking": "high",
+            "main_wire_bytes": 177047,
+            "model_requests": 29,
+            "observer_calls": 2,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 26
+          }
+        ],
+        "decision_latency_ms": 12,
+        "fixture_latency_ms": 40,
+        "measurement": "offline deterministic fixture; token estimates are not live API usage"
+      }
+    },
+    {
+      "phase": "after",
+      "repeat": 4,
+      "result": {
+        "cases": [
+          {
+            "case": "simple-title-edit",
+            "completion_ms": 191,
+            "coordination_calls": 2,
+            "correct": true,
+            "decision_calls": 1,
+            "error": "",
+            "fixture_input_tokens": 2342,
+            "fixture_output_tokens": 80,
+            "initial_thinking": "low",
+            "main_wire_bytes": 9025,
+            "model_requests": 4,
+            "observer_calls": 0,
+            "planning_requests": 0,
+            "review_requests": 1,
+            "tool_calls": 2
+          },
+          {
+            "case": "complex-steady-progress",
+            "completion_ms": 1233,
+            "coordination_calls": 4,
+            "correct": true,
+            "decision_calls": 2,
+            "error": "",
+            "fixture_input_tokens": 45633,
+            "fixture_output_tokens": 580,
+            "initial_thinking": "high",
+            "main_wire_bytes": 177047,
+            "model_requests": 29,
+            "observer_calls": 0,
+            "planning_requests": 1,
+            "review_requests": 1,
+            "tool_calls": 26
+          }
+        ],
+        "decision_latency_ms": 12,
+        "fixture_latency_ms": 40,
+        "measurement": "offline deterministic fixture; token estimates are not live API usage"
+      }
+    }
+  ]
+}

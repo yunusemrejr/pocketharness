@@ -2,7 +2,8 @@
 CXX ?= g++
 # Note: -Wno-error=maybe-uninitialized works around GCC false positives on
 # std::variant moves; genuine cases still print as warnings.
-CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Werror -Wno-error=maybe-uninitialized -MMD -MP -Isrc
+GCC_WARN_WORKAROUND := $(if $(findstring clang,$(notdir $(CXX))),,-Wno-error=maybe-uninitialized)
+CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Werror $(GCC_WARN_WORKAROUND) -MMD -MP -Isrc
 LDFLAGS ?=
 LDLIBS ?= -lpthread
 
@@ -47,18 +48,23 @@ sanitize:
 	./$(TEST_BIN)
 
 install: $(BIN)
-	mkdir -p $(BINDIR)
-	@set -eu; staged=$$(mktemp "$(BINDIR)/.pocket-install.XXXXXX"); \
-	  trap 'rm -f "$$staged"' EXIT; \
-	  install -m 0755 $(BIN) "$$staged"; mv -f "$$staged" "$(BINDIR)/pocket"
-	@# Bundled skills are program data: replaced wholesale on every install.
-	@# Your own skills live in ~/.config/pocketharness/skills and win on name.
-	rm -rf $(SKILLDIR) && mkdir -p $(SKILLDIR) && cp -r skills/. $(SKILLDIR)/
-	@echo "installed $(BINDIR)/pocket and $$(ls skills | wc -l) bundled skills"
+	PREFIX="$(PREFIX)" ./scripts/install-built.sh .
+
+check-workflows:
+	python3 scripts/check-workflows.py
+
+package: $(BIN)
+	./scripts/package-release.sh
+
+bench: tests/benchmark_agent
+	./tests/benchmark_agent
+
+tests/benchmark_agent: tests/benchmark_agent.cpp $(TEST_LIB)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $< $(TEST_LIB) $(LDLIBS)
 
 clean:
-	rm -f $(OBJ) $(BIN) $(TEST_OBJ) $(TEST_BIN) $(OBJ:.o=.d) $(TEST_OBJ:.o=.d)
+	rm -f $(OBJ) $(BIN) $(TEST_OBJ) $(TEST_BIN) tests/benchmark_agent tests/benchmark_agent.d $(OBJ:.o=.d) $(TEST_OBJ:.o=.d)
 
 -include $(OBJ:.o=.d) $(TEST_OBJ:.o=.d)
 
-.PHONY: all test sanitize install clean
+.PHONY: all test sanitize install clean check-workflows package bench

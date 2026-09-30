@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.12.0
+
+Adaptive native execution, reusable project workflows, and media reliability.
+
+- Native task policy scales planning, reasoning, configured fast/main models,
+  reviewers and local observation with complexity, risk and observed failures.
+  Explicit model/thinking choices stay authoritative; growing or failing work
+  escalates and steady progress skips redundant coordination.
+- Successful stop hooks are reused only for an unchanged work revision. Edits
+  invalidate lint/review state, so reviewer-requested fixes receive fresh checks.
+- Deterministic skill routing selects installed stack/media/hosting guides,
+  avoids repeated loaded-skill hints and uses Jev for ambiguous substantial work.
+  Reusable recipes cover native/web/scripting/ML discovery through delivery;
+  UI guidance preserves project identity and targets concrete generic patterns.
+- Native music synthesis avoids invariant per-sample work. Mixing preserves a
+  full music bed when short cues are present, validates WAV layouts and timeline
+  bounds, downmixes surround and filters high-rate inputs before downsampling.
+- Native mix editing supports input trims, voice gain and fade-in. Browser
+  capture freezes CSS/WAAPI animations before delayed asset readiness, then
+  seeks each frame deterministically; short animations no longer disappear.
+- Preserve continuous TUI activity, recover the footer after tiny-terminal
+  resizing, and honor cancellation before final judgments and reviewer starts.
+- Tag releases run compiler/sanitizer checks before publishing a Linux binary,
+  bundled skills and checksum. Source and binary installs use one staged path
+  that preserves user configuration, sessions and personal skills.
+
+Measured fixture and native media results, limitations and reproduction commands
+are recorded in `docs/benchmarks-0.12.0.md`.
+
+## 0.11.4
+
+Continuous TUI liveness and cancellation fixes.
+
+- The animated activity row has priority over wrapped metadata, so the spinner
+  stays visible in narrow or short terminals and while the model is silent.
+  Quiet ticks repaint only that row without rewrapping drafts or changing the
+  transcript's saved cursor. `NO_COLOR` still permits animation;
+  `POCKET_NO_ANIM=1` retains the static indicator and elapsed time.
+- Growing a terminal back from fewer than six rows restores the pinned footer.
+  Previously, one tiny resize disabled the footer for the rest of the session.
+- An active goal no longer displays "paused" just because older follow-ups are
+  held. The queue remains held until explicitly released.
+- Escape at the final reply or during the Jev review prefilter stops new council
+  requests. Reviewer workers check cancellation before starting; interrupted
+  councils retain incurred costs without publishing a review verdict.
+
+Four regression tests cover real PTY animation frames, resizing, retained
+drafts and queues, and cancellation at the main-response and review boundaries.
+
 ## 0.11.3
 
 Composer and footer redraw cost, on the path taken for every keystroke and

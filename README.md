@@ -59,6 +59,28 @@ pocket --version
 pocket --help
 ```
 
+## Adaptive execution and workflows
+
+Small tasks skip planning overhead. With adaptive thinking and an implicit model
+choice, safe simple work can use the configured fast role; edits, failures and
+broader work return to main and raise reasoning/review proportionately. Explicit
+model and thinking choices stay authoritative. Passed hooks are reused until the
+work changes, and steady progress avoids redundant local observer calls.
+
+```sh
+pocket --workflow "Build a PHP 8 website and deploy via Git/SSH on Namecheap"
+```
+
+The offline JSON diagnostic shows native policy and available workflow guides.
+Bundled recipes cover the native, scripting, web and ML stacks, checkpointed
+validation/delivery, media production and shared hosting. Design guidance preserves
+project identity and repairs specific generic patterns. See [execution and workflow
+contracts](docs/execution-workflows.md) and [measured benchmarks](docs/benchmarks-0.12.0.md).
+
+Tagged releases publish a checked Linux binary with bundled skills and checksums.
+The archive installer preserves your configuration, sessions and personal skills.
+Source installation remains available for your compiler/platform.
+
 ## Quick start
 
 ```bash
@@ -92,8 +114,11 @@ Up/Down history, Esc pauses work, Ctrl-C cancels (idle empty prompt quits), Ctrl
 Paste is bracketed (multi-line paste never submits early); the pinned bottom
 bar shows the input box, full provider/model/thinking, combined metered cost,
 and context/tok-s/cache KPIs, with the full session ID above them. While a
-turn runs, the status line shows a live spinner with elapsed time, so a
-silent model or a long tool never looks frozen. The composer
+turn runs, a reserved status row shows a live spinner with elapsed time,
+even during silent thinking or tool calls and after terminal resizes. Quiet
+animation ticks repaint only that row, keeping large drafts responsive.
+`NO_COLOR` preserves motion; `POCKET_NO_ANIM=1` uses a static indicator with
+elapsed time. The composer
 stays live during generation: Enter queues a message visibly. Work yields after
 the current tool batch so follow-ups take effect before another model request.
 Esc stops the current work and holds the queue until a new follow-up or
@@ -131,14 +156,13 @@ cannot be shed — under `--offline` the whole subtree loses `AF_INET`.
 Weak and strong models get the same standards, enforced by the harness:
 
 1. **Brief.** A substantial request ("fix", "build", "redesign", ...) first
-   goes to the `fast` model as a planning council: intent, the questions a
+   can go to the `fast` model as a planning council when complexity or risk warrants it: intent, the questions a
    domain expert would ask (identity, typography, architecture, data,
    security...) answered decisively from the project's evidence and the
    wisdom book, acceptance criteria, and the average outcome to avoid. The
    brief rides along with the request; the user's words win on conflict.
-2. **Skill hints.** BM25 finds candidate skills; Jev confirms relevance in
-   one batched call; the hint names them for loading. The same call asks Jev
-   whether the request is UI/UX/GUI work and, if so, requires the bundled
+2. **Skill hints.** Native task/manifest routes select available skills; ambiguous substantial work uses BM25 and Jev in
+   one batched call; the hint names them for loading. Native task evidence and Jev decisions identify UI/UX/GUI work and require the bundled
    `ai-design-slop` doctrine to be read first (writing a UI file without it
    triggers the same demand).
 3. **Guardian on every change.** Writes/edits are scanned natively
@@ -157,8 +181,8 @@ Weak and strong models get the same standards, enforced by the harness:
    requirements, premature completion → a short `[overseer]` nudge and the
    turn continues. Files changed but never verified → a verification demand.
    Failing `stop` hooks → their output. Changed work → the **review
-   council**: Span prefilters (clean work skips the paid review), then each
-   `review` model answers LGTM or defects; a majority of objections goes
+   council**: Span prefilters (clean work skips the paid review), then a proportionate subset of the configured
+   `review` roster answers LGTM or defects; a majority of objections goes
    back to the worker once.
 6. **Goals.** `/goal TEXT` (or `pocket -g`) runs turns until an audit says
    the goal is met: the `fast` model audits the evidence digest and lists

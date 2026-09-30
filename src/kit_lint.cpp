@@ -19,7 +19,6 @@ namespace fs = std::filesystem;
 
 enum : unsigned { JS = 1, PY = 2, C = 4, SH = 8, GO = 16, PHP = 32, JAVA = 64, HTML = 128, CSS = 256, SVG = 512, CFG = 1024, SQL = 2048 };
 constexpr unsigned CODE = JS | PY | C | SH | GO | PHP | JAVA;
-constexpr unsigned SERVER = JS | PY | GO | PHP | JAVA;
 
 unsigned langOf(const std::string& path) {
     static const std::map<std::string, unsigned> kExt = {
@@ -433,14 +432,14 @@ void svgChecks(const std::string& s, const std::vector<std::string>& lines, Sink
         }
     if (fills.size() > 6 && low.find("currentcolor") == std::string::npos && low.find("var(--") == std::string::npos)
         sink.add('L', "ui", std::to_string(fills.size()) + " hard-coded colours and no currentColor/CSS variables: the graphic cannot follow the theme", 1);
-    int unused = 0, emptyG = 0, ln = 0;
+    int unused = 0, emptyG = 0;
     for (size_t i = 0; (i = low.find(" id=\"", i)) != std::string::npos; ++i) {
         size_t e = low.find('"', i + 5);
         if (e == std::string::npos) break;
         std::string id = low.substr(i + 5, e - i - 5);
         if (low.find("#" + id) == std::string::npos && low.find("\"" + id + "\"", e + 1) == std::string::npos) ++unused;
     }
-    for (const auto& l : lines) { ++ln; std::string t = trim(toLower(l)); if (t == "<g></g>" || t == "<g/>") ++emptyG; }
+    for (const auto& l : lines) { std::string t = trim(toLower(l)); if (t == "<g></g>" || t == "<g/>") ++emptyG; }
     if (unused > 3) sink.add('L', "perf", std::to_string(unused) + " ids are never referenced: strip them", 1);
     if (emptyG) sink.add('L', "perf", "empty <g> groups: remove", 1);
     if (s.size() > 200 * 1024) sink.add('M', "perf", "SVG over 200 KB: simplify, or ship a raster", 1);

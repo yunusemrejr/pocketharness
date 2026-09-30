@@ -1,0 +1,643 @@
+{
+  "method": "sequential paired runs; order alternates; median wall and waited child CPU time",
+  "scope": "native kit commands; LLM token/tool/coordination metrics are not applicable",
+  "binaries": {
+    "before": {
+      "path": "BASELINE/pocket",
+      "sha256": "b937b1ced9a5bc80ddcc984a534ca36373e3814486da009dba6b0434a725201b"
+    },
+    "after": {
+      "path": "CANDIDATE/pocket",
+      "sha256": "760f59ed98f3633a4baca7c2a5850d2886999eab0a0c894862048c698be2bbf8"
+    }
+  },
+  "music": {
+    "lofi": {
+      "before": [
+        {
+          "command": [
+            "BASELINE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/lofi-before.wav",
+            "--style",
+            "lofi",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 2.7352204280005026,
+          "cpu_s": 2.7291359999999996,
+          "report": "OUTPUT/lofi-before.wav: 60.0s stereo 48000 Hz, lofi in E minor at 78 BPM, -16.0 LUFS, peak -1.0 dBFS"
+        },
+        {
+          "command": [
+            "BASELINE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/lofi-before.wav",
+            "--style",
+            "lofi",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 3.274696302000848,
+          "cpu_s": 3.0919650000000005,
+          "report": "OUTPUT/lofi-before.wav: 60.0s stereo 48000 Hz, lofi in E minor at 78 BPM, -16.0 LUFS, peak -1.0 dBFS"
+        },
+        {
+          "command": [
+            "BASELINE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/lofi-before.wav",
+            "--style",
+            "lofi",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 3.1819416559992533,
+          "cpu_s": 3.1685180000000015,
+          "report": "OUTPUT/lofi-before.wav: 60.0s stereo 48000 Hz, lofi in E minor at 78 BPM, -16.0 LUFS, peak -1.0 dBFS"
+        }
+      ],
+      "after": [
+        {
+          "command": [
+            "CANDIDATE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/lofi-after.wav",
+            "--style",
+            "lofi",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.9297114020000663,
+          "cpu_s": 1.9242870000000003,
+          "report": "OUTPUT/lofi-after.wav: 60.0s stereo 48000 Hz, lofi in E minor at 78 BPM, -16.0 LUFS, peak -1.0 dBFS"
+        },
+        {
+          "command": [
+            "CANDIDATE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/lofi-after.wav",
+            "--style",
+            "lofi",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.9655331060002936,
+          "cpu_s": 1.9592820000000002,
+          "report": "OUTPUT/lofi-after.wav: 60.0s stereo 48000 Hz, lofi in E minor at 78 BPM, -16.0 LUFS, peak -1.0 dBFS"
+        },
+        {
+          "command": [
+            "CANDIDATE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/lofi-after.wav",
+            "--style",
+            "lofi",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 2.1547720479993586,
+          "cpu_s": 2.1482720000000013,
+          "report": "OUTPUT/lofi-after.wav: 60.0s stereo 48000 Hz, lofi in E minor at 78 BPM, -16.0 LUFS, peak -1.0 dBFS"
+        }
+      ],
+      "medians": {
+        "before": {
+          "wall_s": 3.1819416559992533,
+          "cpu_s": 3.0919650000000005
+        },
+        "after": {
+          "wall_s": 1.9655331060002936,
+          "cpu_s": 1.9592820000000002
+        }
+      },
+      "wav_sha256": {
+        "before": "46db089d7dd50d85c59f54b44e9281e4fd34008082aefb54f9b36ab1d8e2d1d2",
+        "after": "46db089d7dd50d85c59f54b44e9281e4fd34008082aefb54f9b36ab1d8e2d1d2"
+      },
+      "identical_pcm16": true
+    },
+    "corporate": {
+      "before": [
+        {
+          "command": [
+            "BASELINE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/corporate-before.wav",
+            "--style",
+            "corporate",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 2.00979609299975,
+          "cpu_s": 2.0027719999999976,
+          "report": "OUTPUT/corporate-before.wav: 60.0s stereo 48000 Hz, corporate in E major at 108 BPM, -16.0 LUFS, peak -2.9 dBFS"
+        },
+        {
+          "command": [
+            "BASELINE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/corporate-before.wav",
+            "--style",
+            "corporate",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 2.1534634119998373,
+          "cpu_s": 2.0225939999999962,
+          "report": "OUTPUT/corporate-before.wav: 60.0s stereo 48000 Hz, corporate in E major at 108 BPM, -16.0 LUFS, peak -2.9 dBFS"
+        },
+        {
+          "command": [
+            "BASELINE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/corporate-before.wav",
+            "--style",
+            "corporate",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.8492006020005647,
+          "cpu_s": 1.8431390000000025,
+          "report": "OUTPUT/corporate-before.wav: 60.0s stereo 48000 Hz, corporate in E major at 108 BPM, -16.0 LUFS, peak -2.9 dBFS"
+        }
+      ],
+      "after": [
+        {
+          "command": [
+            "CANDIDATE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/corporate-after.wav",
+            "--style",
+            "corporate",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.7345452919998934,
+          "cpu_s": 1.7155079999999985,
+          "report": "OUTPUT/corporate-after.wav: 60.0s stereo 48000 Hz, corporate in E major at 108 BPM, -16.0 LUFS, peak -2.9 dBFS"
+        },
+        {
+          "command": [
+            "CANDIDATE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/corporate-after.wav",
+            "--style",
+            "corporate",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.9623040169999513,
+          "cpu_s": 1.9097940000000042,
+          "report": "OUTPUT/corporate-after.wav: 60.0s stereo 48000 Hz, corporate in E major at 108 BPM, -16.0 LUFS, peak -2.9 dBFS"
+        },
+        {
+          "command": [
+            "CANDIDATE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/corporate-after.wav",
+            "--style",
+            "corporate",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.312652307999997,
+          "cpu_s": 1.3088379999999984,
+          "report": "OUTPUT/corporate-after.wav: 60.0s stereo 48000 Hz, corporate in E major at 108 BPM, -16.0 LUFS, peak -2.9 dBFS"
+        }
+      ],
+      "medians": {
+        "before": {
+          "wall_s": 2.00979609299975,
+          "cpu_s": 2.0027719999999976
+        },
+        "after": {
+          "wall_s": 1.7345452919998934,
+          "cpu_s": 1.7155079999999985
+        }
+      },
+      "wav_sha256": {
+        "before": "f02879a3d1220ff14e86e87fee46b016c58cf2ab432ce295265b220dc27cea19",
+        "after": "f02879a3d1220ff14e86e87fee46b016c58cf2ab432ce295265b220dc27cea19"
+      },
+      "identical_pcm16": true
+    },
+    "cinematic": {
+      "before": [
+        {
+          "command": [
+            "BASELINE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/cinematic-before.wav",
+            "--style",
+            "cinematic",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.3431848549998904,
+          "cpu_s": 1.3379670000000001,
+          "report": "OUTPUT/cinematic-before.wav: 60.0s stereo 48000 Hz, cinematic in E minor at 84 BPM, -16.0 LUFS, peak -3.9 dBFS"
+        },
+        {
+          "command": [
+            "BASELINE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/cinematic-before.wav",
+            "--style",
+            "cinematic",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.4517355269999825,
+          "cpu_s": 1.3198779999999988,
+          "report": "OUTPUT/cinematic-before.wav: 60.0s stereo 48000 Hz, cinematic in E minor at 84 BPM, -16.0 LUFS, peak -3.9 dBFS"
+        },
+        {
+          "command": [
+            "BASELINE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/cinematic-before.wav",
+            "--style",
+            "cinematic",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.2998404340005436,
+          "cpu_s": 1.2943560000000045,
+          "report": "OUTPUT/cinematic-before.wav: 60.0s stereo 48000 Hz, cinematic in E minor at 84 BPM, -16.0 LUFS, peak -3.9 dBFS"
+        }
+      ],
+      "after": [
+        {
+          "command": [
+            "CANDIDATE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/cinematic-after.wav",
+            "--style",
+            "cinematic",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 0.9949741170003108,
+          "cpu_s": 0.9897430000000005,
+          "report": "OUTPUT/cinematic-after.wav: 60.0s stereo 48000 Hz, cinematic in E minor at 84 BPM, -16.0 LUFS, peak -3.9 dBFS"
+        },
+        {
+          "command": [
+            "CANDIDATE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/cinematic-after.wav",
+            "--style",
+            "cinematic",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.0183189099998344,
+          "cpu_s": 1.0116959999999988,
+          "report": "OUTPUT/cinematic-after.wav: 60.0s stereo 48000 Hz, cinematic in E minor at 84 BPM, -16.0 LUFS, peak -3.9 dBFS"
+        },
+        {
+          "command": [
+            "CANDIDATE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/cinematic-after.wav",
+            "--style",
+            "cinematic",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.073679422999703,
+          "cpu_s": 1.0692589999999969,
+          "report": "OUTPUT/cinematic-after.wav: 60.0s stereo 48000 Hz, cinematic in E minor at 84 BPM, -16.0 LUFS, peak -3.9 dBFS"
+        }
+      ],
+      "medians": {
+        "before": {
+          "wall_s": 1.3431848549998904,
+          "cpu_s": 1.3198779999999988
+        },
+        "after": {
+          "wall_s": 1.0183189099998344,
+          "cpu_s": 1.0116959999999988
+        }
+      },
+      "wav_sha256": {
+        "before": "f4960d0cd2dc9442748ad86b027b7c1b1e76971ae9701a013040e44867dcdcb5",
+        "after": "f4960d0cd2dc9442748ad86b027b7c1b1e76971ae9701a013040e44867dcdcb5"
+      },
+      "identical_pcm16": true
+    },
+    "tech": {
+      "before": [
+        {
+          "command": [
+            "BASELINE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/tech-before.wav",
+            "--style",
+            "tech",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.6610694300006799,
+          "cpu_s": 1.655453,
+          "report": "OUTPUT/tech-before.wav: 60.0s stereo 48000 Hz, tech in E minor at 118 BPM, -16.0 LUFS, peak -1.8 dBFS"
+        },
+        {
+          "command": [
+            "BASELINE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/tech-before.wav",
+            "--style",
+            "tech",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.808945937000317,
+          "cpu_s": 1.8048049999999987,
+          "report": "OUTPUT/tech-before.wav: 60.0s stereo 48000 Hz, tech in E minor at 118 BPM, -16.0 LUFS, peak -1.8 dBFS"
+        },
+        {
+          "command": [
+            "BASELINE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/tech-before.wav",
+            "--style",
+            "tech",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.78135626600033,
+          "cpu_s": 1.7760290000000027,
+          "report": "OUTPUT/tech-before.wav: 60.0s stereo 48000 Hz, tech in E minor at 118 BPM, -16.0 LUFS, peak -1.8 dBFS"
+        }
+      ],
+      "after": [
+        {
+          "command": [
+            "CANDIDATE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/tech-after.wav",
+            "--style",
+            "tech",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.3477715389999503,
+          "cpu_s": 1.3434150000000011,
+          "report": "OUTPUT/tech-after.wav: 60.0s stereo 48000 Hz, tech in E minor at 118 BPM, -16.0 LUFS, peak -1.8 dBFS"
+        },
+        {
+          "command": [
+            "CANDIDATE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/tech-after.wav",
+            "--style",
+            "tech",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.3874896070001341,
+          "cpu_s": 1.3820960000000002,
+          "report": "OUTPUT/tech-after.wav: 60.0s stereo 48000 Hz, tech in E minor at 118 BPM, -16.0 LUFS, peak -1.8 dBFS"
+        },
+        {
+          "command": [
+            "CANDIDATE/pocket",
+            "kit",
+            "music",
+            "OUTPUT/tech-after.wav",
+            "--style",
+            "tech",
+            "--duration",
+            "60",
+            "--seed",
+            "7"
+          ],
+          "wall_s": 1.3796887779999452,
+          "cpu_s": 1.375447000000003,
+          "report": "OUTPUT/tech-after.wav: 60.0s stereo 48000 Hz, tech in E minor at 118 BPM, -16.0 LUFS, peak -1.8 dBFS"
+        }
+      ],
+      "medians": {
+        "before": {
+          "wall_s": 1.78135626600033,
+          "cpu_s": 1.7760290000000027
+        },
+        "after": {
+          "wall_s": 1.3796887779999452,
+          "cpu_s": 1.375447000000003
+        }
+      },
+      "wav_sha256": {
+        "before": "6edf66fe774a415c4a1ef66371d10d0ec3e9c07b6feb9a258f50c40bf3742b02",
+        "after": "6edf66fe774a415c4a1ef66371d10d0ec3e9c07b6feb9a258f50c40bf3742b02"
+      },
+      "identical_pcm16": true
+    }
+  },
+  "video": {
+    "before": [
+      {
+        "command": [
+          "BASELINE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/before.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.249711540000135,
+        "cpu_s": 1.3147309999999939,
+        "report": "OUTPUT/before.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.81s render"
+      },
+      {
+        "command": [
+          "BASELINE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/before.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.361091106999993,
+        "cpu_s": 1.386597999999997,
+        "report": "OUTPUT/before.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.93s render"
+      },
+      {
+        "command": [
+          "BASELINE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/before.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.3191521240005386,
+        "cpu_s": 1.3172340000000045,
+        "report": "OUTPUT/before.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.90s render"
+      }
+    ],
+    "after": [
+      {
+        "command": [
+          "CANDIDATE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/after.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.184431534000396,
+        "cpu_s": 1.125716999999999,
+        "report": "OUTPUT/after.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.75s render"
+      },
+      {
+        "command": [
+          "CANDIDATE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/after.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.2109107819997007,
+        "cpu_s": 1.1366969999999985,
+        "report": "OUTPUT/after.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.78s render"
+      },
+      {
+        "command": [
+          "CANDIDATE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/after.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.1992491410001094,
+        "cpu_s": 1.203915000000002,
+        "report": "OUTPUT/after.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.74s render"
+      }
+    ],
+    "medians": {
+      "before": {
+        "wall_s": 3.3191521240005386,
+        "cpu_s": 1.3172340000000045
+      },
+      "after": {
+        "wall_s": 3.1992491410001094,
+        "cpu_s": 1.1366969999999985
+      }
+    },
+    "decoded_rgb_sha256": {
+      "before": "94284927f8ccddbcab11c3dc17f05ca5fbc6aff2433a26f7a4f4b03d370a1e46",
+      "after": "94284927f8ccddbcab11c3dc17f05ca5fbc6aff2433a26f7a4f4b03d370a1e46"
+    },
+    "identical_decoded_video": true
+  }
+}

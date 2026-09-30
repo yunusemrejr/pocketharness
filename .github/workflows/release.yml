@@ -1,0 +1,43 @@
+name: Release
+on:
+  push:
+    tags: ['v[0-9]*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+  publish:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: make -j2
+      - name: Verify version and package
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: ./scripts/package-release.sh
+      - name: Extract release notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          awk -v version="${RELEASE_TAG#v}" '
+            $0 == "## " version { show=1; next }
+            show && /^## / { exit }
+            show { print }
+          ' CHANGELOG.md > build/release/notes.md
+          test -s build/release/notes.md
+      - name: Publish checked artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$RELEASE_TAG" build/release/*.tar.gz build/release/*.sha256 \
+            --verify-tag --title "Pocket Harness $RELEASE_TAG" --notes-file build/release/notes.md

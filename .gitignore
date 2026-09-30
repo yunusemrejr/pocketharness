@@ -5,6 +5,8 @@ src/*.d
 tests/*.o
 tests/*.d
 tests/run_tests
+tests/benchmark_agent
+__pycache__/
 
 # Optional capability example outputs
 build/
