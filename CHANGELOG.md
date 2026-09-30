@@ -8,6 +8,9 @@ Adaptive native execution, reusable project workflows, and media reliability.
   reviewers and local observation with complexity, risk and observed failures.
   Explicit model/thinking choices stay authoritative; growing or failing work
   escalates and steady progress skips redundant coordination.
+- Learned health/latency gates reject unreliable or substantially slower fast
+  routes in both direct execution and complex planning. Planning notices and
+  usage accounting identify the model actually used.
 - Successful stop hooks are reused only for an unchanged work revision. Edits
   invalidate lint/review state, so reviewer-requested fixes receive fresh checks.
 - Deterministic skill routing selects installed stack/media/hosting guides,

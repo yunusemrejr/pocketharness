@@ -1348,8 +1348,14 @@ void Agent::readWorkspaceUpdates() {
 // expert would, decide the open questions from evidence, and fix
 // acceptance criteria that the reviewers and goal audits later enforce.
 std::string Agent::makeBrief(const std::string& request, std::vector<ChatResponse>* deferred,
-                             std::atomic<bool>* cancel) {
+                             std::atomic<bool>* cancel, ResolvedModel* usedModel) {
     ResolvedModel m = opts_.fast.empty() ? opts_.model : opts_.fast[0];
+    if (opts_.adaptiveModel && opts_.thinking == "adaptive" && !opts_.fast.empty() &&
+        !brainPreferFast(opts_.model.provider.name, m.provider.name))
+        m = opts_.model;
+    // The worker returns its actual route so deferred usage and the notice
+    // cannot be attributed to a configured fast role that it did not use.
+    if (usedModel) *usedModel = m;
     std::string snapshot;
     if (opts_.tools) {
         const std::string& ws = opts_.tools->workspace;
@@ -2100,6 +2106,7 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
     // independent: the brief runs on a worker without callbacks while the
     // hint runs here, so the turn waits for the slower one, not the sum.
     std::string brief;
+    ResolvedModel briefModel = opts_.model;
     std::vector<ChatResponse> briefUsage;
     std::thread briefWorker;
     std::atomic<bool> briefStop{false}, briefDone{false};
@@ -2108,7 +2115,7 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
         taskPolicy_.planningBrief && taskPolicy_.workspaceWork)
         briefWorker = std::thread([&] {
             try {
-                brief = makeBrief(userText, &briefUsage, &briefStop);
+                brief = makeBrief(userText, &briefUsage, &briefStop, &briefModel);
             } catch (...) {
                 brief.clear();
             }
@@ -2137,10 +2144,9 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
         }
         briefWorker.join();
         if (briefStop) brief.clear();
-        const ResolvedModel& bm = opts_.fast.empty() ? opts_.model : opts_.fast[0];
-        for (const auto& u : briefUsage) recordResponse(u, 0, &bm, true);
+        for (const auto& u : briefUsage) recordResponse(u, 0, &briefModel, true);
         if (!brief.empty()) {
-            if (opts_.onNotice) opts_.onNotice("brief: request interpreted by " + bm.spec);
+            if (opts_.onNotice) opts_.onNotice("brief: request interpreted by " + briefModel.spec);
             text += "\n\n" + brief;
         }
     }

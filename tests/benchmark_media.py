@@ -2,6 +2,7 @@
 """Paired native DSP/export benchmark, with correctness evidence and no API calls.
 
 python3 tests/benchmark_media.py --before /path/to/old/pocket --after ./pocket --out build/media-benchmark
+Use --workload music or --workload video to investigate one workload without repeating the other.
 Run on an otherwise idle host. These are native kit timings, not LLM task/token benchmarks.
 """
 import argparse
@@ -20,6 +21,8 @@ def main():
     parser.add_argument("--after", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--workload", choices=("all", "music", "video"), default="all")
+    parser.add_argument("--note", action="append", default=[], help="record an observed environmental limitation with the raw results")
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")
@@ -51,10 +54,12 @@ def main():
         return rows
 
     results = {"method": "sequential paired runs; order alternates; median wall and waited child CPU time",
+               "workload": args.workload,
+               "environment_notes": args.note,
                "scope": "native kit commands; LLM token/tool/coordination metrics are not applicable",
                "binaries": {phase: {"path": str(path), "sha256": digest(path)} for phase, path in binaries.items()},
                "music": {}}
-    for style in ("lofi", "corporate", "cinematic", "tech"):
+    for style in (("lofi", "corporate", "cinematic", "tech") if args.workload != "video" else ()):
         rows = paired(lambda phase: [str(binaries[phase]), "kit", "music", str(out / f"{style}-{phase}.wav"),
                                      "--style", style, "--duration", "60", "--seed", "7"])
         rows["wav_sha256"] = {phase: digest(out / f"{style}-{phase}.wav") for phase in binaries}
@@ -62,6 +67,10 @@ def main():
         assert rows["identical_pcm16"], f"{style}: synthesis output differs from baseline"
         results["music"][style] = rows
         print(style, json.dumps(rows["medians"]), "identical PCM:", rows["identical_pcm16"], flush=True)
+
+    if args.workload == "music":
+        (out / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+        return
 
     scene = out / "scene.html"
     scene.write_text("""<!doctype html><style>

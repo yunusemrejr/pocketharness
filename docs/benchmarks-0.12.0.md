@@ -3,7 +3,9 @@
 Measured on 2026-09-30 on an AMD Ryzen 5 7530U (12 logical CPUs), Ubuntu 26.04.1,
 with GCC 15 and the same configured provider roles. Baseline is commit
 `3e93e52a94f94f928ae366c6948d477f6fdeaab3` (0.11.3); candidate is 0.12.0.
-Compilation is outside timed regions. Native commands run sequentially; paired
+Compilation is outside timed regions. Other document-rendering jobs were observed
+during final native sampling, so background/compositor variance limits wall-time
+inference. Native commands run sequentially; paired
 orders alternate. These small samples describe these workloads on this machine,
 not provider-wide latency guarantees.
 
@@ -36,7 +38,7 @@ DeepSeek main provider instead of the historically slower/unreliable fast role.
 Jev side-token usage is not included in the harness token count, and the provider
 does not report complete costs, so no total-cost claim is made.
 
-An initial live candidate was slower: 2857 → 3471 ms. Inspection of learned
+An early live simple candidate was slower: 2857 → 3471 ms. Inspection of learned
 provider history found the fast role had approximately 40% observed health and
 20.96 s latency versus main's 100% and 2.96 s. The final policy rejects that route
 and removes trivial completion judgments. The paired live measurements above
@@ -69,7 +71,24 @@ Nearly all extra input is reported cache reuse: hit tokens 21,760 → 28,800 whi
 miss tokens remain 13,049 → 13,065. The last candidate pair is faster (31.692 vs
 34.760 s), so the samples do not establish a consistent causal latency penalty.
 Remote phase variability and differing generated traces remain practical limits;
-conservatively retain the measured +8.5% median result.
+retain this intermediate +8.5% median result rather than omit it.
+
+Inspection also found a persistent coordination gap shared with baseline: complex
+advisory planning bypassed the learned health gate and always chose the configured
+fast role. Its recorded latency was over five times main's. The final candidate
+applies the same advisory health gate to implicit adaptive planning, retains
+explicit settings, and accounts usage against the model actually selected.
+
+Three fresh alternating pairs after that change all pass the external oracle and
+the delivered 7–22 tests. Final medians are **62.784 → 26.423 s (-57.9%)**, reported
+input **65,177 → 41,318 (-36.6%)**, output **9,052 → 4,416**, tools **12 → 9** and
+Jev/Span calls **4 → 3**. All three candidate plans use main; baseline uses fast
+twice and times out its third brief at the existing 20-second deadline. Baseline
+runs also generate different amounts of code/test output. These gains describe
+this workload and observed provider conditions, not a controlled estimate of the
+health gate's sole contribution or a promise of a 58% gain on all complex tasks.
+The regression investigation motivated the refinement; all earlier samples are
+retained alongside [final live complex data](benchmark-data/live-complex-final.json).
 
 ## Native music and video
 
@@ -78,17 +97,24 @@ style. The optimization hoists note-invariant frequency and pan calculations and
 skips notes outside the requested timeline. Entire WAV hashes match in every
 style; faster synthesis produces the same PCM16 samples.
 
-| Workload | Median wall seconds before → after | Reduction |
+| Workload | Median wall seconds before → after | Elapsed change |
 |---|---:|---:|
-| Lo-fi score | 3.182 → 1.966 | 38.2% |
-| Corporate score | 2.010 → 1.735 | 13.7% |
-| Cinematic score | 1.343 → 1.018 | 24.2% |
-| Tech score | 1.781 → 1.380 | 22.5% |
-| 3 s video, 960×540, 12 fps | 3.319 → 3.199 | 3.6% |
+| Lo-fi score | 3.347 → 2.679 | -19.9% |
+| Corporate score | 2.074 → 1.721 | -17.0% |
+| Cinematic score | 1.505 → 1.212 | -19.4% |
+| Tech score | 2.190 → 1.657 | -24.4% |
+| 3 s video, 960×540, 12 fps (5 pairs) | 3.454 → 3.493 | +1.1% elapsed |
 
-Video waited-child CPU time is 1.317 → 1.137 s (-13.7%). All 36 decoded RGB frames
-hash identically. Wall time varied between runs; the 3.6% change is modest and not
-evidence of a broad video latency gain. The substantive animation improvement is
+The final three-pair video sample regressed 3.621 → 4.115 s (+13.6%) while using
+less CPU. Targeted investigation repeated only video in five alternating pairs:
+wall median 3.454 → 3.493 s (+1.1%), waited-child CPU **1.532 → 1.308 s (-14.7%)**.
+Before wall samples span 2.895–3.487 s and after 3.235–3.558 s. The large regression
+did not reproduce. Frame-render median falls 2.99 → 2.95 s while startup/cleanup
+rises 0.464 → 0.503 s, consistent with the two added pre-navigation CDP requests.
+Unrelated Python/PDF rendering activity was observed; it was not interrupted.
+All 36 decoded RGB frames hash identically. Wall speed remains inconclusive under
+background/compositor variability, and no video wall-speed gain is claimed.
+The substantive animation improvement is
 correctness: short CSS/WAAPI animations remain seekable after delayed readiness.
 Music/video commands make zero model or coordination calls; LLM tokens do not
 apply to these native measurements.
@@ -112,6 +138,9 @@ make bench
 python3 tests/media_integration.py ./pocket --out build/media-integration
 python3 tests/benchmark_media.py --before /path/to/0.11.3/pocket \
   --after ./pocket --out build/media-benchmark --runs 3
+# Repeat only a concerned workload:
+python3 tests/benchmark_media.py --before /path/to/0.11.3/pocket \
+  --after ./pocket --out build/video-confirm --runs 5 --workload video
 ./scripts/test-release.sh
 ```
 
@@ -126,10 +155,12 @@ per-run counts, hashes and full timing samples are available in
 [fixture data](benchmark-data/policy-final-paired.json),
 [live simple data](benchmark-data/live-final.json),
 [live complex data](benchmark-data/live-complex.json) and
-[native media data](benchmark-data/media-final.json).
+[early native media data](benchmark-data/media-final.json),
+[final native media data](benchmark-data/media-release.json) and
+[video investigation](benchmark-data/video-confirm.json).
 
-GCC, Clang and AddressSanitizer/UndefinedBehaviorSanitizer each pass **373 tests**.
-The source binary is approximately 2.8 MB, 2.4% larger than baseline, with the same
+GCC, Clang and AddressSanitizer/UndefinedBehaviorSanitizer each pass **374 tests**.
+The source binary is approximately 2.8 MB, 2.5% larger than baseline, with the same
 standard C++/libc/math linked dependencies. Python is used for development checks;
 it is not a new mandatory runtime dependency. Remote hosting deployment and model
 training are reusable capability-aware workflows; this release does not establish

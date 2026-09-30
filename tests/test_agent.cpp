@@ -1,6 +1,7 @@
 // PocketHarness tests - agent prompt stability, frozen prefix, resume.
 #include "mini.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -2884,6 +2885,56 @@ TEST(agent_Adaptive_Failed_Fast_Request_Escalates_To_Main) {
         CHECK_EQ(levels[1], std::string("high"));
         CHECK_EQ(agent.stats().fallbacks, 1);
     }
+    return "";
+}
+
+TEST(agent_Adaptive_Planning_Avoids_Known_Slow_Or_Unhealthy_Advisory_Routes) {
+    std::string home = makeTempDir("pocket-planning-health");
+    HomeGuard isolated(home);
+    for (int i = 0; i < 8; ++i) {
+        brainNoteHealth("fixture-main", true, 1000);
+        brainNoteHealth("fixture-healthy", true, 400);
+        brainNoteHealth("fixture-slow", true, 9000);
+        brainNoteHealth("fixture-unhealthy", false, 100);
+    }
+    struct Case { const char* provider; bool implicit; const char* thinking; bool main; };
+    const Case cases[] = {
+        {"fixture-healthy", true, "adaptive", false},
+        {"fixture-slow", true, "adaptive", true},
+        {"fixture-unhealthy", true, "adaptive", true},
+        {"fixture-slow", false, "adaptive", false}, // explicit model intent
+        {"fixture-slow", true, "high", false},      // explicit thinking
+    };
+    for (const auto& c : cases) {
+        AgentOpts opts;
+        opts.model = resolveModel(defaultConfig(), "glm").value;
+        opts.model.provider.name = "fixture-main";
+        opts.model.spec = "fixture-main:main";
+        auto fast = opts.model;
+        fast.provider.name = c.provider;
+        fast.spec = std::string(c.provider) + ":fast";
+        opts.fast = {fast};
+        opts.adaptiveModel = c.implicit;
+        opts.thinking = c.thinking;
+        opts.brief = true;
+        std::string planner;
+        std::vector<std::string> notices;
+        opts.onNotice = [&](const std::string& n) { notices.push_back(n); };
+        opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+            ChatResponse r;
+            if (req.system.find("planning council") != std::string::npos) {
+                planner = req.model.spec;
+                r.text = "INTENT: Implement the requested migration. ACCEPTANCE: Verify correctness.";
+            } else r.text = "The migration is implemented and verified.";
+            return Result<ChatResponse>::Ok(r);
+        };
+        Agent agent(opts);
+        CHECK(agent.runTurn("Implement the migration across modules and benchmark correctness").empty());
+        auto expected = c.main ? opts.model.spec : fast.spec;
+        CHECK_EQ(planner, expected);
+        CHECK(std::find(notices.begin(), notices.end(), "brief: request interpreted by " + expected) != notices.end());
+    }
+    rmRf(home);
     return "";
 }
 

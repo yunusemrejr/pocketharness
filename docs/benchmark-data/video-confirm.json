@@ -1,0 +1,231 @@
+{
+  "method": "sequential paired runs; order alternates; median wall and waited child CPU time",
+  "workload": "video",
+  "scope": "native kit commands; LLM token/tool/coordination metrics are not applicable",
+  "binaries": {
+    "before": {
+      "path": "BASELINE/pocket",
+      "sha256": "b937b1ced9a5bc80ddcc984a534ca36373e3814486da009dba6b0434a725201b"
+    },
+    "after": {
+      "path": "CANDIDATE/pocket",
+      "sha256": "304ea3d837e932e2499372deb22cd9859f25c48c12dd4704d0b984ae59232b2b"
+    }
+  },
+  "music": {},
+  "video": {
+    "before": [
+      {
+        "command": [
+          "BASELINE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/before.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.4539410309998857,
+        "cpu_s": 1.482009,
+        "report": "OUTPUT/before.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 3.01s render"
+      },
+      {
+        "command": [
+          "BASELINE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/before.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.414226046999829,
+        "cpu_s": 1.6601600000000005,
+        "report": "OUTPUT/before.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.95s render"
+      },
+      {
+        "command": [
+          "BASELINE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/before.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 2.8952411450009095,
+        "cpu_s": 1.5686930000000001,
+        "report": "OUTPUT/before.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.29s render"
+      },
+      {
+        "command": [
+          "BASELINE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/before.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.4666780309999012,
+        "cpu_s": 1.5320660000000013,
+        "report": "OUTPUT/before.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.99s render"
+      },
+      {
+        "command": [
+          "BASELINE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/before.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.486545161000322,
+        "cpu_s": 1.51532,
+        "report": "OUTPUT/before.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 3.04s render"
+      }
+    ],
+    "after": [
+      {
+        "command": [
+          "CANDIDATE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/after.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.519016381000256,
+        "cpu_s": 1.375498,
+        "report": "OUTPUT/after.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 3.01s render"
+      },
+      {
+        "command": [
+          "CANDIDATE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/after.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.401601911999933,
+        "cpu_s": 1.3076520000000003,
+        "report": "OUTPUT/after.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.92s render"
+      },
+      {
+        "command": [
+          "CANDIDATE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/after.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.234676658999888,
+        "cpu_s": 1.2736909999999995,
+        "report": "OUTPUT/after.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.78s render"
+      },
+      {
+        "command": [
+          "CANDIDATE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/after.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.492846332001136,
+        "cpu_s": 1.300992,
+        "report": "OUTPUT/after.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.99s render"
+      },
+      {
+        "command": [
+          "CANDIDATE/pocket",
+          "kit",
+          "video",
+          "OUTPUT/scene.html",
+          "OUTPUT/after.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.557582597999499,
+        "cpu_s": 1.4208090000000002,
+        "report": "OUTPUT/after.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.95s render"
+      }
+    ],
+    "medians": {
+      "before": {
+        "wall_s": 3.4539410309998857,
+        "cpu_s": 1.5320660000000013
+      },
+      "after": {
+        "wall_s": 3.492846332001136,
+        "cpu_s": 1.3076520000000003
+      }
+    },
+    "decoded_rgb_sha256": {
+      "before": "94284927f8ccddbcab11c3dc17f05ca5fbc6aff2433a26f7a4f4b03d370a1e46",
+      "after": "94284927f8ccddbcab11c3dc17f05ca5fbc6aff2433a26f7a4f4b03d370a1e46"
+    },
+    "identical_decoded_video": true
+  },
+  "environment_notes": [
+    "This host was not idle. A snapshot taken during the five-pair run with ps -eo pid,pcpu,comm --sort=-pcpu showed Python at 113% CPU and pdftoppm at 106% CPU alongside several Chrome processes. These percentages are lifetime averages, not a continuous utilization trace; some Chrome processes belong to this benchmark.",
+    "No unrelated process was killed, paused or changed. Concurrent workload and compositor scheduling limit conclusions about wall-clock export speed. Per-run wall time, waited child CPU and render reports are retained; decoded frame parity was checked independently."
+  ]
+}

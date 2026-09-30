@@ -262,7 +262,7 @@ class Agent {
     // With `deferred`, usage is collected there and no notice is emitted:
     // safe to run off the agent thread (it touches no stats or callbacks).
     std::string makeBrief(const std::string& request, std::vector<ChatResponse>* deferred = nullptr,
-                          std::atomic<bool>* cancel = nullptr);
+                          std::atomic<bool>* cancel = nullptr, ResolvedModel* usedModel = nullptr);
     std::string turnDigest(size_t maxBytes) const;
     json::Value turnTranscript(const std::string& finalText) const;
     std::map<std::string, double> ask(const json::Value& state, const std::vector<Question>& qs, bool transcript);

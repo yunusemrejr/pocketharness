@@ -12,7 +12,7 @@ calls. Simple safe work may use the configured `fast` role when the model was
 chosen implicitly. Explicit `-m`, `/model`, `/thinking` and resumed session
 choices stay authoritative. Images require the main model. A fast-role failure
 returns to main; main-provider failure retains the existing fallback policy.
-The fast role must also pass the native health/latency history gate: observed
+The fast role for execution and advisory planning must also pass the native health/latency history gate: observed
 unreliable or substantially slower routing stays on main. Trivial direct answers
 skip completion judgments; an implementation request without workspace work
 still receives a completion check.
