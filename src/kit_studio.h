@@ -20,6 +20,7 @@ struct Stereo {
 Result<Stereo> loadAudio(const std::string& path);
 Result<void> saveStereoWav(const std::string& path, const Stereo& s);
 // ITU-R BS.1770-4 integrated loudness with both gates; -1000 for silence.
+// Clips shorter than its 400 ms window use available K-weighted energy as an estimate.
 double integratedLufs(const Stereo& s);
 // Look-ahead peak limiter: no sample exceeds ceilingDb afterwards.
 void limitPeak(Stereo& s, double ceilingDb);

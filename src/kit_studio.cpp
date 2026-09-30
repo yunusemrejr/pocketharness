@@ -38,27 +38,47 @@ uint32_t le(std::string_view s, size_t p, unsigned bytes) {
 // ---- decoding --------------------------------------------------------------
 Result<Stereo> decodeWav(std::string_view d) {
     using Res = Result<Stereo>;
-    if (d.size() < 44 || d.substr(0, 4) != "RIFF" || d.substr(8, 4) != "WAVE") return Res::Err("not a RIFF/WAVE file");
-    unsigned format = 0, channels = 0, rate = 0, bits = 0;
+    if (d.size() < 12 || d.substr(0, 4) != "RIFF" || d.substr(8, 4) != "WAVE") return Res::Err("not a RIFF/WAVE file");
+    const size_t riffSize = le(d, 4, 4);
+    if (riffSize < 4 || riffSize > d.size() - 8) return Res::Err("truncated RIFF/WAVE");
+    const size_t end = riffSize + 8;
+    unsigned format = 0, channels = 0, rate = 0, bits = 0, align = 0, byteRate = 0;
     size_t data = 0, length = 0;
-    bool haveFmt = false;
-    for (size_t p = 12; p + 8 <= d.size();) {
+    bool haveFmt = false, haveData = false;
+    for (size_t p = 12; p < end;) {
+        if (end - p < 8) return Res::Err("truncated WAV chunk header");
         size_t size = le(d, p + 4, 4), start = p + 8;
+        if (size > end - start || (size & 1) > end - start - size) return Res::Err("truncated WAV chunk or padding");
         std::string_view tag = d.substr(p, 4);
-        if (tag == "fmt " && size >= 16) {
+        if (tag == "fmt ") {
+            if (haveFmt || size < 16) return Res::Err("invalid or duplicate WAV format chunk");
             haveFmt = true;
             format = le(d, start, 2); channels = le(d, start + 2, 2); rate = le(d, start + 4, 4); bits = le(d, start + 14, 2);
-            if (format == 0xfffe && size >= 26) format = le(d, start + 24, 2);
+            byteRate = le(d, start + 8, 4); align = le(d, start + 12, 2);
+            if (format == 0xfffe) {
+                static constexpr char guidTail[] = "\0\0\0\0\x10\0\x80\0\0\xaa\0\x38\x9b\x71";
+                if (size < 40 || le(d, start + 16, 2) < 22 || size_t(le(d, start + 16, 2)) > size - 18 ||
+                    le(d, start + 18, 2) != bits || d.substr(start + 26, 14) != std::string_view(guidTail, 14))
+                    return Res::Err("invalid extensible WAV format");
+                format = le(d, start + 24, 2);
+            }
         } else if (tag == "data") {
-            data = start; length = std::min(size, d.size() - start);  // streamed WAVs may claim 0xFFFFFFFF
-            break;
+            if (haveData) return Res::Err("multiple WAV data chunks are unsupported");
+            haveData = true; data = start; length = size;
         }
         p = start + size + (size & 1);
     }
-    if (!haveFmt || !data || channels < 1 || rate < 8000 || rate > 192000 ||
-        !((format == 1 && (bits == 8 || bits == 16 || bits == 24 || bits == 32)) || (format == 3 && bits == 32)))
+    if (!haveFmt || !haveData || channels < 1 || channels > 32 || rate < 8000 || rate > 192000)
+        return Res::Err("invalid WAV (need 1..32 channels, 8000..192000 Hz)");
+    if (!((format == 1 && (bits == 8 || bits == 16 || bits == 24 || bits == 32)) || (format == 3 && bits == 32)))
         return Res::Err("unsupported WAV (need PCM 8/16/24/32 or float32)");
-    const size_t bytes = bits / 8, frames = length / (bytes * channels);
+    const size_t bytes = bits / 8;
+    if (align != bytes * channels || byteRate != rate * align || length % align)
+        return Res::Err("invalid WAV frame alignment or byte rate");
+    const size_t frames = length / align;
+    if (!frames || frames > maxSeconds * size_t(rate)) return Res::Err("audio length must be greater than zero and at most 1200 seconds");
+    // A surround mix needs its channel layout to downmix correctly; do not silently discard centre/dialogue channels.
+    if (channels > 2) return Res::Err("unsupported WAV (multichannel audio requires FFmpeg for a stereo downmix)");
     std::vector<float> a(frames), b(frames);
     for (size_t i = 0; i < frames; ++i)
         for (unsigned c = 0; c < std::min(2u, channels); ++c) {
@@ -67,14 +87,47 @@ Result<Stereo> decodeWav(std::string_view d) {
             if (format == 3) { float f; memcpy(&f, &raw, 4); v = f; }
             else if (bits == 8) v = (double(raw) - 128) / 128;
             else v = double(int32_t(raw << (32 - bits))) / 2147483648.0;
-            (c ? b : a)[i] = std::isfinite(v) ? float(v) : 0.f;
+            if (!std::isfinite(v)) return Res::Err("WAV contains a non-finite sample");
+            (c ? b : a)[i] = float(v);
         }
     if (channels == 1) b = a;
     Stereo out;
     if (rate == (unsigned)R) { out.l = std::move(a); out.r = std::move(b); return Res::Ok(std::move(out)); }
-    // Catmull-Rom resample to 48 kHz.
     const double step = double(rate) / R;
     const size_t count = size_t(double(frames) / step);
+    out.l.resize(count); out.r.resize(count);
+    if (rate > (unsigned)R) {
+        // Windowed-sinc low-pass before decimation. Cubic interpolation alone aliases
+        // frequencies above 24 kHz into the audible band. Cache fractional phases;
+        // no transcendental functions run per output sample.
+        constexpr size_t phases = 1024;
+        const int radius = int(std::ceil(16 * step)), taps = radius * 2;
+        const double cutoff = .95 / step;
+        std::vector<std::vector<double>> kernels(phases, std::vector<double>(taps));
+        for (size_t ph = 0; ph < phases; ++ph) {
+            double sum = 0;
+            for (int j = 0; j < taps; ++j) {
+                const double x = j - radius + 1 - double(ph) / phases;
+                const double sinc = std::fabs(x) < 1e-12 ? cutoff : std::sin(pi * cutoff * x) / (pi * x);
+                kernels[ph][j] = sinc * (.5 + .5 * std::cos(pi * x / radius));
+                sum += kernels[ph][j];
+            }
+            for (double& v : kernels[ph]) v /= sum;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            const double pos = i * step;
+            const long centre = long(pos);
+            const auto& k = kernels[std::min(phases - 1, size_t((pos - centre) * phases))];
+            double l = 0, r = 0;
+            for (int j = 0; j < taps; ++j) {
+                const size_t at = size_t(std::clamp<long>(centre + j - radius + 1, 0, long(frames) - 1));
+                l += a[at] * k[j]; r += b[at] * k[j];
+            }
+            out.l[i] = float(l); out.r[i] = float(r);
+        }
+        return Res::Ok(std::move(out));
+    }
+    // Catmull-Rom interpolation for upsampling, where there is no decimation alias.
     auto cubic = [&](const std::vector<float>& x, double pos) {
         long i = long(pos);
         double t = pos - i;
@@ -82,7 +135,6 @@ Result<Stereo> decodeWav(std::string_view d) {
         double p0 = at(i - 1), p1 = at(i), p2 = at(i + 1), p3 = at(i + 2);
         return float(p1 + .5 * t * (p2 - p0 + t * (2 * p0 - 5 * p1 + 4 * p2 - p3 + t * (3 * (p1 - p2) + p3 - p0))));
     };
-    out.l.resize(count); out.r.resize(count);
     for (size_t i = 0; i < count; ++i) out.l[i] = cubic(a, i * step), out.r[i] = cubic(b, i * step);
     return Res::Ok(std::move(out));
 }
@@ -105,6 +157,7 @@ Result<Stereo> loadAudio(const std::string& path) {
     if (file.value.size() > 12 && file.value.compare(0, 4, "RIFF") == 0) {
         auto w = decodeWav(file.value);
         if (w.ok) return w;
+        if (!startsWith(w.error, "unsupported WAV")) return Result<Stereo>::Err(path + ": " + w.error);
     }
     std::string ffmpeg = whichExe("ffmpeg");
     if (ffmpeg.empty()) return Result<Stereo>::Err(path + ": not a plain WAV and FFmpeg is not installed to decode it");
@@ -114,7 +167,7 @@ Result<Stereo> loadAudio(const std::string& path) {
     close(fd);
     SpawnOpts o;
     o.exe = ffmpeg;
-    o.argv = {ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", path, "-vn", "-ac", "2", "-ar",
+    o.argv = {ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", path, "-vn", "-t", std::to_string(maxSeconds + 1), "-ac", "2", "-ar",
               std::to_string(R), "-c:a", "pcm_s16le", "-f", "wav", tmp};
     o.timeoutMs = 300000;
     SpawnResult sr = spawn(o);
@@ -125,6 +178,8 @@ Result<Stereo> loadAudio(const std::string& path) {
 }
 
 Result<void> saveStereoWav(const std::string& path, const Stereo& s) {
+    if (s.l.size() != s.r.size() || s.size() > maxSeconds * size_t(R))
+        return Result<void>::Err("stereo channels must have equal lengths, at most 1200 seconds");
     auto put = [](std::string& o, uint32_t v, int n) { for (int i = 0; i < n; ++i) o += char((v >> (8 * i)) & 255); };
     std::string o = "RIFF";
     put(o, uint32_t(36 + s.size() * 4), 4);
@@ -134,7 +189,10 @@ Result<void> saveStereoWav(const std::string& path, const Stereo& s) {
     put(o, uint32_t(s.size() * 4), 4);
     o.reserve(44 + s.size() * 4);
     for (size_t i = 0; i < s.size(); ++i)
-        for (float v : {s.l[i], s.r[i]}) put(o, uint16_t(int16_t(std::lround(std::clamp(v, -1.f, 1.f) * 32767))), 2);
+        for (float v : {s.l[i], s.r[i]}) {
+            if (!std::isfinite(v)) return Result<void>::Err("audio contains a non-finite sample");
+            put(o, uint16_t(int16_t(std::lround(std::clamp(v, -1.f, 1.f) * 32767))), 2);
+        }
     auto saved = writeOutputFile(path, o);
     return saved.ok ? Result<void>::Ok() : Result<void>::Err(saved.error);
 }
@@ -155,6 +213,13 @@ double integratedLufs(const Stereo& s) {
     }
     std::vector<double> blocks;
     for (size_t i = 0; i + 4 <= sub.size(); ++i) blocks.push_back((sub[i] + sub[i + 1] + sub[i + 2] + sub[i + 3]) / 4);
+    // A short cue cannot fill the standard 400 ms window. Estimate its loudness
+    // from the available K-weighted samples instead of treating audible sound as silence.
+    if (s.size() && s.size() < 4 * hop) {
+        double energy = acc;
+        for (double z : sub) energy += z * hop;
+        blocks.push_back(energy / s.size());
+    }
     auto lufs = [](double z) { return -0.691 + 10 * std::log10(z); };
     double sum = 0;
     size_t n = 0;
@@ -176,7 +241,7 @@ void limitPeak(Stereo& s, double ceilingDb) {
     const double ceil = dbToGain(ceilingDb);
     const size_t n = s.size(), half = R / 200;  // 5 ms look-ahead each side
     if (!n) return;
-    std::vector<float> need(n, 1.f), gain(n, 1.f);
+    std::vector<float> need(n, 1.f);
     bool any = false;
     for (size_t i = 0; i < n; ++i) {
         double p = std::max(std::fabs(s.l[i]), std::fabs(s.r[i]));
@@ -195,14 +260,14 @@ void limitPeak(Stereo& s, double ceilingDb) {
         low[i] = need[q.front()];
     }
     const size_t w = half + 1;
-    std::vector<double> prefix(n + 1, 0);
-    for (size_t i = 0; i < n; ++i) prefix[i + 1] = prefix[i] + low[i];
+    // Keep a running window rather than two extra full-programme buffers.
+    size_t left = 0, right = 0;
+    double sum = 0;
     for (size_t i = 0; i < n; ++i) {
         size_t a = i >= w / 2 ? i - w / 2 : 0, b = std::min(n, i + w / 2 + 1);
-        gain[i] = float((prefix[b] - prefix[a]) / (b - a));
-    }
-    for (size_t i = 0; i < n; ++i) {
-        float g = std::min(gain[i], need[i]);  // belt and braces: never above the requirement
+        for (; right < b; ++right) sum += low[right];
+        for (; left < a; ++left) sum -= low[left];
+        float g = std::min(float(sum / (b - a)), need[i]);
         s.l[i] *= g; s.r[i] *= g;
     }
 }
@@ -277,27 +342,30 @@ const char* kHat[6] = {"", "x.x.x.x.x.x.x.x.", ".x.x.x.x.x.x.x.x", "..x...x...x.
 
 struct Song {
     size_t n;
-    std::vector<float> bedL, bedR, topL, topR, rvL, rvR, dlL, dlR;
+    std::vector<float> bedL, bedR, topL, topR, rvL, rvR, dlL;
     std::vector<size_t> kicks;
-    explicit Song(size_t len) : n(len), bedL(len), bedR(len), topL(len), topR(len), rvL(len), rvR(len), dlL(len), dlR(len) {}
+    explicit Song(size_t len) : n(len), bedL(len), bedR(len), topL(len), topR(len), rvL(len), rvR(len), dlL(len) {}
     void put(bool bed, size_t i, double l, double r, double rev, double dly) {
         if (i >= n) return;
         (bed ? bedL : topL)[i] += float(l); (bed ? bedR : topR)[i] += float(r);
         rvL[i] += float(l * rev); rvR[i] += float(r * rev);
-        dlL[i] += float((l + r) * .5 * dly); dlR[i] += 0;
+        dlL[i] += float((l + r) * .5 * dly);
     }
     void mono(bool bed, size_t i, double v, double pan, double rev, double dly) {
         double a = (pan + 1) * pi / 4;
         put(bed, i, v * std::cos(a), v * std::sin(a), rev, dly);
     }
     void pad(const int (&m)[4], size_t at, size_t len, double cutoff, double gain, double phase, double rev) {
+        if (at >= n) return;
         const size_t rel = size_t(.9 * R), att = std::min<size_t>(size_t(.5 * R), len / 2 + 1);
         double ph[4][3] = {}, lpL[2] = {}, lpR[2] = {};
         const double dt[3] = {std::exp2(-7 / 1200.0), 1, std::exp2(7 / 1200.0)};
+        double freq[4];
+        for (int v = 0; v < 4; ++v) freq[v] = mtof(m[v]) / R;
         for (size_t i = 0; i < len + rel && at + i < n; ++i) {
             double env = std::min(1.0, double(i) / att) * (i < len ? 1.0 : 1.0 - double(i - len) / rel), a = 0, b = 0;
             for (int v = 0; v < 4; ++v) {
-                double f = mtof(m[v]) / R;
+                const double f = freq[v];
                 for (int d = 0; d < 3; ++d) {
                     double s = saw(ph[v][d], f * dt[d]);
                     ph[v][d] += f * dt[d]; ph[v][d] -= std::floor(ph[v][d]);
@@ -312,35 +380,42 @@ struct Song {
         }
     }
     void pluck(double f, size_t at, double dur, double pan, double gain, double bright, bool tri, bool bed, double rev, double dly) {
+        if (at >= n) return;
         double ph = 0, lp = 0;
-        const size_t len = size_t((dur + .2) * R);
+        const size_t len = std::min(size_t((dur + .2) * R), n - at);
+        const double angle = (pan + 1) * pi / 4, left = std::cos(angle), right = std::sin(angle);
         for (size_t i = 0; i < len; ++i) {
             double t = double(i) / R, amp = std::exp(-t / (dur * .5 + .03)) * std::min(1.0, i / (.002 * R));
             double x = tri ? 1 - 4 * std::fabs(ph - .5) : saw(ph, f / R);
             ph += f / R; ph -= std::floor(ph);
             double k = 1 - std::exp(-2 * pi * (f * bright * std::exp(-t * 7) + f * 1.2) / R);
             lp += k * (x - lp);
-            mono(bed, at + i, lp * amp * gain, pan, rev, dly);
+            const double v = lp * amp * gain;
+            put(bed, at + i, v * left, v * right, rev, dly);
         }
     }
     void epiano(double f, size_t at, double dur, double pan, double gain) {
-        const size_t len = size_t((dur * 1.2 + .3) * R);
+        if (at >= n) return;
+        const size_t len = std::min(size_t((dur * 1.2 + .3) * R), n - at);
         for (int c = 0; c < 2; ++c) {
             double fc = f * (c ? 1.0015 : .9985), ph = 0, pm = 0;
+            const double angle = (pan + (c ? .35 : -.35) + 1) * pi / 4, left = std::cos(angle), right = std::sin(angle);
             for (size_t i = 0; i < len; ++i) {
                 double t = double(i) / R;
                 double y = std::sin(2 * pi * ph + 1.4 * std::exp(-t * 5) * std::sin(2 * pi * pm)) * std::exp(-t / (dur * .9 + .1));
                 y *= std::min(1.0, i / (.004 * R));
                 ph += fc / R; pm += fc * 14 / R;
-                mono(true, at + i, y * gain * .5, pan + (c ? .35 : -.35), .3, 0);
+                const double v = y * gain * .5;
+                put(true, at + i, v * left, v * right, .3, 0);
             }
         }
     }
     void bass(double f, size_t at, double dur, double gain) {
+        if (at >= n) return;
         double ph = 0, lp = 0;
         const size_t len = size_t(dur * R) + R / 20;
         const double k = 1 - std::exp(-2 * pi * 420 / R);
-        for (size_t i = 0; i < len; ++i) {
+        for (size_t i = 0; i < std::min(len, n - at); ++i) {
             double t = double(i) / R;
             double env = std::min({1.0, i / (.004 * R), (len - 1.0 - i) / (.04 * R)}) * (.7 + .3 * std::exp(-t * 4));
             lp += k * (saw(ph, f / R) - lp);
@@ -350,9 +425,10 @@ struct Song {
         }
     }
     void kick(size_t at, double gain, bool boom) {
+        if (at >= n) return;
         double ph = 0;
         const double decay = boom ? .45 : .11, f0 = boom ? 60 : 46, f1 = boom ? 42 : 150;
-        for (size_t i = 0; i < size_t(decay * 6 * R); ++i) {
+        for (size_t i = 0; i < std::min(size_t(decay * 6 * R), n - at); ++i) {
             double t = double(i) / R;
             ph += (f0 + (f1 - f0) * std::exp(-t * (boom ? 12 : 32))) / R;
             double v = std::sin(2 * pi * ph) * std::exp(-t / decay) * std::min(1.0, i / (.0008 * R));
@@ -362,6 +438,11 @@ struct Song {
     }
     void noiseHit(size_t at, double decay, double gain, double tone, Rng& rng, double rev, bool bursts) {
         double prev = 0, ph = 0;
+        double left[3], right[3];
+        for (int j = 0; j < 3; ++j) {
+            const double angle = ((j - 1) * .12 + 1) * pi / 4;
+            left[j] = std::cos(angle); right[j] = std::sin(angle);
+        }
         for (size_t i = 0; i < size_t(decay * 5 * R); ++i) {
             double t = double(i) / R, x = rng.f() * 2 - 1;
             double d = x - prev; prev = x;  // first difference: bright noise
@@ -369,18 +450,22 @@ struct Song {
             if (bursts && t < .03) env *= std::fmod(t, .01) < .006 ? 1.0 : .45;  // clap: three quick bursts
             ph += tone / R;
             double v = (d * .6 + (tone > 0 ? std::sin(2 * pi * ph) * .5 : 0)) * env * gain;
-            mono(false, at + i, v, ((int)(rng.next() % 3) - 1) * .12, rev, 0);
+            const int pan = int(rng.next() % 3);
+            put(false, at + i, v * left[pan], v * right[pan], rev, 0);
         }
     }
     void bell(double f, size_t at, double dur, double pan, double gain) {
+        if (at >= n) return;
         const double part[3] = {1, 2.0, 2.76}, amp[3] = {1, .35, .22}, tau[3] = {1.0, .6, .35};
+        const double angle = (pan + 1) * pi / 4, left = std::cos(angle), right = std::sin(angle);
         for (int p = 0; p < 3; ++p) {
             double ph = 0;
-            for (size_t i = 0; i < size_t((dur * tau[p] * 5 + .05) * R); ++i) {
+            for (size_t i = 0; i < std::min(size_t((dur * tau[p] * 5 + .05) * R), n - at); ++i) {
                 double t = double(i) / R;
                 double v = std::sin(2 * pi * ph) * amp[p] * std::exp(-t / (dur * tau[p] * .8 + .05)) * std::min(1.0, i / (.002 * R));
                 ph += f * part[p] / R;
-                mono(false, at + i, v * gain * .5, pan, .55, .5);
+                const double value = v * gain * .5;
+                put(false, at + i, value * left, value * right, .55, .5);
             }
         }
     }
@@ -397,7 +482,7 @@ struct Song {
 };
 
 int parseKey(std::string k) {
-    if (k.empty()) return -1;
+    if (k.empty() || k.size() > 2 || (k.size() == 2 && k[1] != '#' && k[1] != 'b')) return -1;
     static const int base[7] = {9, 11, 0, 2, 4, 5, 7};
     char c = (char)toupper((unsigned char)k[0]);
     if (c < 'A' || c > 'G') return -1;
@@ -649,47 +734,75 @@ int kitMusic(const std::vector<std::string>& a) {
 
 int kitMix(const std::vector<std::string>& a) {
     const char* usage =
-        "usage: kit mix OUT.wav [--voice FILE [--voice-at S]] [--music FILE [--music-db -14] [--music-at S]] [--duck 8]\n"
-        "                [--at SEC:FILE[:DB] ...] [--duration S] [--lufs -14] [--ceiling -1.5] [--fade-out 1.5]";
+        "usage: kit mix OUT.wav [--voice FILE [--voice-at S] [--voice-trim START:END] [--voice-db 0]]\n"
+        "                [--music FILE [--music-db -14] [--music-at S] [--music-trim START:END]] [--duck 8]\n"
+        "                [--at SEC:FILE[:DB] ...] [--duration S] [--lufs -14] [--ceiling -1.5] [--fade-in 0] [--fade-out 1.5]";
     if (a.size() == 1 && a[0] == "--help") { puts(usage); return 0; }
     if (a.empty() || a.size() % 2 == 0) return fail(usage);
-    std::string voicePath, musicPath;
+    std::string voicePath, musicPath, voiceTrim, musicTrim;
     std::vector<std::string> cues;
-    double voiceAt = 0, musicAt = 0, musicDb = -14, duck = 8, duration = 0, target = -14, ceiling = -1.5, fadeOut = 1.5;
+    double voiceAt = 0, musicAt = 0, voiceDb = 0, musicDb = -14, duck = 8, duration = 0, target = -14, ceiling = -1.5,
+           fadeIn = 0, fadeOut = 1.5;
     for (size_t i = 1; i < a.size(); i += 2) {
         const std::string& k = a[i];
         const std::string& v = a[i + 1];
-        double* num = k == "--voice-at" ? &voiceAt : k == "--music-at" ? &musicAt : k == "--music-db" ? &musicDb : k == "--duck" ? &duck
-                    : k == "--duration" ? &duration : k == "--lufs" ? &target : k == "--ceiling" ? &ceiling : k == "--fade-out" ? &fadeOut : nullptr;
+        double* num = k == "--voice-at" ? &voiceAt : k == "--music-at" ? &musicAt : k == "--voice-db" ? &voiceDb
+                    : k == "--music-db" ? &musicDb : k == "--duck" ? &duck : k == "--duration" ? &duration : k == "--lufs" ? &target
+                    : k == "--ceiling" ? &ceiling : k == "--fade-in" ? &fadeIn : k == "--fade-out" ? &fadeOut : nullptr;
         if (k == "--voice") voicePath = v;
         else if (k == "--music") musicPath = v;
+        else if (k == "--voice-trim") voiceTrim = v;
+        else if (k == "--music-trim") musicTrim = v;
         else if (k == "--at") cues.push_back(v);
         else if (num) { if (!number(v, *num)) return fail("invalid number for " + k); }
         else return fail("unknown option " + k + "\n" + usage);
     }
     if (voicePath.empty() && musicPath.empty() && cues.empty()) return fail("nothing to mix\n" + std::string(usage));
-    if (duck < 0 || duck > 30 || target > -6 || target < -40 || ceiling > -0.1 || ceiling < -12 || voiceAt < 0 || musicAt < 0 ||
-        fadeOut < 0 || fadeOut > 30 || duration < 0 || duration > maxSeconds) return fail("value out of range\n" + std::string(usage));
+    if (duck < 0 || duck > 30 || target > -6 || target < -40 || ceiling > -0.1 || ceiling < -12 || voiceAt < 0 || voiceAt > maxSeconds ||
+        musicAt < 0 || musicAt > maxSeconds || voiceDb < -60 || voiceDb > 12 || musicDb < -60 || musicDb > 12 ||
+        fadeIn < 0 || fadeIn > 30 || fadeOut < 0 || fadeOut > 30 || duration < 0 || duration > maxSeconds)
+        return fail("value out of range\n" + std::string(usage));
+    if ((!voiceTrim.empty() && voicePath.empty()) || (!musicTrim.empty() && musicPath.empty()))
+        return fail("trim needs the corresponding --voice or --music input");
     struct Placed { Stereo audio; size_t at; double db; };
     Stereo voice, music;
     std::vector<Placed> sfx;
     if (!voicePath.empty()) { auto r = loadAudio(voicePath); if (!r.ok) return fail(r.error); voice = std::move(r.value); }
     if (!musicPath.empty()) { auto r = loadAudio(musicPath); if (!r.ok) return fail(r.error); music = std::move(r.value); }
+    auto trimTrack = [&](Stereo& s, const std::string& cut) -> std::string {
+        if (cut.empty()) return "";
+        const size_t colon = cut.find(':');
+        double first = 0, last = 0;
+        if (colon == std::string::npos || !number(cut.substr(0, colon), first) || !number(cut.substr(colon + 1), last) ||
+            first < 0 || last <= first || last > double(s.size()) / R)
+            return "trim needs START:END within the input's duration: " + cut;
+        const size_t begin = size_t(std::llround(first * R)), end = std::min(s.size(), size_t(std::llround(last * R)));
+        if (begin >= end) return "trim must contain at least one sample";
+        for (auto* channel : {&s.l, &s.r}) {
+            std::move(channel->begin() + begin, channel->begin() + end, channel->begin());
+            channel->resize(end - begin);
+        }
+        return "";
+    };
+    if (auto error = trimTrack(voice, voiceTrim); !error.empty()) return fail(error);
+    if (auto error = trimTrack(music, musicTrim); !error.empty()) return fail(error);
     for (const std::string& c : cues) {
         size_t colon = c.find(':');
         double at = 0, db = 0;
-        if (colon == std::string::npos || !number(c.substr(0, colon), at) || at < 0) return fail("--at needs SEC:FILE[:DB], got " + c);
+        if (colon == std::string::npos || !number(c.substr(0, colon), at) || at < 0 || at > maxSeconds)
+            return fail("--at needs SEC:FILE[:DB], with SEC in 0..1200, got " + c);
         std::string rest = c.substr(colon + 1), file = rest;
         if (size_t c2 = rest.rfind(':'); c2 != std::string::npos && number(rest.substr(c2 + 1), db)) file = rest.substr(0, c2);
+        if (db < -60 || db > 12) return fail("cue gain must be -60..12 dB: " + c);
         auto r = loadAudio(file);
         if (!r.ok) return fail(r.error);
         sfx.push_back({std::move(r.value), size_t(at * R), db});
     }
     size_t end = 0;
     if (voice.size()) end = std::max(end, size_t(voiceAt * R) + voice.size());
+    if (music.size()) end = std::max(end, size_t(musicAt * R) + music.size());
     for (auto& s : sfx) end = std::max(end, s.at + s.audio.size());
     if (duration > 0) end = size_t(duration * R);
-    else if (!end) end = size_t(musicAt * R) + music.size();
     if (end < R / 10 || end > maxSeconds * size_t(R)) return fail("mix length must be 0.1.." + std::to_string(maxSeconds) + " seconds");
     Stereo out;
     out.l.assign(end, 0); out.r.assign(end, 0);
@@ -699,13 +812,13 @@ int kitMix(const std::vector<std::string>& a) {
     double voiceLufs = -1000, voiceGain = 1;
     if (voice.size()) {
         voiceLufs = integratedLufs(voice);
-        voiceGain = voiceLufs > -900 ? dbToGain(-16 - voiceLufs) : 1;
+        voiceGain = voiceLufs > -900 ? dbToGain(-16 + voiceDb - voiceLufs) : dbToGain(voiceDb);
         addAt(voice, size_t(voiceAt * R), voiceGain);
     }
     if (music.size()) {
         double ml = integratedLufs(music);
         // With a voice the music sits musicDb below it; alone it is the programme.
-        double level = voice.size() ? -16 + musicDb : -16;
+        double level = voice.size() ? -16 + voiceDb + musicDb : -16;
         double g = ml > -900 ? dbToGain(level - ml) : 1;
         std::vector<float> duckGain(end, 1.f);
         if (voice.size() && duck > 0) {
@@ -742,6 +855,12 @@ int kitMix(const std::vector<std::string>& a) {
         addAt(s.audio, s.at, pk > 1e-6f ? dbToGain(-10 + s.db) / pk : 0);  // accents peak 10 dB under full scale
     }
     // Programme fade-out, loudness to target, peak ceiling.
+    const size_t fadeUp = std::min(end, size_t(fadeIn * R));
+    for (size_t i = 0; i < fadeUp; ++i) {
+        double f = double(i) / std::max<size_t>(1, fadeUp - 1);
+        f = f * f * (3 - 2 * f);
+        out.l[i] *= float(f); out.r[i] *= float(f);
+    }
     const size_t fade = std::min(end, size_t(fadeOut * R));
     for (size_t i = 0; i < fade; ++i) {
         double f = double(fade - 1 - i) / fade;

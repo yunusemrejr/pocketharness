@@ -443,6 +443,29 @@ std::string render(const std::vector<std::string>& args, bool still) {
     auto metrics = cdp.call("Emulation.setDeviceMetricsOverride", {{"width", width}, {"height", height},
         {"deviceScaleFactor", 1}, {"mobile", false}});
     if (!metrics.ok) return metrics.error;
+    auto page = cdp.call("Page.enable");
+    if (!page.ok) return page.error;
+    // Capture animations from the first document turn. Waiting until fonts,
+    // images or renderReady resolve loses short animations with fill:none;
+    // those finished objects disappear from getAnimations() and cannot be sought.
+    auto freeze = cdp.call("Page.addScriptToEvaluateOnNewDocument", {{"source", R"JS((()=>{
+        const seen = window.__pocketAnimations = new Set();
+        const animate = Element.prototype.animate;
+        Element.prototype.animate = function(...args) {
+            const a = animate.apply(this, args); seen.add(a); a.pause(); return a;
+        };
+        const style = document.createElement('style');
+        style.textContent = '*,*::before,*::after{animation-play-state:paused!important}';
+        const collect = () => {
+            if (document.documentElement && !style.isConnected) document.documentElement.appendChild(style);
+            for (const a of document.getAnimations()) { seen.add(a); a.pause(); }
+        };
+        const observer = new MutationObserver(collect);
+        observer.observe(document, {childList:true, subtree:true});
+        document.addEventListener('DOMContentLoaded', () => { collect(); observer.disconnect(); }, {once:true});
+        collect();
+    })())JS"}});
+    if (!freeze.ok) return freeze.error;
     const std::string url = fileUrl(source.string());
     auto navigation = cdp.call("Page.navigate", {{"url", url}});
     if (!navigation.ok) return navigation.error;
@@ -468,7 +491,8 @@ std::string render(const std::vector<std::string>& args, bool still) {
         }
         // getAnimations() forgets animations that have finished, and a forgotten one can never be sought back:
         // keep every animation ever seen so any time can be revisited (lint samples out of order, --start jumps).
-        const seen = new Set(document.getAnimations());
+        const seen = window.__pocketAnimations || new Set();
+        for (const a of document.getAnimations()) seen.add(a);
         window.__pocketSeek = async (t) => {
             await window.renderFrame(t);
             for (const a of document.getAnimations()) seen.add(a);
@@ -515,7 +539,8 @@ std::string render(const std::vector<std::string>& args, bool still) {
         for (int attempt = 0; attempt < 2; ++attempt) {
             auto draw = cdp.evaluate("window.__pocketSeek(" + seconds + ")");
             if (!draw.ok) return "frame " + std::to_string(frame) + ": " + draw.error;
-            shot = cdp.call("Page.captureScreenshot", {{"format", "png"}, {"captureBeyondViewport", false}, {"fromSurface", true}});
+            shot = cdp.call("Page.captureScreenshot", {{"format", "png"}, {"captureBeyondViewport", false},
+                {"fromSurface", true}, {"optimizeForSpeed", true}});
             if (shot.ok || interrupted || browser.done.load()) break;
         }
         if (!shot.ok) return "frame " + std::to_string(frame) + " of " + std::to_string(frames) + ": " + shot.error +

@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <filesystem>
+#include <limits>
 
 #include "../src/kit_media.h"
 #include "../src/kit_studio.h"
@@ -26,6 +27,20 @@ Stereo sine(double hz, double amp, double seconds) {
     s.l.resize(n); s.r.resize(n);
     for (size_t i = 0; i < n; ++i) s.l[i] = s.r[i] = float(amp * std::sin(2 * M_PI * hz * double(i) / kStudioRate));
     return s;
+}
+void putLe(std::string& s, size_t at, uint32_t v, unsigned bytes) {
+    for (unsigned i = 0; i < bytes; ++i) s[at + i] = char(v >> (8 * i));
+}
+std::string monoWav(int rate, double hz, double seconds) {
+    const size_t n = size_t(rate * seconds);
+    std::string wav(44 + n * 2, '\0');
+    wav.replace(0, 4, "RIFF"); wav.replace(8, 8, "WAVEfmt "); wav.replace(36, 4, "data");
+    putLe(wav, 4, uint32_t(wav.size() - 8), 4); putLe(wav, 16, 16, 4); putLe(wav, 20, 1, 2);
+    putLe(wav, 22, 1, 2); putLe(wav, 24, rate, 4); putLe(wav, 28, rate * 2, 4);
+    putLe(wav, 32, 2, 2); putLe(wav, 34, 16, 2); putLe(wav, 40, uint32_t(n * 2), 4);
+    for (size_t i = 0; i < n; ++i)
+        putLe(wav, 44 + i * 2, uint16_t(int16_t(std::lround(.2 * 32767 * std::sin(2 * M_PI * hz * i / rate)))), 2);
+    return wav;
 }
 }  // namespace
 
@@ -81,6 +96,102 @@ TEST(studio_Mix_Reaches_Target_Loudness_Under_The_Ceiling) {
     CHECK(kitMix({d.at("o2.wav"), "--voice", d.at("nope.wav")}) != 0);                 // missing input
     CHECK(kitMix({d.at("o2.wav"), "--voice", d.at("voice.wav"), "--lufs", "0"}) != 0); // out of range
     CHECK(!std::filesystem::exists(d.at("o2.wav")));
+    return "";
+}
+
+TEST(studio_Wav_Rejects_Corruption_Instead_Of_Concealing_It) {
+    Dir d;
+    const auto valid = monoWav(48000, 997, 1);
+    for (int kind = 0; kind < 9; ++kind) {
+        std::string wav = valid;
+        if (kind == 0) putLe(wav, 32, 99, 2);                     // invalid alignment
+        if (kind == 1) putLe(wav, 28, 0, 4);                      // invalid byte rate
+        if (kind == 2) putLe(wav, 4, uint32_t(wav.size()), 4);     // truncated RIFF
+        if (kind == 3) putLe(wav, 16, 1000000, 4);                // truncated chunk
+        if (kind == 4) putLe(wav, 40, 12345, 4);                  // incomplete sample frame
+        if (kind == 5) putLe(wav, 22, 0, 2);                      // no channels
+        if (kind == 6) {                                         // duplicate fmt
+            wav.insert(36, wav.substr(12, 24)); putLe(wav, 4, uint32_t(wav.size() - 8), 4);
+        }
+        if (kind == 7) {                                         // malformed extensible GUID
+            wav.insert(36, 24, '\0'); putLe(wav, 4, uint32_t(wav.size() - 8), 4);
+            putLe(wav, 16, 40, 4); putLe(wav, 20, 0xfffe, 2); putLe(wav, 36, 22, 2);
+        }
+        if (kind == 8) {                                         // non-finite floating point sample
+            putLe(wav, 20, 3, 2); putLe(wav, 28, 192000, 4);
+            putLe(wav, 32, 4, 2); putLe(wav, 34, 32, 2); putLe(wav, 44, 0x7fc00000u, 4);
+        }
+        CHECK(atomicWriteFile(d.at("bad.wav"), wav).ok);
+        CHECK(!loadAudio(d.at("bad.wav")).ok);
+    }
+    Stereo invalid = sine(997, .1, .1);
+    invalid.r.pop_back();
+    CHECK(!saveStereoWav(d.at("out.wav"), invalid).ok);
+    invalid.r = invalid.l; invalid.l[0] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(!saveStereoWav(d.at("out.wav"), invalid).ok);
+    CHECK(!std::filesystem::exists(d.at("out.wav")));
+    return "";
+}
+
+TEST(studio_Resampling_Rejects_Ultrasonic_Aliases_And_Preserves_Audible_Pitch) {
+    Dir d;
+    CHECK(atomicWriteFile(d.at("high.wav"), monoWav(96000, 32000, .5)).ok);
+    CHECK(atomicWriteFile(d.at("low.wav"), monoWav(96000, 12000, .5)).ok);
+    auto high = loadAudio(d.at("high.wav")), low = loadAudio(d.at("low.wav"));
+    CHECK(high.ok && low.ok && high.value.size() == 24000 && low.value.size() == 24000);
+    auto rms = [](const Stereo& s) {
+        double energy = 0;
+        for (size_t i = 100; i < s.size() - 100; ++i) energy += s.l[i] * s.l[i];
+        return std::sqrt(energy / (s.size() - 200));
+    };
+    CHECK(rms(high.value) < .0002);  // >57 dB rejection vs the original .141 RMS alias
+    CHECK(std::fabs(rms(low.value) - .2 / std::sqrt(2.0)) < .003);
+    return "";
+}
+
+TEST(studio_Mix_Covers_All_Tracks_And_Normalises_Short_Cues) {
+    Dir d;
+    CHECK(saveStereoWav(d.at("music.wav"), sine(997, .1, 2)).ok);
+    CHECK(saveStereoWav(d.at("cue.wav"), sine(440, .1, .1)).ok);
+    CHECK(kitMix({d.at("out.wav"), "--music", d.at("music.wav"), "--at", "0:" + d.at("cue.wav")}) == 0);
+    auto all = loadAudio(d.at("out.wav"));
+    CHECK(all.ok && all.value.size() == 2u * kStudioRate);
+    CHECK(kitMix({d.at("short.wav"), "--at", "0:" + d.at("cue.wav"), "--fade-out", "0"}) == 0);
+    auto cue = loadAudio(d.at("short.wav"));
+    CHECK(cue.ok && cue.value.size() == 4800);
+    CHECK(std::fabs(integratedLufs(cue.value) + 14) < .1 && peakDb(cue.value) <= -1.49);
+    CHECK(kitMix({d.at("trim.wav"), "--music", d.at("music.wav"), "--duration", "1"}) == 0);
+    CHECK(loadAudio(d.at("trim.wav")).value.size() == size_t(kStudioRate));
+    for (const auto& options : {std::vector<std::string>{"--voice-at", "1e300"}, {"--music-at", "1e300"},
+                               {"--music-db", "1000"}, {"--at", "1e300:" + d.at("cue.wav")},
+                               {"--at", "0:" + d.at("cue.wav") + ":1000"}}) {
+        std::vector<std::string> args = {d.at("bad.wav"), "--music", d.at("music.wav")};
+        args.insert(args.end(), options.begin(), options.end());
+        CHECK(kitMix(args) != 0);
+        CHECK(!std::filesystem::exists(d.at("bad.wav")));
+    }
+    CHECK(kitMusic({d.at("bad.wav"), "--key", "Cjunk"}) != 0);
+    return "";
+}
+
+TEST(studio_Mix_Trims_Input_Before_Placement_And_Fades_In) {
+    Dir d;
+    Stereo source = sine(997, .1, 2);
+    // The first half is silent. Trimming selects the actual recording instead of its lead-in.
+    std::fill(source.l.begin(), source.l.begin() + kStudioRate, 0);
+    std::fill(source.r.begin(), source.r.begin() + kStudioRate, 0);
+    CHECK(saveStereoWav(d.at("source.wav"), source).ok);
+    CHECK(kitMix({d.at("edit.wav"), "--voice", d.at("source.wav"), "--voice-trim", "1:2", "--voice-at", ".2",
+                  "--fade-in", ".3", "--fade-out", "0"}) == 0);
+    auto edit = loadAudio(d.at("edit.wav"));
+    CHECK(edit.ok && edit.value.size() == 57600);
+    for (size_t i = 0; i < 9600; ++i) CHECK(edit.value.l[i] == 0 && edit.value.r[i] == 0);
+    CHECK(std::fabs(integratedLufs(edit.value) + 14) < .1);
+    CHECK(peakDb(edit.value) <= -1.49);
+    CHECK(kitMix({d.at("bad.wav"), "--voice", d.at("source.wav"), "--voice-trim", "2:1"}) != 0);
+    CHECK(kitMix({d.at("bad.wav"), "--voice", d.at("source.wav"), "--voice-trim", "0:3"}) != 0);
+    CHECK(kitMix({d.at("bad.wav"), "--music", d.at("source.wav"), "--voice-trim", "0:1"}) != 0);
+    CHECK(!std::filesystem::exists(d.at("bad.wav")));
     return "";
 }
 

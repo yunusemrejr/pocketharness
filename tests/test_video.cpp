@@ -228,6 +228,10 @@ TEST(video_Frame_And_Sequence_Use_Explicit_Times) {
     for (const char* time : {"__pocketSeek(1.25)", "__pocketSeek(0)", "__pocketSeek(0.5)"}) CHECK(log.value.find(time) != std::string::npos);
     CHECK(log.value.find("encoded bytes " + std::to_string(2 * fixturePng(320, 240).size())) != std::string::npos);
     CHECK(log.value.find("encoder 1:a:0") != std::string::npos && log.value.find("encoder apad") != std::string::npos);
+    const size_t freeze = log.value.find("Page.addScriptToEvaluateOnNewDocument"), navigate = log.value.find("Page.navigate");
+    CHECK(freeze != std::string::npos && navigate != std::string::npos && freeze < navigate);
+    CHECK(log.value.find("animation-play-state:paused") != std::string::npos);
+    CHECK(log.value.find("optimizeForSpeed") != std::string::npos);
     CHECK(scratch.cleaned());
     return "";
 }
