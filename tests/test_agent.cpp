@@ -1527,7 +1527,7 @@ TEST(agent_Unknown_Quality_Evidence_Uses_Normal_Council) {
         return Result<ChatResponse>::Ok(response);
     };
     Agent agent(opts);
-    CHECK(agent.runTurn("Implement and verify the requested change").empty());
+    CHECK(agent.runTurn("Implement and verify the migration across production modules").empty());
     CHECK(decisionRequests == 1 && councilRequests == 1);
     CHECK(agent.stats().reviews == 1);
     return "";
@@ -2671,7 +2671,7 @@ TEST(agent_Council_Reviewers_Run_Concurrently) {
         return Result<ChatResponse>::Ok(response);
     };
     Agent agent(opts);
-    CHECK(agent.runTurn("Implement and verify the requested change").empty());
+    CHECK(agent.runTurn("Implement and verify the migration across production modules").empty());
     CHECK_EQ(votes.load(), 3);
     CHECK(maxLive.load() >= 2);  // reviewers overlapped instead of queueing
     CHECK_EQ(agent.stats().reviews, 1);
@@ -2712,12 +2712,84 @@ TEST(agent_Council_Does_Not_Wait_For_Stalled_Reviewer) {
     };
     Agent agent(opts);
     int64_t t0 = nowMs();
-    CHECK(agent.runTurn("Implement and verify the requested change").empty());
+    CHECK(agent.runTurn("Implement and verify the migration across production modules").empty());
     CHECK(nowMs() - t0 < 3000);
     CHECK(stalledCancelled.load());
     bool approved = false;
     for (const auto& n : notices) approved |= n.find("review: 1/1 approve; no verdict: ") == 0 && n.find("timed out") != std::string::npos;
     CHECK(approved);
+    return "";
+}
+
+TEST(agent_Cancelled_Final_Does_Not_Start_Reviewers) {
+    // Escape may race the main reply or arrive while the review prefilter is
+    // answering. Neither boundary may start a new council with fresh flags.
+    for (bool cancelInPrefilter : {false, true}) {
+        ToolEnv tools;
+        AgentOpts opts;
+        opts.model = resolveModel(defaultConfig(), "glm").value;
+        opts.tools = &tools;
+        opts.review = true;
+        opts.reviewers = {opts.model, opts.model};
+        std::atomic<bool> cancel{false};
+        std::atomic<int> reviewers{0};
+        int decisions = 0;
+        opts.cancel = &cancel;
+        opts.decide = [&](const json::Value&, const std::vector<Question>&, bool, double*) {
+            ++decisions;
+            cancel = true;
+            return std::map<std::string, double>{{"bad", .5}};
+        };
+        opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+            ChatResponse response;
+            if (req.system.find("strict senior reviewer") != std::string::npos) {
+                ++reviewers;
+                response.text = "LGTM";
+            } else {
+                tools.changedFiles.push_back("checked.cpp");
+                response.text = "The requested change is implemented and checked.";
+                if (!cancelInPrefilter) cancel = true;
+            }
+            return Result<ChatResponse>::Ok(response);
+        };
+        Agent agent(opts);
+        CHECK_EQ(agent.runTurn("Implement and verify the requested change"), std::string("cancelled"));
+        CHECK_EQ(reviewers.load(), 0);
+        CHECK_EQ(decisions, cancelInPrefilter ? 1 : 0);
+        CHECK_EQ(agent.stats().reviews, 0);
+    }
+    return "";
+}
+
+TEST(agent_Cancelled_Council_Records_Usage_Without_A_Verdict) {
+    ToolEnv tools;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &tools;
+    opts.review = true;
+    opts.reviewers = {opts.model};
+    std::atomic<bool> cancel{false};
+    opts.cancel = &cancel;
+    std::vector<std::string> notices;
+    opts.onNotice = [&](const std::string& n) { notices.push_back(n); };
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks& cb) {
+        ChatResponse response;
+        if (req.system.find("strict senior reviewer") != std::string::npos) {
+            response.cost = .025;
+            cb.onUsage(response);
+            cancel = true;
+            response.text = "LGTM";
+        } else {
+            tools.changedFiles.push_back("checked.cpp");
+            response.text = "The requested change is implemented and checked.";
+        }
+        return Result<ChatResponse>::Ok(response);
+    };
+    Agent agent(opts);
+    CHECK_EQ(agent.runTurn("Implement and verify the requested change"), std::string("cancelled"));
+    CHECK_EQ(agent.stats().reviews, 0);
+    CHECK(agent.stats().sideCost > .024 && agent.stats().sideCost < .026);
+    for (const auto& n : notices) CHECK(!startsWith(n, "review:"));
     return "";
 }
 
@@ -2745,13 +2817,286 @@ TEST(agent_Slow_Brief_Is_Skipped_At_Deadline) {
     };
     Agent agent(opts);
     int64_t t0 = nowMs();
-    CHECK(agent.runTurn("fix the parser bug in the tokenizer module please").empty());
+    CHECK(agent.runTurn("fix the parser migration across modules and benchmark the complete pipeline please").empty());
     CHECK(nowMs() - t0 < 3000);
     CHECK(briefCancelled.load());
     CHECK(workPrompt.find("[brief") == std::string::npos);  // a late brief is never injected
     bool noted = false;
     for (const auto& n : notices) noted |= n.find("brief: skipped") == 0;
     CHECK(noted);
+    return "";
+}
+
+TEST(agent_Adaptive_Simple_Work_Skips_Planning_And_Uses_Fast_Until_Failure) {
+    for (bool explicitThinking : {false, true}) {
+        AgentOpts opts;
+        opts.model = resolveModel(defaultConfig(), "glm").value;
+        auto fast = opts.model;
+        fast.spec = "fixture:fast";
+        fast.model = "fixture-fast";
+        opts.fast = {fast};
+        opts.thinking = explicitThinking ? "max" : "adaptive";
+        opts.adaptiveModel = opts.brief = true;
+        std::vector<std::string> models, thinking;
+        opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+            models.push_back(req.model.spec);
+            thinking.push_back(req.thinking);
+            ChatResponse response;
+            // No tool authority: a failed tool escalates the next request.
+            if (models.size() == 1) response.calls = {{"read1", "read", "{\"path\":\"title.txt\"}"}};
+            else response.text = "The title file is unavailable in this workspace.";
+            return Result<ChatResponse>::Ok(response);
+        };
+        Agent agent(opts);
+        CHECK(agent.runTurn("Please make the project title say Pocket Harness.").empty());
+        CHECK_EQ(models.size(), (size_t)2); // no planning request for a precise edit
+        CHECK_EQ(models[0], explicitThinking ? opts.model.spec : fast.spec);
+        CHECK_EQ(models[1], opts.model.spec);
+        CHECK_EQ(thinking[0], std::string(explicitThinking ? "max" : "low"));
+        CHECK_EQ(thinking[1], std::string(explicitThinking ? "max" : "high"));
+    }
+    return "";
+}
+
+TEST(agent_Adaptive_Failed_Fast_Request_Escalates_To_Main) {
+    for (const auto& error : {"HTTP 503: fixture unavailable", "HTTP 401: fixture unauthorized"}) {
+        AgentOpts opts;
+        opts.model = resolveModel(defaultConfig(), "glm").value;
+        auto fast = opts.model;
+        fast.spec = "fixture:fast";
+        opts.fast = {fast};
+        opts.thinking = "adaptive";
+        opts.adaptiveModel = true;
+        std::vector<std::string> models, levels;
+        opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+            models.push_back(req.model.spec);
+            levels.push_back(req.thinking);
+            if (req.model.spec == fast.spec) return Result<ChatResponse>::Err(error);
+            ChatResponse r;
+            r.text = "42";
+            return Result<ChatResponse>::Ok(r);
+        };
+        Agent agent(opts);
+        CHECK(agent.runTurn("What is six times seven?").empty());
+        CHECK_EQ(models.size(), (size_t)2);
+        CHECK_EQ(models[0], fast.spec);
+        CHECK_EQ(models[1], opts.model.spec);
+        CHECK_EQ(levels[1], std::string("high"));
+        CHECK_EQ(agent.stats().fallbacks, 1);
+    }
+    return "";
+}
+
+TEST(agent_Adaptive_Numeric_Answer_Skips_Judge_But_Broad_Completion_Does_Not) {
+    for (bool complex : {false, true}) {
+        AgentOpts opts;
+        opts.model = resolveModel(defaultConfig(), "glm").value;
+        opts.autonomy = true;
+        int decisions = 0;
+        opts.decide = [&](const json::Value&, const std::vector<Question>&, bool, double*) {
+            ++decisions;
+            return std::map<std::string, double>{{"ask", 0}, {"announce", 0}, {"premature", 0}, {"ignored", 0}};
+        };
+        opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+            ChatResponse r;
+            r.text = complex ? "All tests pass and the build is clean." : "4";
+            return Result<ChatResponse>::Ok(r);
+        };
+        Agent agent(opts);
+        CHECK(agent.runTurn(complex ? "Implement the migration across production modules and verify release" : "What is 2+2?").empty());
+        CHECK_EQ(decisions, complex ? 1 : 0);
+    }
+    return "";
+}
+
+TEST(agent_Adaptive_Simple_Action_Does_Not_Accept_Unevidenced_Completion) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.autonomy = true;
+    int decisions = 0, requests = 0;
+    opts.decide = [&](const json::Value&, const std::vector<Question>&, bool, double*) {
+        return std::map<std::string, double>{{"ask", 0}, {"announce", 0},
+            {"premature", ++decisions == 1 ? .99 : 0}, {"ignored", 0}};
+    };
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ++requests;
+        ChatResponse r;
+        r.text = "Done";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Fix the save bug").empty());
+    CHECK_EQ(requests, 2);
+    CHECK_EQ(decisions, 2);
+    CHECK_EQ(agent.stats().nudges, 1);
+    return "";
+}
+
+TEST(agent_Adaptive_Explicit_Failure_Output_Escalates_Despite_Exit_Zero) {
+    std::string ws = makeTempDir("pocket-explicit-failure");
+    auto auth = authorityInit(ws, {}, {}, false);
+    CHECK(auth.ok);
+    ToolEnv tools;
+    tools.workspace = tools.sessionTmp = ws;
+    tools.auth = &auth.value;
+    tools.unsafe = true;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.thinking = "adaptive";
+    opts.tools = &tools;
+    std::vector<std::string> levels;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        levels.push_back(req.thinking);
+        ChatResponse r;
+        if (levels.size() == 1) r.calls = {{"check", "bash",
+            "{\"command\":\"printf 'Traceback (most recent call last):\\\\nfixture error\\\\n'\"}"}};
+        else r.text = "The command reports a traceback; the requested work remains unverified.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Check the command").empty());
+    CHECK_EQ(levels.size(), (size_t)2);
+    CHECK_EQ(levels[1], std::string("high"));
+    authorityClose(auth.value);
+    rmRf(ws);
+    return "";
+}
+
+TEST(agent_Quoted_Failure_Markers_Are_Successful_Read_Evidence) {
+    std::string ws = makeTempDir("pocket-quoted-failure");
+    auto auth = authorityInit(ws, {}, {}, false);
+    CHECK(auth.ok);
+    for (int i = 0; i < 8; ++i)
+        CHECK(atomicWriteFile(ws + "/example" + std::to_string(i),
+            "Source documents a literal marker: Traceback (most recent call last):\n"
+            "FAIL is another quoted output example, not an actual read failure.\n").ok);
+    ToolEnv tools;
+    tools.workspace = ws;
+    tools.auth = &auth.value;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.thinking = "adaptive";
+    opts.tools = &tools;
+    std::vector<std::string> levels;
+    int observers = 0;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        int n = (int)levels.size();
+        levels.push_back(req.thinking);
+        ChatResponse r;
+        if (n < 8) r.calls = {{"read" + std::to_string(n), "read", json::stringify(
+            json::Object{{"path", "example" + std::to_string(n)}})}};
+        else r.text = "The source examples were successfully inspected.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    opts.progress = [&](const std::string&, double*) { ++observers; return std::string(); };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Inspect the source examples").empty());
+    CHECK_EQ(levels.size(), (size_t)9);
+    for (const auto& level : levels) CHECK_EQ(level, std::string("low"));
+    CHECK_EQ(observers, 0);
+    CHECK_EQ(agent.stats().toolCalls, 8);
+    CHECK(validateHistory(agent.messages()).empty());
+    authorityClose(auth.value);
+    rmRf(ws);
+    return "";
+}
+
+TEST(agent_Review_Fixes_Rerun_Changed_Work_Gates_Without_Repeating_Passed_Hooks) {
+    for (bool repairFile : {false, true}) {
+        std::string ws = makeTempDir("pocket-review-revision");
+        auto auth = authorityInit(ws, {}, {}, false);
+        CHECK(auth.ok);
+        ToolEnv tools;
+        tools.workspace = tools.sessionTmp = ws;
+        tools.auth = &auth.value;
+        tools.unsafe = true;
+        AgentOpts opts;
+        opts.model = resolveModel(defaultConfig(), "glm").value;
+        opts.tools = &tools;
+        opts.review = true;
+        opts.stopHooks = {"printf 'checked\\n' >> hook.log"};
+        int main = 0, reviews = 0;
+        opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+            ChatResponse r;
+            if (req.system.find("strict senior reviewer") != std::string::npos) {
+                r.text = ++reviews == 1 ? "The title or completion description needs the requested correction." : "LGTM";
+            } else {
+                int n = ++main;
+                if (n == 1 || (repairFile && n == 4))
+                    r.calls = {{"write" + std::to_string(n), "write", json::stringify(json::Object{
+                        {"path", "title.txt"}, {"content", n == 1 ? "First title\n" : "Corrected title\n"}})}};
+                else if (n == 2 || (repairFile && n == 5))
+                    r.calls = {{"verify" + std::to_string(n), "bash", "{\"command\":\"test -s title.txt\"}"}};
+                else r.text = "The title change is implemented and the command verified it.";
+            }
+            return Result<ChatResponse>::Ok(r);
+        };
+        Agent agent(opts);
+        CHECK(agent.runTurn("Correct the title in this text file").empty());
+        CHECK_EQ(reviews, repairFile ? 2 : 1);
+        auto hook = readFileBounded(ws + "/hook.log", 100);
+        CHECK(hook.ok);
+        CHECK_EQ(hook.value, std::string(repairFile ? "checked\nchecked\n" : "checked\n"));
+        CHECK(validateHistory(agent.messages()).empty());
+        authorityClose(auth.value);
+        rmRf(ws);
+    }
+    return "";
+}
+
+TEST(agent_Progress_Observer_Skips_Successful_Discovery) {
+    std::string ws = makeTempDir("pocket-progress-success");
+    auto auth = authorityInit(ws, {}, {}, false);
+    CHECK(auth.ok);
+    for (int i = 0; i < 20; ++i)
+        CHECK(atomicWriteFile(ws + "/e" + std::to_string(i), "Useful unique discovery with sufficient evidence " + std::to_string(i)).ok);
+    ToolEnv tools;
+    tools.workspace = ws;
+    tools.auth = &auth.value;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &tools;
+    int requests = 0, observers = 0;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        int n = requests++;
+        if (n < 20) r.calls = {{"e" + std::to_string(n), "read", json::stringify(json::Object{{"path", "e" + std::to_string(n)}})}};
+        else r.text = "All twenty evidence files were inspected.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    opts.progress = [&](const std::string&, double*) { ++observers; return std::string(); };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Inspect every evidence file").empty());
+    CHECK_EQ(requests, 21);
+    CHECK_EQ(observers, 0);
+    authorityClose(auth.value);
+    rmRf(ws);
+    return "";
+}
+
+TEST(agent_Restore_Remembers_Loaded_Skills_Across_Compaction) {
+    std::string home = makeTempDir("pocket-skill-restore");
+    HomeGuard isolated(home);
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    SessionEvent assistant{"assistant", "", "", "", "", true};
+    assistant.replay = json::Object{{"calls", json::Array{json::Object{
+        {"id", "load-ui"}, {"name", "skill"}, {"args", "{\"action\":\"load\",\"name\":\" ai-design-slop \"}"}}}}};
+    CHECK(sessionAppend(id.value, assistant).ok);
+    CHECK(sessionAppend(id.value, {"tool_result", "The design doctrine", "load-ui", "skill", "", true}).ok);
+    SessionEvent compact{"compact", "Completed skill discovery; preserve project identity", "", "", "", true};
+    compact.replay = json::Object{{"cut", 2}, {"summary", "The doctrine was loaded"}};
+    CHECK(sessionAppend(id.value, compact).ok);
+    ToolEnv tools;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &tools;
+    Agent agent(opts);
+    CHECK(agent.restore(id.value).ok);
+    CHECK_EQ(tools.loadedSkills.size(), (size_t)1);
+    CHECK_EQ(tools.loadedSkills[0], std::string(kUiDocSkill));
+    CHECK(tools.uiDocLoaded);
+    rmRf(home);
     return "";
 }
 

@@ -9,8 +9,8 @@
 #include <unistd.h>
 
 #include <algorithm>
-
-#include "config.h"
+#include <cctype>
+#include <initializer_list>
 
 namespace pocket {
 
@@ -51,7 +51,8 @@ void scanDir(const std::string& dir, const std::string& source, std::vector<Skil
                 const std::string& line = lines[i];
                 std::string s = trim(line);
                 if (m.heading.empty() && startsWith(s, "#")) {
-                    m.heading = trim(s.substr(s.find_first_not_of('#')));
+                    const size_t begin = s.find_first_not_of('#');
+                    if (begin != std::string::npos) m.heading = trim(s.substr(begin));
                     continue;
                 }
                 if (s.empty()) {
@@ -113,6 +114,131 @@ std::vector<SkillMeta> skillSearch(const std::vector<SkillMeta>& all, const std:
     std::vector<SkillMeta> out;
     for (const auto& [s, i] : ranked) out.push_back(all[i]);
     return out;
+}
+
+SkillSelection skillAutoSelect(const std::vector<SkillMeta>& all, const std::string& task,
+                               const std::vector<std::string>& alreadyLoaded,
+                               size_t maxSkills, const std::string& workspace) {
+    SkillSelection result;
+    // Word boundaries avoid routes such as Java for JavaScript, Go for "logo",
+    // UI for "build", and music for a filename containing "musical".
+    auto normalized = [](const std::string& value) {
+        std::string out = " ";
+        for (unsigned char c : value) {
+            if (std::isalnum(c) || c == '+') out += static_cast<char>(std::tolower(c));
+            else if (out.back() != ' ') out += ' ';
+        }
+        if (out.back() != ' ') out += ' ';
+        return out;
+    };
+    const std::string text = normalized(task.substr(0, 32768));
+    auto has = [&](std::initializer_list<const char*> words) {
+        for (const auto* word : words)
+            if (text.find(normalized(word)) != std::string::npos) return true;
+        return false;
+    };
+    auto add = [&](const std::string& name) {
+        if (result.skills.size() >= maxSkills ||
+            std::find(alreadyLoaded.begin(), alreadyLoaded.end(), name) != alreadyLoaded.end()) return;
+        for (const auto& skill : result.skills) if (skill.name == name) return;
+        for (const auto& skill : all)
+            if (skill.name == name) { result.skills.push_back(skill); return; }
+    };
+
+    result.ui = has({"ui", "ux", "gui", "user interface", "landing page", "website", "web page", "webapp",
+                     "web app", "frontend", "front end", "dashboard", "mockup", "wireframe", "css", "html"});
+    const bool animation = has({"animation", "animated", "motion graphics", "gif"});
+    result.video = has({"video", "youtube", "shorts", "reels", "voiceover", "voice over", "narration", "storyboard",
+                       "mp4", "motion graphics"}) || (animation && has({"audio", "sound", "music"}));
+    const bool delivery = has({"deploy", "deployment", "hosting", "production website", "namecheap", "godaddy",
+                              "cPanel", "ssh deployment"});
+    const bool php = has({"php", "php8", "php8+", "composer", "laravel", "symfony"});
+    const bool node = has({"node", "nodejs", "node js", "npm", "express", "fastify"});
+    const bool react = has({"react", "reactdom", "jsx", "next js"});
+    const bool browser = has({"vanilla js", "vanilla javascript", "browser javascript", "dom", "javascript", "html", "css"});
+    const bool go = has({"golang", "go service", "go module", "go cli", "go mod", "go program", "go app",
+                         "go implementation", "go test", "go code", "go programming", "in go", "using go", "with go"});
+    const bool rust = has({"rust", "cargo", "rustc"});
+    const bool java = has({"java", "jvm", "gradle", "maven", "spring boot"});
+    const bool python = has({"python", "flask", "django", "pyproject", "pip"});
+    const bool shell = has({"bash", "shell script", "shell scripting", "sh script"});
+    const bool cpp = has({"c++", "cpp", "cxx", "cmake"});
+    const bool c = has({"c language", "c code", "c programming", "in c", "using c", "with c", "gcc"});
+    const bool desktop = has({"linux app", "linux application", "native app", "native application", "desktop app",
+                              "desktop application", "gtk", "qt", "fltk"});
+    const bool localWeb = has({"local webapp", "local web app", "localhost", "local flask", "local server"});
+    const bool algorithm = has({"algorithm", "data structure", "shortest path", "scheduling algorithm", "graph traversal"});
+    const bool tuning = has({"fine tuning", "finetuning", "fine tune", "finetune", "lora", "qlora", "peft", "sft"});
+    const bool colab = has({"colab", "google colab"});
+    const bool ml = has({"machine learning", "ml", "model training", "classification", "regression model", "neural network"});
+    const bool work = php || node || react || browser || go || rust || java || python || shell || cpp || c || desktop ||
+                      localWeb || algorithm || tuning || colab || ml || result.ui || result.video || animation || delivery;
+
+    // Preserve named skills first, then mandatory craft and actual delivery needs.
+    for (const auto& skill : all)
+        if (text.find(normalized(skill.name)) != std::string::npos) add(skill.name);
+    if (result.ui) add("ai-design-slop");
+    if (result.video) add("video-studio");
+    if (delivery) add("shared-hosting-deployment");
+    if (work) add("project-workflows");
+    if (colab) add("google-colab-training");
+    if (tuning) add("llm-fine-tuning");
+    if (react) add("modern-frontend-frameworks");
+    if (php) add("php-application-engineering");
+    if (node) add("node-runtime-engineering");
+    if (browser && !react && !node) add("browser-javascript-engineering");
+    if (go) add("go-service-engineering");
+    if (rust) add("rust-systems-engineering");
+    if (java) add("java-platform-engineering");
+    if (python) add("python-software-engineering");
+    if (shell) add("bash-workflows");
+    if (cpp) add("cpp-performance-engineering");
+    if (c && !cpp) add("c-systems-engineering");
+    if (desktop) add("linux-desktop-ui-ux");
+    if (localWeb) add("local-webapp-workflows");
+    if (algorithm) add("algorithm-design");
+    if (ml && !tuning) add("ml-engineering");
+    if (animation && !result.video) add("browser-animation-engineering");
+    if (has({"music", "compose a song", "compose song", "songwriting", "melody", "midi", "soundtrack"})) add("music-composition");
+    if (has({"audio", "sound editing", "sound edit", "noise reduction", "denoise", "loudness", "mix audio"}))
+        add("audio-processing");
+
+    // A generic implementation request can still route from actual manifests.
+    // Explicit task runtimes win; project detection never runs commands or scans
+    // the entire tree, and a casual greeting does not inspect the workspace.
+    const bool explicitRuntime = php || node || react || browser || go || rust || java || python || shell || cpp || c;
+    const bool documentationOnly = has({"readme", "markdown", "documentation", "docs", "changelog", "typo", "spelling", "grammar"}) &&
+                                   !has({"implement", "debug", "code", "function", "parser", "test", "tests", "crash"});
+    if (!workspace.empty() && !explicitRuntime && !documentationOnly &&
+        has({"implement", "fix", "debug", "refactor", "optimize", "improve", "build", "test", "tests", "bug", "failure"})) {
+        auto exists = [&](const char* file) {
+            struct stat st;
+            return stat((workspace + "/" + file).c_str(), &st) == 0 && S_ISREG(st.st_mode);
+        };
+        std::vector<std::string> detected;
+        if (exists("composer.json")) detected.push_back("php-application-engineering");
+        if (exists("package.json")) {
+            auto package = readFileBounded(workspace + "/package.json", 1 << 15);
+            if (package.ok && package.value.find("\"react\"") != std::string::npos)
+                detected.push_back("modern-frontend-frameworks");
+            else detected.push_back("node-runtime-engineering");
+        }
+        if (exists("go.mod")) detected.push_back("go-service-engineering");
+        if (exists("Cargo.toml")) detected.push_back("rust-systems-engineering");
+        if (exists("pom.xml") || exists("build.gradle") || exists("build.gradle.kts")) detected.push_back("java-platform-engineering");
+        if (exists("pyproject.toml") || exists("requirements.txt") || exists("setup.py")) detected.push_back("python-software-engineering");
+        if (exists("CMakeLists.txt")) detected.push_back("c-cpp-multiplatform");
+        if (detected.empty() && exists("Makefile")) {
+            auto makefile = readFileBounded(workspace + "/Makefile", 1 << 15);
+            if (makefile.ok && (makefile.value.find("CXX") != std::string::npos || makefile.value.find(".cpp") != std::string::npos))
+                detected.push_back("cpp-performance-engineering");
+            else if (makefile.ok && makefile.value.find("CC") != std::string::npos)
+                detected.push_back("c-systems-engineering");
+        }
+        if (!detected.empty()) add("project-workflows");
+        for (const auto& name : detected) add(name);
+    }
+    return result;
 }
 
 Result<std::string> skillLoad(const std::vector<SkillMeta>& all, const std::string& name) {

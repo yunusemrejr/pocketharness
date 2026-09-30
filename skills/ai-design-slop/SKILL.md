@@ -1,75 +1,35 @@
 ---
 name: ai-design-slop
-description: "Mandatory before any UI, UX or GUI work: the two live generations of AI design slop (indigo/purple SaaS, cream/terracotta editorial), the full tell checklist, and the nine-step procedure that avoids them."
+description: Required before UI/UX/GUI design or implementation: preserve project identity, avoid generic purple-gradient SaaS and cream/cursive templates, validate real content, interaction and visual hierarchy.
 ---
 
-# Preventing AI Design Slop
+# Preventing AI design slop
 
+Design from the actual product, audience and task. Preserve the established project identity and intentional user choices. A color, font or component alone is not a defect; the defect is copying a stock visual formula without a reason it serves this screen. Do not replace a functioning identity with a different template to satisfy a heuristic.
 
-AI design slop is the default output of a model asked to design with no constraints: the statistical median of its training data, rendered as a page. Two generations of it are live right now, both diagnosed below, plus the mechanism that produces both and the procedure that avoids it.
+## Discovery before styling
 
-## What slop actually is
+Inspect existing screens, tokens, components, real content and the user's references. Name the screen's primary job and required states. Reuse the current design system unless the requested change or observed defect justifies altering it. For a new product without an established identity, derive choices from its subject, use and audience; do not invent a brand and then claim it was supplied.
 
-An unconstrained model doesn't design — it averages. Asked for "a SaaS landing page" with no other input, it outputs the statistical median of every SaaS page in its training data: the most probable tokens, not a considered choice. Adam Wathan picked `indigo-500` as Tailwind UI's neutral demo accent in 2019, with no design rationale behind it. Tailwind's popularity meant billions of tokens of `bg-indigo-500` code entered training corpora. Models learned it as ground truth — "buttons are purple" — the same way they learn any other high-frequency pattern.
+Common template combinations to question:
 
-This compounds. AI-generated sites ship to the live web, get scraped, and become training data for the next generation of models — a feedback loop where the model is now training partly on its own output, amplifying the original bias each cycle. The same mechanism explains both generations below: a genuinely new aesthetic gets adopted, floods the training distribution once enough people ship it, and becomes the new median — indistinguishable slop under a different palette.
+- Gratuitous indigo/purple/pink gradients, glow halos, glass panels, pill above a centered hero and identical icon cards.
+- Cream/terracotta backgrounds, oversized cursive or italic serif display, ornamental hairlines and editorial texture unrelated to the content.
+- Boilerplate SaaS section order, vague promises, fabricated metrics, testimonials or customer logos.
+- Colored left rails, decorative status dots, animated LIVE/BETA pills or tinted icon tiles that encode no real information.
+- Oversized ordinary-page headings, excessive corner radius, emoji chrome, decorative terminal output and motion without a user or narrative purpose.
 
-## Generation 1: indigo/purple SaaS
+Several of these together should prompt inspection, not an automatic redesign. An existing purple brand, useful card grid, appropriate serif or actual live state can remain. Record a specific brand/state exception for a reported cue rather than treating a generic visual pass as clearance.
 
-The dominant look since roughly 2023, still the default any unprompted agent reaches for.
+## Implementation and review
 
-| Element | What it looks like | Why it's a tell |
-| --- | --- | --- |
-| Accent color | Indigo-to-purple or purple-to-pink gradient (`#6366f1`–`#a855f7`–`#ec4899`) | Traced directly to Tailwind's `indigo-500` demo default; now "the single loudest AI tell," per design critics tracking the pattern |
-| Typeface | Inter, or Space Grotesk / Geist paired with Inter | "The safest possible answer" — signals no typographic decision was made at all |
-| Background | Near-black or deep navy, permanent dark mode | Defaults to dark because dark hides low-contrast text; body copy frequently fails WCAG AA contrast as a result |
-| Cards | Three or four identical rounded cards in a row, thin-line icon centered at the top, soft shadow, sometimes a colored top or left stripe | Copied from Tailwind grid tutorials until it became the model's learned default for "feature section" |
-| Ornaments | Colored glows/box-shadows behind headlines, badge pill sitting directly above the H1, all-caps eyebrow labels, emoji used as section icons | Pure decoration with no informational role — the badge-above-H1 and glow-behind-headline pairing shows up across almost every AI-generated SaaS mock |
-| Numbers | A stat-banner row of big invented figures ("99.99% uptime," "2M+ deploys") and fabricated customer logos | Filler presented as evidence; nothing behind the numbers |
-| Copy | "Build faster. Ship smarter." — short punchy fragments that name no real capability | Weightless by design: could be pasted onto any competitor's page unchanged |
+1. Use real content and real states. Label uncertain/placeholder content; never present invented numbers as evidence.
+2. Give repeated elements a job: selecting, grouping, navigating, filtering or conveying state. Use spacing, alignment and typography for hierarchy before adding decoration.
+3. Keep text legible at the actual viewport and contrast; preserve semantic headings, accessible names, keyboard/focus behavior and reduced-motion support.
+4. Run the swap test: if changing only the logo/headline makes the screen suitable for an unrelated product, inspect which content/layout choices are generic and repair the observed weakness.
+5. Verify the changed user journey and rendered empty/loading/error/disabled states. Screenshots establish appearance; interaction needs browser or equivalent input evidence. If the environment lacks visual tools, report the gap and use DOM/geometry/contrast checks where available.
+6. Make one focused pass with `anti-ai-slop`, `ui-antipattern-review` or `accessible-interaction-design` as relevant. Inspect each concrete reported cue once. Repeat only after an actual change, new failure or unresolved concern; reviews of an unchanged artifact add no evidence.
 
-## Generation 2: cream/terracotta editorial
+Use available native `pocket kit` quality and browser tools after checking current help. JEV findings are advisory leads tied to the changed artifact and user context; they do not prove genericity, correctness or accessibility. Resolve a cue through the actual source/rendered state, preserve specific intentional exceptions and avoid duplicate requests with identical context.
 
-The reaction to generation 1, now itself a cliche — adopted partly because it reads as "the opposite of AI slop," then flooded the training distribution the same way indigo did.
-
-| Element | What it looks like | Why it's a tell |
-| --- | --- | --- |
-| Background | Beige/cream/ivory (`#F4F1EA`-family), warm off-white instead of pure white | Signals "considered editorial," borrowed wholesale from a handful of design-forward brand sites (Anthropic's own included) until every AI output converged on it too |
-| Accent | Rust, terracotta, burnt orange | Swapped in as the anti-purple; equally a default the moment it's applied without a subject-specific reason |
-| Typeface | Oversized serif display, often italicized, tracked-out all-caps subheads with extra letter-spacing | "Considered typography" as a costume — the serif is chosen for its vibe, not because it fits the content |
-| UI chrome | Hairline rules, ticker-style text bars, rounded-rectangle outlines with a neon or soft glow, desaturated mid-century accent hues | Decorative texture standing in for actual information hierarchy |
-| Overall effect | "Tasteful, slightly askew" — deliberately imperfect in a way that itself became a pattern | Kyle Chayka's framing: once informed viewers recognize the formula, the page reads as trying to look hand-made rather than being hand-made |
-
-Both generations fail the same test for the same reason: neither is derived from the actual product. Swap the logo and headline on either and it still works for an unrelated company — that portability is the definition of slop, not the color or font in use.
-
-## The full tell checklist
-
-| Category | Tell |
-| --- | --- |
-| Fonts | Inter with no other rationale; the Space Grotesk / Instrument Serif / Geist rotation; a single italic serif word dropped into an otherwise sans-serif headline for "personality" |
-| Color | Indigo→purple→pink gradient; cream/terracotta as its inverse; gradient used as a background wash rather than tied to any content; glow/box-shadow halos around cards or headlines; dark-mode-only with body text under 4.5:1 contrast |
-| Layout | Centered hero + generic sans headline; badge pill floating above the H1; 3-up identical cards with icon-top and soft shadow; colored top/left stripe on cards; numbered 1-2-3 steps applied to something that isn't actually sequential; a stat-banner row of invented numbers; emoji standing in for icons, especially in a sidebar |
-| Copy | Headlines that name no real capability ("Build faster. Ship smarter."); feature descriptions interchangeable across competitors; badges/tags added for texture ("Beta," "New," "Enterprise") with no actual status behind them; fabricated customer logos or testimonials |
-
-Any one of these in isolation is a legitimate design choice. The tell is applying several together with no argument for why this subject, specifically, needed them.
-
-## Operating procedure for agents
-
-1. **Ground every choice in the subject before touching a palette.** Name the concrete product, its audience, and the one job the screen does. Derive color, type, and layout from that subject's own vocabulary (its units, its real data, its actual workflow) — never from "what SaaS pages look like."
-2. **Ban the two default palettes outright unless the user asked for one of them.** No indigo→purple→pink gradient as a default hero treatment. No cream/ivory + terracotta + oversized italic serif as a default either. If the user's own words specify one of these looks, build it exactly — their instruction overrides this rule.
-3. **Pick neutrals with a deliberate hue bias**, not a pure gray or a pure white/near-black chosen because it's safe. State in one line why this hue.
-4. **Choose a type pairing you would not reuse on an unrelated project.** Reject Inter-by-default, and reject the Space-Grotesk/Instrument-Serif/Geist rotation as a substitute for a real decision.
-5. **Use only real content.** No invented stats, no fabricated logos or testimonials, no placeholder numbers presented as facts. A number with no source becomes a labeled placeholder, not a plausible-looking fake.
-6. **Give every recurring element (badge, tag, numbered step, colored card border) an actual informational job before adding it.** If removing it loses no information, cut it — it was decoration standing in for hierarchy.
-7. **Cut ornament that doesn't represent live state.** A blinking or glowing status dot needs a real status behind it; a glow behind a headline needs no such test, so remove it.
-8. **Run the swap test before shipping.** If the logo and headline can be swapped for an unrelated company's and the page still works unchanged, the design is slop regardless of which palette generation it belongs to — revise until it's specific to this subject.
-9. **Take one real point of view per page**, and keep everything else around it quiet. Maximalist and minimalist directions both fail the same way when every element is trying equally hard.
-
-## Sources
-
-- [The generic style of AI web design](https://kylechayka.substack.com/p/the-generic-style-of-ai-web-design) — Kyle Chayka
-- [AI Design Slop: 16 Patterns That Out Your App as Vibe-Coded](https://www.developersdigest.tech/blog/ai-design-slop-and-how-to-spot-it)
-- [Why Every AI-Built Website Looks the Same (Blame Tailwind's Indigo-500)](https://dev.to/alanwest/why-every-ai-built-website-looks-the-same-blame-tailwinds-indigo-500-3h2p)
-- [AI Slop Fonts and Gradients: The Tells That Give Away AI Design](https://www.925studios.co/blog/ai-slop-design-tells)
-- [The Purple Gradient Problem: Why AI UI All Looks Alike](https://dev.to/james_anderson_h/the-purple-gradient-problem-why-ai-ui-all-looks-alike-and-how-to-fix-it-3j65)
-- [Why Your AI Keeps Building the Same Purple Gradient Website](https://prg.sh/ramblings/Why-Your-AI-Keeps-Building-the-Same-Purple-Gradient-Website)
+Deliver the working interface with its verified behavior and material remaining limitations. Do not leak agent build narration into reader-facing copy or claim visual review, keyboard testing or performance measurement that did not occur.

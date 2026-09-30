@@ -70,6 +70,7 @@ void usage() {
         "  --image PATH         attach an image (PNG/JPEG/GIF/WebP, max 5 MiB, repeatable)\n"
         "  --resume [id]        resume a session (interactive unless -p)\n"
         "  --sessions           list sessions and exit\n"
+        "  --workflow TASK      show native policy and available workflow skills as JSON\n"
         "  --network            allow network access for tools (on by default)\n"
         "  --no-network, --offline  deny network access for tools\n"
         "  --allow-read PATH    extra read root for native tools (repeatable)\n"
@@ -179,7 +180,8 @@ int pocketMain(int argc, char** argv) {
     std::string thinkingCli;
     std::string resumeId;
     bool resume = false, listSessions = false, listModels = false, refreshCatalog = false;
-    std::string modelQuery, goalText;
+    std::string modelQuery, goalText, workflowTask;
+    bool workflowRequested = false;
     bool optNetwork = false, optUnsafe = false, optAllowRoot = false, optNoNetwork = false;
     bool optAllowDestructive = false;
     bool optHelp = false, optVersion = false;
@@ -205,6 +207,7 @@ int pocketMain(int argc, char** argv) {
         else if (a == "--version" || a == "-v") optVersion = true;
         else if (a == "-p" || a == "--print") { printRequested = true; prompt = needVal("-p"); }
         else if (a == "-g" || a == "--goal") { goalRequested = true; prompt = goalText = needVal("--goal"); }
+        else if (a == "--workflow") { workflowRequested = true; workflowTask = needVal("--workflow"); }
         else if (a == "--refresh-catalog") refreshCatalog = true;
         else if (a == "--models") {
             listModels = true;
@@ -256,6 +259,10 @@ int pocketMain(int argc, char** argv) {
         fprintf(stderr, "pocket: use either --print or --goal with a nonempty prompt\n");
         return 2;
     }
+    if (workflowRequested && (trim(workflowTask).empty() || printRequested || goalRequested || resume || listModels || listSessions)) {
+        fprintf(stderr, "pocket: --workflow needs a nonempty task and cannot combine with execution modes\n");
+        return 2;
+    }
 
     // --- privilege boundary: refuse root agent execution by default ---
     if (geteuid() == 0 && !optAllowRoot) {
@@ -305,6 +312,18 @@ int pocketMain(int argc, char** argv) {
                     workspace.c_str(), parentWs.c_str());
             return 1;
         }
+    }
+
+    if (workflowRequested) {
+        auto selected = skillAutoSelect(skillDiscover(workspace), workflowTask, {}, 4, workspace);
+        auto policy = taskPolicy(workflowTask);
+        json::Array names;
+        for (const auto& skill : selected.skills) names.push_back(skill.name);
+        printf("%s\n", json::stringify(json::Object{{"scale", taskScaleName(policy.scale)},
+            {"adaptive_thinking", policy.thinking}, {"planning_brief", policy.planningBrief},
+            {"reviewer_budget", policy.reviewers}, {"fast_model_eligible", policy.fastModel},
+            {"ui", selected.ui}, {"video", selected.video}, {"skills", names}}, true).c_str());
+        return 0;
     }
 
     // Provider keys from the user env file (never overriding the shell).
@@ -578,39 +597,44 @@ int pocketMain(int argc, char** argv) {
         return decide(cfg, state, qs, transcript, cost, tools.cancel, tools.onEvent);
     };
     ao.hint = [&cfg, &tools, workspace](const std::string& text, double* cost) -> std::string {
-        if (!needsBrief(text)) return "";
-        auto hits = skillSearch(skillDiscover(workspace), text);
-        if (hits.size() > 3) hits.resize(3);
-        std::vector<Question> qs;
-        for (size_t i = 0; i < hits.size(); ++i)
-            qs.push_back({"s" + std::to_string(i), "Would the guide \"" + hits[i].name + ": " + hits[i].preview.substr(0, 200) +
-                                                       "\" materially help an expert do this task well?"});
-        // Same batched call: is this UI/UX/GUI work? Then the design doctrine is required reading.
-        // Remote Jev answers it for free in the batch; a local LM pays one inference per question, so
-        // offline it is only asked when a keyword already suspects UI work.
-        const bool askUi = remoteAvailable(cfg) || looksLikeUiWork(text);
-        const bool askVideo = remoteAvailable(cfg) || looksLikeVideoWork(text);
-        if (askVideo) qs.push_back({"video", "Does this task involve making, editing or rendering a video, motion graphics, an animation with sound, "
-                                    "a voiceover, or a music track for a video?"});
-        if (askUi) qs.push_back({"ui", "Does this task involve designing, building or restyling a user interface, user experience, "
-                            "web page or any graphical/terminal interface?"});
-        if (qs.empty()) return "";
-        auto p = decide(cfg, json::Object{{"task", text.substr(0, 2000)}}, qs, false, cost, tools.cancel, tools.onEvent);
-        bool ui = p.count("ui") ? p["ui"] >= 0.7 : looksLikeUiWork(text);
-        bool video = p.count("video") ? p["video"] >= 0.7 : looksLikeVideoWork(text);
+        if (startsWith(trim(text), "[")) return "";
+        const auto all = skillDiscover(workspace);
+        const auto selected = skillAutoSelect(all, text, tools.loadedSkills, 4, workspace);
         std::vector<std::string> keep;
-        for (size_t i = 0; i < hits.size(); ++i)
-            // Without a verdict, only a skill the request names (fuzzily) is offered:
-            // a bare BM25 word overlap is noise, not relevance.
-            if (hits[i].name != kUiDocSkill && hits[i].name != kVideoDocSkill &&
-                (p.empty() ? i == 0 && fuzzyScore(hits[i].name, text) >= 0.8 : p["s" + std::to_string(i)] >= 0.7))
-                keep.push_back(hits[i].name);
+        for (const auto& skill : selected.skills)
+            if (skill.name != kUiDocSkill && skill.name != kVideoDocSkill) keep.push_back(skill.name);
+        bool ui = selected.ui || looksLikeUiWork(text);
+        bool video = selected.video;
+        // Deterministic domain routes need no paid relevance check. Ask Jev
+        // only for ambiguous substantial work, in one bounded batch.
+        if (keep.empty() && !ui && !video && text.size() > 240 && taskPolicy(text).planningBrief) {
+            auto hits = skillSearch(all, text);
+            if (hits.size() > 3) hits.resize(3);
+            std::vector<Question> qs;
+            for (size_t i = 0; i < hits.size(); ++i)
+                qs.push_back({"s" + std::to_string(i), "Would the guide \"" + hits[i].name + ": " + hits[i].preview.substr(0, 200) +
+                             "\" materially help an expert do this task well?"});
+            if (remoteAvailable(cfg)) {
+                qs.push_back({"ui", "Does this task involve designing, building or restyling a user interface?"});
+                qs.push_back({"video", "Does this task involve making or editing video, animation, voiceover or music for video?"});
+            }
+            if (!qs.empty()) {
+                auto verdict = decide(cfg, json::Object{{"task", text.substr(0, 2000)}}, qs, false, cost, tools.cancel, tools.onEvent);
+                ui = verdict.count("ui") && verdict["ui"] >= .7;
+                video = verdict.count("video") && verdict["video"] >= .7;
+                for (size_t i = 0; i < hits.size(); ++i)
+                    if (verdict.count("s" + std::to_string(i)) && verdict["s" + std::to_string(i)] >= .7 &&
+                        hits[i].name != kUiDocSkill && hits[i].name != kVideoDocSkill &&
+                        std::find(tools.loadedSkills.begin(), tools.loadedSkills.end(), hits[i].name) == tools.loadedSkills.end())
+                        keep.push_back(hits[i].name);
+            }
+        }
         std::string out;
         if (ui && !tools.uiDocLoaded)
             out = "[harness] This is UI/UX work. Before designing or writing any interface, you MUST load the design "
                   "doctrine: skill(action=load, name=\"" + std::string(kUiDocSkill) +
-                  "\"). Defaults (indigo/purple gradients, cream/terracotta serif, Inter, identical icon cards, "
-                  "invented stats) are defects.";
+                  "\"). Preserve project identity; gratuitous purple gradients, cream-and-cursive templates, identical icon cards, "
+                  "invented stats are defects.";
         if (video && !tools.videoDocLoaded)
             out += std::string(out.empty() ? "" : "\n") +
                    "[harness] This is video work. Before planning or writing scenes, load the video doctrine: skill(action=load, name=\"" +
@@ -621,6 +645,7 @@ int pocketMain(int argc, char** argv) {
                    join(keep, ", ") + " — load with skill(action=load, name=...) before starting.";
         return out;
     };
+    ao.adaptiveModel = modelSpec.empty() && !resume;
     ao.thinking = thinking;
     ao.maxRounds = optMaxRounds > 0 ? optMaxRounds : cfg.maxRounds;
     ao.workingContextTokens = cfg.workingContextTokens;

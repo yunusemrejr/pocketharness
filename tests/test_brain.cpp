@@ -50,6 +50,30 @@ TEST(brain_Stop_Classifier_Separates_Done_Announce_Permission) {
     return "";
 }
 
+TEST(brain_Task_Policy_Scales_With_Risk_Uncertainty_And_Observed_Work) {
+    auto simple = taskPolicy("Please make the project title say Pocket Harness.");
+    CHECK(simple.scale == TaskScale::Simple && simple.fastModel && !simple.planningBrief && simple.thinking == "low");
+    auto uncertain = taskPolicy("Diagnose the intermittent parser regression");
+    CHECK(uncertain.scale == TaskScale::Standard && !uncertain.fastModel && uncertain.thinking == "medium");
+    auto complex = taskPolicy("Implement the migration across modules and benchmark correctness");
+    CHECK(complex.scale == TaskScale::Complex && complex.planningBrief && complex.reviewers == 3);
+    auto risky = taskPolicy("Deploy the production authentication change");
+    CHECK(risky.scale == TaskScale::Critical && risky.thinking == "high" && !risky.fastModel);
+    auto failed = taskPolicy("Read the title", {2, 0, 2, 2});
+    CHECK(failed.scale == TaskScale::Standard && failed.thinking == "high" && !failed.fastModel);
+    auto broad = taskPolicy("Fix the title", {0, 4, 6, 0});
+    CHECK(broad.scale == TaskScale::Complex && broad.reviewers == 3);
+    TaskObservation riskyAction;
+    riskyAction.actionScale = TaskScale::Critical;
+    CHECK(taskPolicy("Read the title", riskyAction).scale == TaskScale::Critical);
+    CHECK(taskPolicy("Fine-tune a language model with QLoRA in Google Colab").scale == TaskScale::Complex);
+    CHECK(taskPolicy("Create an animation with music and a voiceover").scale == TaskScale::Complex);
+    CHECK(taskPolicy("Fix the save bug").workspaceWork);
+    CHECK(!taskPolicy("How do I fix the save bug?").workspaceWork);
+    CHECK(!taskPolicy("Write a short poem about rain").workspaceWork);
+    return "";
+}
+
 TEST(brain_Quirks_Learned_From_400s_Persist) {
     std::string home = makeTempDir("pocket-brain");
     HomeGuard hg(home);
@@ -69,6 +93,27 @@ TEST(brain_Quirks_Learned_From_400s_Persist) {
     CHECK(o.reasoning == "none" && !o.streamUsage);
     brainNoteHealth("prov", false, 100);
     CHECK(brainHealth("prov") < 1 && brainHealth("unknown") == 1);
+    rmRf(home);
+    return "";
+}
+
+TEST(brain_Implicit_Fast_Route_Avoids_Well_Observed_Unhealthy_Or_Slow_Providers) {
+    std::string home = makeTempDir("pocket-route-health");
+    HomeGuard isolated(home);
+    CHECK(brainPreferFast("main", "unknown")); // unknown is not fabricated as bad
+    brainNoteHealth("one-failure", false, 100);
+    CHECK(brainPreferFast("main", "one-failure")); // one sample is not a trend
+    for (int i = 0; i < 8; ++i) {
+        brainNoteHealth("main", true, 1000);
+        brainNoteHealth("unhealthy", false, 100);
+        brainNoteHealth("slow", true, 9000);
+        brainNoteHealth("fast", true, 400);
+    }
+    CHECK(!brainPreferFast("main", "unhealthy"));
+    CHECK(!brainPreferFast("main", "slow"));
+    CHECK(brainPreferFast("main", "fast"));
+    CHECK(brainPreferFast("unknown", "slow")); // no main latency to compare
+    CHECK(brainPreferFast("unhealthy", "unhealthy")); // provider scores cannot distinguish models
     rmRf(home);
     return "";
 }
@@ -147,11 +192,16 @@ TEST(wisdom_Retrieves_Relevant_Sections) {
     return "";
 }
 
-TEST(agent_Needs_Brief_Only_For_Real_Work) {
-    CHECK(needsBrief("please fix the user interface and make it elegant, not boilerplate"));
-    CHECK(!needsBrief("what does this function do?"));
-    CHECK(!needsBrief("fix it"));
-    CHECK(!needsBrief("[overseer] fix the remaining issues in the parser module now"));
+TEST(agent_Planning_Brief_Only_For_Substantial_Work) {
+    auto brief = [](const std::string& request) {
+        auto policy = taskPolicy(request);
+        return policy.planningBrief && policy.workspaceWork;
+    };
+    CHECK(brief("Fine-tune a language model with QLoRA in Google Colab"));
+    CHECK(brief("Implement the migration across modules and benchmark correctness"));
+    CHECK(!brief("How do I fine-tune a language model with QLoRA?"));
+    CHECK(!brief("Please make the project title say Pocket Harness."));
+    CHECK(!brief("Write a short poem about rain"));
     return "";
 }
 

@@ -35,6 +35,28 @@ struct StopGuess {
 StopGuess classifyStop(std::string_view finalText);
 const char* stopKindName(StopKind k);
 
+// Native execution policy: no network, no learned completion verdict. The
+// request establishes a floor; observed failures and growing work escalate
+// independently. Explicit model/thinking settings remain Agent's authority.
+enum class TaskScale { Simple, Standard, Complex, Critical };
+struct TaskObservation {
+    int failures = 0;
+    int changedFiles = 0;
+    int toolRounds = 0;
+    int stalledRounds = 0;
+    TaskScale actionScale = TaskScale::Simple;
+};
+struct TaskPolicy {
+    TaskScale scale = TaskScale::Simple;
+    std::string thinking = "low";
+    bool planningBrief = false;
+    bool fastModel = true;
+    bool workspaceWork = false;  // a text-only answer cannot complete this intent
+    int reviewers = 1;
+};
+TaskPolicy taskPolicy(std::string_view request, const TaskObservation& observed = {});
+const char* taskScaleName(TaskScale scale);
+
 // Learned state, persisted in stateDir()/brain.json (small, atomic writes).
 // quirks: per "provider:model" wire incompatibilities discovered from 400s
 //   (no_reasoning, no_stream_usage, max_tokens, max_completion_tokens).
@@ -43,6 +65,10 @@ std::vector<std::string> brainQuirks(const std::string& modelKey);
 void brainNoteQuirk(const std::string& modelKey, const std::string& quirk);
 void brainNoteHealth(const std::string& provider, bool ok, long ms);
 double brainHealth(const std::string& provider);  // EWMA success, 1 when unknown
+// Advisory implicit routing only. A single snapshot compares sufficiently
+// observed health/latency; unknown providers and same-provider models remain
+// eligible. Never used to override a user's explicit model selection.
+bool brainPreferFast(const std::string& mainProvider, const std::string& fastProvider);
 std::string brainStatus();                        // human summary, one line per provider
 
 // Map a provider 400 body to a quirk to learn ("" = nothing recognizable).

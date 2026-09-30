@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <thread>
+#include <set>
 
 #include "../src/tui.h"
 
@@ -30,7 +31,7 @@ struct TuiFixture {
     std::string output;
     bool plain = false;
     explicit TuiFixture(int width = 80, int height = 24, bool lineMode = false, bool pausedGoal = false,
-                        bool sessionMode = false, bool attachedImage = false, bool heldAudit = false) : plain(lineMode) {
+                        bool sessionMode = false, bool attachedImage = false, bool heldAudit = false, bool animate = false) : plain(lineMode) {
         master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
         if (master < 0 || grantpt(master) || unlockpt(master)) return;
         char* path = ptsname(master);
@@ -60,7 +61,8 @@ struct TuiFixture {
             setenv("HOME", home.c_str(), 1);
             setenv("XDG_CONFIG_HOME", (home + "/config").c_str(), 1);
             setenv("XDG_STATE_HOME", (home + "/state").c_str(), 1);
-            setenv("POCKET_NO_ANIM", "1", 1);
+            if (animate) unsetenv("POCKET_NO_ANIM");
+            else setenv("POCKET_NO_ANIM", "1", 1);
             setenv("NO_COLOR", "1", 1);
             setenv("TERM", "xterm", 1);
             Config cfg = defaultConfig();
@@ -100,10 +102,11 @@ struct TuiFixture {
                 bool heldGoal = req.stream && holdGoalWork && user.find("[goal") != std::string::npos;
                 if (heldGoal) holdGoalWork = false;
                 bool auditGate = heldAudit && req.system.find("You audit an autonomous agent") != std::string::npos;
-                if (user == "first" || user == "delayed approval" || user == "viewportstream" || heldGoal || auditGate) {
+                if (user == "first" || user == "quiet thinking" || user == "delayed approval" || user == "viewportstream" || heldGoal || auditGate) {
                     if (env.onEvent) env.onEvent("judge: local LM ran successfully (fixture)");
                     if (auditGate && env.onEvent) env.onEvent("AUDIT_READY");
-                    if (!auditGate && cb.onToken) cb.onToken(user == "viewportstream" ? std::string(600, 'z') + "TAIL_READY" :
+                    if (user == "quiet thinking" && cb.onReasoning) cb.onReasoning("THINKING_RUNNING\n");
+                    else if (!auditGate && cb.onToken) cb.onToken(user == "viewportstream" ? std::string(600, 'z') + "TAIL_READY" :
                                               heldGoal ? "GOAL_RUNNING\n" : "FIRST_RUNNING\n");
                     for (;;) {
                         if (cb.cancel && cb.cancel->load()) return Result<ChatResponse>::Err("cancelled");
@@ -379,6 +382,54 @@ TEST(tui_Working_Footer_Shows_Liveness_And_Elapsed) {
     t.finishFirst();
     CHECK(t.waitFor("REPLY:\"first\""));
     CHECK(t.waitFor("done in"));
+    CHECK(t.quit());
+    return "";
+}
+
+// Sample fresh PTY paints, not historical status text. NO_COLOR remains set
+// to prove that disabling color does not disable the liveness animation.
+static std::set<std::string> sampleBusyFrames(TuiFixture& t, const std::string& phase) {
+    t.output.clear();
+    (void)t.waitFor("NEVER_A_REAL_TUI_EVENT", 520);
+    std::set<std::string> frames;
+    for (const char* glyph : {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"})
+        if (t.output.find(std::string(glyph) + " " + phase) != std::string::npos) frames.insert(glyph);
+    return frames;
+}
+
+TEST(tui_Thinking_Animation_Remains_Visible_Through_Resize_And_Recovery) {
+    TuiFixture t(80, 24, false, false, true, false, false, true);
+    CHECK(t.ready() && t.send("quiet thinking\r") && t.waitFor("THINKING_RUNNING"));
+    CHECK(sampleBusyFrames(t, "thinking").size() >= 3);
+    winsize size{}; size.ws_col = 20; size.ws_row = 12;
+    CHECK(ioctl(t.master, TIOCSWINSZ, &size) == 0 && kill(t.child, SIGWINCH) == 0);
+    CHECK(sampleBusyFrames(t, "thinking").size() >= 3);
+    size.ws_row = 5;
+    CHECK(ioctl(t.master, TIOCSWINSZ, &size) == 0 && kill(t.child, SIGWINCH) == 0);
+    (void)sampleBusyFrames(t, "thinking");
+    size.ws_col = 80; size.ws_row = 24;
+    CHECK(ioctl(t.master, TIOCSWINSZ, &size) == 0 && kill(t.child, SIGWINCH) == 0);
+    CHECK(sampleBusyFrames(t, "thinking").size() >= 3);
+    CHECK(t.send("draft survives") && t.waitFor("> draft survives"));
+    CHECK(sampleBusyFrames(t, "thinking").size() >= 3);
+    CHECK(t.output.find("draft survives") == std::string::npos); // ticks repaint only the activity row
+    CHECK(t.send("\033") && t.waitFor("(paused;"));
+    CHECK(sampleBusyFrames(t, "thinking").empty());
+    CHECK(t.send(" continued\r") && t.waitFor("REPLY:\"draft survives continued\""));
+    CHECK(t.quit());
+    return "";
+}
+
+TEST(tui_Active_Goal_Animates_While_The_Followup_Queue_Is_Held) {
+    TuiFixture t(80, 24, false, false, false, false, false, true);
+    CHECK(t.ready() && t.send("first\r") && t.waitFor("FIRST_RUNNING"));
+    CHECK(t.send("older\r") && t.waitFor("queued 1"));
+    CHECK(t.send("\033") && t.waitFor("(paused;"));
+    CHECK(t.send("/goal hold\r") && t.waitFor("GOAL_RUNNING"));
+    CHECK(sampleBusyFrames(t, "writing").size() >= 3);
+    CHECK(t.output.find("paused · queued 1") == std::string::npos);
+    CHECK(t.send("\033") && t.waitFor("(paused;"));
+    CHECK(t.send("/queue\r") && t.waitFor("queue: 1 held"));
     CHECK(t.quit());
     return "";
 }

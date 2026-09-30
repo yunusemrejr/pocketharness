@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common.h"
+#include "brain.h"
 #include "oversee.h"
 #include "provider.h"
 #include "session.h"
@@ -104,6 +105,10 @@ struct AgentOpts {
     // Skill hint for a new user message ("" = none).
     std::function<std::string(const std::string& userText, double* cost)> hint;
     bool brief = false;              // expert brief before substantial requests
+    // Main sets this only for an implicit model choice. /model disables it.
+    // A configured fast role handles safe simple requests; observed work or
+    // failure returns to the main model without changing its configured role.
+    bool adaptiveModel = false;
     long workingContextTokens = 96000;  // soft checkpoint independent of the model window; 0 disables
     // Cheap advisory check of a bounded recent tool trace. Never a completion
     // verdict or permission gate; empty means no change of direction suggested.
@@ -124,10 +129,6 @@ struct AgentOpts {
 // few thousand tokens each), finite against pathological providers. Expired
 // phases cancel their in-flight requests and degrade to the survivor path.
 inline constexpr long kDoubleDeadlineMs = 480000;
-
-// True for requests that deserve an expert brief (imperative work, not a
-// quick question). Pure, unit-tested.
-bool needsBrief(const std::string& userText);
 
 struct AgentStats {
     long inTokens = 0;  // summed when the provider reports usage, else stays 0
@@ -208,6 +209,7 @@ class Agent {
     void setModel(const ResolvedModel& m, const std::string& thinking) {
         opts_.model = m;
         opts_.thinking = thinking;
+        opts_.adaptiveModel = false;
         stats_.lastPrompt = -1;
         lastEstimate_ = 0;
     }
@@ -311,6 +313,14 @@ class Agent {
     int turnNudges_ = 0, turnGates_ = 0;
     bool unverified_ = false, verifyNudged_ = false, reviewed_ = false, linted_ = false, calmNext_ = false;
     std::string thinkNow_ = "high";  // adaptive thinking: level for the next request
+    TaskPolicy taskPolicy_;
+    TaskObservation taskObserved_;
+    std::string policyRequest_;
+    std::string lastRequestModel_;  // model changes invalidate prompt calibration
+    bool fastPreferred_ = true;    // health snapshot, evaluated once per turn
+    int reviewPasses_ = 0;
+    long workRevision_ = 0;
+    std::map<std::string, long> hookPassedRevision_;
     std::vector<std::string> blind_;  // model specs that rejected image input this session
     std::map<std::string, int> hookNagged_;  // stop-hook failures nagged this turn
 };

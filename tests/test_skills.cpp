@@ -64,6 +64,140 @@ TEST(skills_Search_Ranks_Name_Heading_Preview) {
     return "";
 }
 
+TEST(skills_Discover_Empty_Markdown_Heading) {
+    std::string home = makeTempDir("pocket-skill-heading");
+    CHECK(!home.empty());
+    HomeGuard hg(home);
+    const std::string ws = home + "/ws";
+    CHECK(ensureDir(projectSkillDir(ws) + "/empty-heading", 0755).ok);
+    CHECK(atomicWriteFile(projectSkillDir(ws) + "/empty-heading/SKILL.md",
+                          "#\n##\n# Actual heading\n\nA valid preview.\n", 0644).ok);
+    auto all = skillDiscover(ws);
+    CHECK_EQ(all.size(), size_t(1));
+    CHECK_EQ(all[0].heading, std::string("Actual heading"));
+    CHECK_EQ(all[0].preview, std::string("A valid preview."));
+    rmRf(home);
+    return "";
+}
+
+namespace {
+
+std::vector<SkillMeta> workflowCatalog() {
+    std::vector<SkillMeta> all;
+    for (const char* name : {"project-workflows", "ai-design-slop", "video-studio", "shared-hosting-deployment",
+                             "php-application-engineering", "node-runtime-engineering", "modern-frontend-frameworks",
+                             "browser-javascript-engineering", "go-service-engineering", "rust-systems-engineering",
+                             "java-platform-engineering", "python-software-engineering", "bash-workflows",
+                             "cpp-performance-engineering", "c-systems-engineering", "linux-desktop-ui-ux",
+                             "local-webapp-workflows", "algorithm-design", "ml-engineering", "llm-fine-tuning",
+                             "google-colab-training", "music-composition", "audio-processing", "browser-animation-engineering"})
+        all.push_back({name, "bundled", name, "", "skills/" + std::string(name) + "/SKILL.md"});
+    return all;
+}
+
+bool selected(const SkillSelection& result, const std::string& name) {
+    for (const auto& skill : result.skills) if (skill.name == name) return true;
+    return false;
+}
+
+}  // namespace
+
+TEST(skills_AutoSelect_Exact_Domains_And_No_Noise) {
+    auto all = workflowCatalog();
+    CHECK(skillAutoSelect(all, "hello").skills.empty());
+    CHECK(skillAutoSelect(all, "Please go to the logo description").skills.empty());
+    CHECK(skillAutoSelect(all, "Compose an email").skills.empty());
+    auto js = skillAutoSelect(all, "Fix the JavaScript browser request race");
+    CHECK(selected(js, "browser-javascript-engineering"));
+    CHECK(!selected(js, "java-platform-engineering"));
+    CHECK(!selected(js, "go-service-engineering"));
+    for (const auto& item : std::vector<std::pair<std::string, std::string>>{
+             {"Build a PHP8+ API", "php-application-engineering"},
+             {"Fix the Node.js CLI", "node-runtime-engineering"},
+             {"Create a React CDN component", "modern-frontend-frameworks"},
+             {"Optimize the Go service", "go-service-engineering"},
+             {"Implement a Rust parser", "rust-systems-engineering"},
+             {"Fix Java shutdown", "java-platform-engineering"},
+             {"Build a Flask API", "python-software-engineering"},
+             {"Fix the Bash launcher", "bash-workflows"},
+             {"Optimize a C++ renderer", "cpp-performance-engineering"},
+             {"Fix memory ownership in C", "c-systems-engineering"},
+             {"Build a GTK Linux application", "linux-desktop-ui-ux"},
+             {"Debug a local webapp", "local-webapp-workflows"},
+             {"Implement a shortest path algorithm", "algorithm-design"},
+             {"Build a machine learning classifier", "ml-engineering"}}) {
+        auto result = skillAutoSelect(all, item.first);
+        if (!selected(result, item.second)) return "missing workflow for " + item.first;
+        CHECK(selected(result, "project-workflows"));
+        CHECK(result.skills.size() <= 4);
+    }
+    auto colab = skillAutoSelect(all, "Fine-tune with QLoRA in Google Colab");
+    CHECK(selected(colab, "google-colab-training"));
+    CHECK(selected(colab, "llm-fine-tuning"));
+    CHECK(!selected(colab, "go-service-engineering"));
+    return "";
+}
+
+TEST(skills_AutoSelect_Bounded_Deduplicated_And_Installed) {
+    auto all = workflowCatalog();
+    auto ui = skillAutoSelect(all, "Build a PHP website deployed on Namecheap through GitHub SSH");
+    CHECK(ui.ui && !ui.video);
+    CHECK(selected(ui, "ai-design-slop"));
+    CHECK(selected(ui, "shared-hosting-deployment"));
+    CHECK(selected(ui, "php-application-engineering"));
+    CHECK_EQ(ui.skills.size(), size_t(4));
+    auto resumed = skillAutoSelect(all, "Build a PHP website deployed on Namecheap through GitHub SSH",
+                                   {"ai-design-slop", "project-workflows", "php-application-engineering"});
+    CHECK(resumed.ui);
+    CHECK_EQ(resumed.skills.size(), size_t(1));
+    CHECK_EQ(resumed.skills[0].name, std::string("shared-hosting-deployment"));
+    auto named = skillAutoSelect(all, "Use rust-systems-engineering to create a Rust webapp", {}, 1);
+    CHECK_EQ(named.skills.size(), size_t(1));
+    CHECK_EQ(named.skills[0].name, std::string("rust-systems-engineering"));
+    auto unavailable = skillAutoSelect({all[0]}, "Build a PHP website on GoDaddy");
+    CHECK(unavailable.ui);
+    CHECK_EQ(unavailable.skills.size(), size_t(1));
+    CHECK_EQ(unavailable.skills[0].name, std::string("project-workflows"));
+    CHECK(skillAutoSelect(all, "Create a video", {}, 0).skills.empty());
+    return "";
+}
+
+TEST(skills_AutoSelect_Audio_Is_Independent_Of_Video) {
+    auto all = workflowCatalog();
+    auto music = skillAutoSelect(all, "Compose a music track and edit its audio loudness");
+    CHECK(!music.video);
+    CHECK(selected(music, "music-composition"));
+    CHECK(selected(music, "audio-processing"));
+    CHECK(!selected(music, "video-studio"));
+    auto video = skillAutoSelect(all, "Create a video with animated diagrams and narration");
+    CHECK(video.video);
+    CHECK(selected(video, "video-studio"));
+    auto gif = skillAutoSelect(all, "Create a GIF animation");
+    CHECK(!gif.video);
+    CHECK(selected(gif, "browser-animation-engineering"));
+    return "";
+}
+
+TEST(skills_AutoSelect_Project_Manifest_And_Explicit_Runtime) {
+    std::string ws = makeTempDir("pocket-workflow");
+    CHECK(!ws.empty());
+    auto all = workflowCatalog();
+    CHECK(atomicWriteFile(ws + "/package.json", "{\"dependencies\":{\"react\":\"19.0.0\"}}", 0644).ok);
+    auto result = skillAutoSelect(all, "Fix the failing test", {}, 4, ws);
+    CHECK(selected(result, "modern-frontend-frameworks"));
+    CHECK(selected(result, "project-workflows"));
+    CHECK(skillAutoSelect(all, "hello", {}, 4, ws).skills.empty());
+    CHECK(skillAutoSelect(all, "Fix the title in README.md", {}, 4, ws).skills.empty());
+    CHECK(skillAutoSelect(all, "Fix a typo in the documentation", {}, 4, ws).skills.empty());
+    auto explicitRuntime = skillAutoSelect(all, "Write a Python script", {}, 4, ws);
+    CHECK(selected(explicitRuntime, "python-software-engineering"));
+    CHECK(!selected(explicitRuntime, "modern-frontend-frameworks"));
+    auto resumed = skillAutoSelect(all, "Fix the failing test", {"modern-frontend-frameworks", "project-workflows"}, 4, ws);
+    CHECK(resumed.skills.empty());
+    rmRf(ws);
+    return "";
+}
+
 TEST(skills_Bundled_Local_Markdown_Links_Resolve) {
     // The installed skill tree keeps relative assets/references. A missing
     // target otherwise sends a model to a script or example it cannot use.

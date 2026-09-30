@@ -472,3 +472,19 @@ TEST(tools_Write_Reports_Lint_Findings_Without_Being_Asked) {
     CHECK(r.ok && r.output.find("[quality]") == std::string::npos);
     return "";
 }
+
+TEST(tools_Loaded_Skill_Names_Are_Canonical_And_Deduplicated) {
+    std::string home = makeTempDir("pocket-skill-loaded");
+    HomeGuard isolated(home);
+    CHECK(ensureDir(bundledSkillDir() + "/ai-design-slop", 0700).ok);
+    CHECK(atomicWriteFile(bundledSkillDir() + "/ai-design-slop/SKILL.md", "# Design\n\nPreserve the project identity.").ok);
+    ToolEnv env;
+    env.workspace = home;
+    CHECK(runTool(env, "skill", R"({"action":"load","name":" ai-design-slop "})").ok);
+    CHECK(env.uiDocLoaded);
+    CHECK(runTool(env, "skill", R"({"action":"load","name":"ai-design-slop"})").ok);
+    CHECK_EQ(env.loadedSkills.size(), size_t(1));
+    CHECK_EQ(env.loadedSkills.front(), std::string("ai-design-slop"));
+    rmRf(home);
+    return "";
+}

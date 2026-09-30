@@ -227,7 +227,12 @@ TEST(cli_Local_Judge_Activity_Reaches_The_User) {
     CHECK(atomicWriteFile(userConfigPath(), json::stringify(config)).ok);
     SpawnOpts opts;
     opts.exe = "./pocket";
-    opts.argv = {opts.exe, "--allow-root", workspace, "-p", "Fix parser bugs and test invalid inputs carefully."};
+    // An explicit skill name routes natively now. Use an ambiguous substantial
+    // request so the batched local relevance judge is actually warranted.
+    opts.argv = {opts.exe, "--allow-root", workspace, "-p",
+        "Investigate bugs in the existing recursive parsing logic and test invalid inputs carefully. "
+        "Recover the migration acceptance criteria, identify the owning routines, reproduce malformed-input failures, "
+        "and validate the resulting behavior against the existing fixtures while preserving unrelated work."};
     opts.timeoutMs = 10000;
     auto result = spawn(opts);
     server.stop();
@@ -376,5 +381,40 @@ TEST(cli_Interactive_Resume_Handoff_Restores_Target_And_Releases_Leases) {
         close(lease.value);
     }
     CHECK(sessionList(10, workspace).size() == 2);
+    return "";
+}
+
+TEST(cli_Workflow_Inspection_Is_Offline_And_Does_Not_Create_A_Session) {
+    std::string home = makeTempDir("pocket-route-cli");
+    CHECK(!home.empty());
+    HomeGuard isolated(home);
+    CHECK(ensureDir(home + "/workspace", 0700).ok);
+    for (const auto* name : {"project-workflows", "php-application-engineering", "shared-hosting-deployment"}) {
+        CHECK(ensureDir(bundledSkillDir() + "/" + name, 0700).ok);
+        CHECK(atomicWriteFile(bundledSkillDir() + "/" + name + "/SKILL.md", "# Workflow\n\nA task guide.").ok);
+    }
+    SpawnOpts opts;
+    opts.exe = "./pocket";
+    opts.argv = {"./pocket", home + "/workspace", "--workflow", "Deploy PHP 8 website to Namecheap through Git and SSH"};
+    opts.timeoutMs = 2000;
+    auto result = spawn(opts);
+    CHECK(result.ok && result.exitCode == 0);
+    auto report = json::parse(result.out);
+    CHECK(report.ok && report.value.at("planning_brief").asBool());
+    CHECK(report.value.at("ui").asBool());
+    bool hosting = false, php = false;
+    for (const auto& skill : report.value.at("skills").asArr()) {
+        hosting |= skill.asStr() == "shared-hosting-deployment";
+        php |= skill.asStr() == "php-application-engineering";
+    }
+    CHECK(hosting && php);
+    CHECK(!std::filesystem::exists(sessionDir()));
+    opts.argv = {"./pocket", "--workflow", ""};
+    auto empty = spawn(opts);
+    CHECK(empty.ok && empty.exitCode == 2);
+    opts.argv = {"./pocket", "--workflow", "Inspect Go service", "-p", "run"};
+    auto conflict = spawn(opts);
+    CHECK(conflict.ok && conflict.exitCode == 2);
+    rmRf(home);
     return "";
 }

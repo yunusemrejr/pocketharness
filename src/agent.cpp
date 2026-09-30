@@ -194,6 +194,7 @@ VoidResult Agent::restore(const std::string& sessionId) {
     // this a resume sees pre-compact history twice (once raw, once summed).
     messages_.clear();
     std::vector<ChatImage> imgBuf;  // image events attach to the next user message
+    std::map<std::string, ToolCall> historicalCalls;
     for (size_t i = 0; i < loaded.value.events.size(); ++i) {
         const auto& ev = loaded.value.events[i];
         if (ev.type == "user") {
@@ -221,8 +222,10 @@ VoidResult Agent::restore(const std::string& sessionId) {
             messages_.push_back(ChatMessage{"assistant", ev.text, {}, ""});
             messages_.back().replay = ev.replay;
             // New logs commit the full batch with the assistant in one record.
-            for (const auto& tc : ev.replay.at("calls").asArr())
+            for (const auto& tc : ev.replay.at("calls").asArr()) {
                 messages_.back().toolCalls.push_back({tc.at("id").asStr(), tc.at("name").asStr(), tc.at("args").asStr(), ""});
+                historicalCalls[tc.at("id").asStr()] = messages_.back().toolCalls.back();
+            }
             if (messages_.back().replay.isObj()) messages_.back().replay.asObj().erase("calls");
         } else if (ev.type == "tool_call") {
             // Attach to the owning assistant message, scanning back past
@@ -234,12 +237,25 @@ VoidResult Agent::restore(const std::string& sessionId) {
                     tc.id = ev.toolId;
                     tc.name = ev.toolName;
                     tc.argsJson = ev.toolArgs;
+                    historicalCalls[tc.id] = tc;
                     it->toolCalls.push_back(std::move(tc));
                     break;
                 }
                 if (it->role == "user") break;
             }
         } else if (ev.type == "tool_result") {
+            auto call = historicalCalls.find(ev.toolId);
+            if (opts_.tools && ev.toolOk && call != historicalCalls.end() && call->second.name == "skill") {
+                auto args = json::parse(call->second.argsJson);
+                std::string name = args.ok ? trim(args.value.at("name").asStr()) : "";
+                if (args.ok && args.value.at("action").asStr() == "load" && !name.empty()) {
+                    auto& loadedSkills = opts_.tools->loadedSkills;
+                    if (std::find(loadedSkills.begin(), loadedSkills.end(), name) == loadedSkills.end())
+                        loadedSkills.push_back(name);
+                    opts_.tools->uiDocLoaded |= name == kUiDocSkill;
+                    opts_.tools->videoDocLoaded |= name == kVideoDocSkill;
+                }
+            }
             messages_.push_back(ChatMessage{"tool", capToolResult(ev.text), {}, ev.toolId});
         } else if (ev.type == "compact") {
             size_t cut = ev.replay.at("cut").asInt((long)messages_.size());
@@ -583,14 +599,37 @@ Result<ChatResponse> Agent::requestOnce() {
     std::string bad = validateHistory(messages_);
     if (!bad.empty()) return Result<ChatResponse>::Err("corrupt conversation history: " + bad);
     ChatRequest req;
-    req.model = opts_.model;
+    const ResolvedModel* selected = &opts_.model;
+    bool images = false;
+    for (const auto& m : messages_) images |= !m.images.empty();
+    if (opts_.adaptiveModel && opts_.thinking == "adaptive" && taskPolicy_.fastModel && fastPreferred_ &&
+        !images && !opts_.fast.empty()) {
+        const auto& fast = opts_.fast[0];
+        long budget = std::min(opts_.maxTokens > 0 ? opts_.maxTokens : std::max(1L, fast.options.maxTokens),
+                               std::max(1L, fast.context / 4));
+        if (contextUsed() + budget <= fast.context) selected = &fast;
+    }
+    if (lastRequestModel_ != selected->spec) {
+        stats_.lastPrompt = -1;
+        lastEstimate_ = 0;
+        if (opts_.onNotice && (selected != &opts_.model || !lastRequestModel_.empty()))
+            opts_.onNotice("execution policy: routing " + std::string(taskScaleName(taskPolicy_.scale)) +
+                            " work to " + selected->spec);
+        lastRequestModel_ = selected->spec;
+    }
+    req.model = *selected;
     req.system = system_;  // frozen prefix: byte-identical every request
     req.messages = messages_;  // results were capped once on arrival
     req.tools = toolDefs_;     // fixed schemas in fixed order
     req.thinking = calmNext_ ? "off" : effectiveThinking();
+    if (!calmNext_ && opts_.thinking == "adaptive" && req.model.provider.protocol == "anthropic")
+        req.thinking = "high";  // stable per-model cache prefix
     calmNext_ = false;
     req.stream = true;
     req.maxTokens = completionBudget();
+    req.maxTokens = std::min(req.maxTokens, std::max(1L, req.model.context / 4));
+    if (selected != &opts_.model && opts_.maxTokens <= 0)
+        req.maxTokens = std::min(req.maxTokens, std::max(1L, selected->options.maxTokens));
     req.sessionTag = orSessionId_;
     ChatCallbacks cb;
     cb.cancel = opts_.cancel;
@@ -622,7 +661,27 @@ Result<ChatResponse> Agent::requestOnce() {
     // this request to the fallback model. Auth and not-found errors never switch.
     bool transient = !r.ok && isTransientProviderError(r.error);
     bool rejected = !r.ok && (startsWith(r.error, "HTTP 400") || startsWith(r.error, "HTTP 422"));
-    const ResolvedModel* used = &opts_.model;
+    const ResolvedModel* used = selected;
+    // A simple task's fast route is advisory. A failed attempt escalates to
+    // the original main model before trying its configured provider fallback.
+    if (!r.ok && selected != &opts_.model && r.error != "cancelled" &&
+        !(opts_.cancel && opts_.cancel->load())) {
+        ++taskObserved_.failures;
+        taskPolicy_ = taskPolicy(policyRequest_, taskObserved_);
+        thinkNow_ = "high";
+        req.model = opts_.model;
+        req.thinking = effectiveThinking();
+        req.maxTokens = completionBudget();
+        used = &opts_.model;
+        lastRequestModel_ = opts_.model.spec;
+        stats_.lastPrompt = -1;
+        ++stats_.fallbacks;
+        usageSeen = false;
+        if (opts_.onNotice) opts_.onNotice("execution policy: fast route failed; escalating to " + opts_.model.spec);
+        r = send();
+        transient = !r.ok && isTransientProviderError(r.error);
+        rejected = !r.ok && (startsWith(r.error, "HTTP 400") || startsWith(r.error, "HTTP 422"));
+    }
     if ((transient || rejected) && !opts_.fallback.empty() && opts_.fallback[0].spec != opts_.model.spec) {
         if (contextUsed() >= opts_.fallback[0].context)
             return Result<ChatResponse>::Err(r.error + "; fallback context window is too small for this conversation");
@@ -1068,13 +1127,22 @@ std::string Agent::councilReview() {
     std::string finalText = messages_.empty() ? "" : messages_.back().content;
     auto span = ask(turnTranscript(finalText),
                     {{"bad", "Is the work incomplete, unverified or defective relative to the user's request?"}}, true);
-    if (goalStatus_ != GoalStatus::Active && span.count("bad") && span["bad"] < 0.2) {
+    // The prefilter can be interrupted. A council has its own cancellation
+    // flags, so never launch it after the caller has already stopped the turn.
+    if (opts_.cancel && opts_.cancel->load()) return "";
+    if (goalStatus_ != GoalStatus::Active && taskPolicy_.scale < TaskScale::Complex &&
+        span.count("bad") && span["bad"] < 0.2) {
         ++stats_.reviews;
         if (opts_.onNotice) opts_.onNotice("review: span-01 finds the work sound");
         return "";
     }
     std::vector<ResolvedModel> council = opts_.reviewers;
     if (council.empty()) council.push_back(opts_.fast.empty() ? opts_.model : opts_.fast[0]);
+    // The configured review role is a roster. Small verified changes need
+    // one independent reviewer; broad/risky work and a failed first review
+    // use the full roster, up to the native concurrency budget.
+    size_t limit = reviewPasses_ > 1 ? 3 : (size_t)taskPolicy_.reviewers;
+    if (council.size() > limit) council.resize(limit);
     std::string digest = turnDigest(40000);
     std::string sys =
         "You are a strict senior reviewer in a code-review council. Judge the work below against the "
@@ -1096,7 +1164,9 @@ std::string Agent::councilReview() {
     for (size_t i = 0; i < council.size(); ++i)
         pool.emplace_back([&, i] {
             try {
-                votes[i] = sideRequest(council[i], sys, digest, 1200, &usages[i], &stop[i]);
+                if ((opts_.cancel && opts_.cancel->load()) || stop[i].load())
+                    votes[i] = Result<ChatResponse>::Err("cancelled");
+                else votes[i] = sideRequest(council[i], sys, digest, 1200, &usages[i], &stop[i]);
             } catch (...) {
                 votes[i] = Result<ChatResponse>::Err("reviewer failed");
             }
@@ -1117,8 +1187,12 @@ std::string Agent::councilReview() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     for (auto& t : pool) t.join();
-    for (size_t i = 0; i < council.size(); ++i) {
+    // Meter completed attempts even when Escape won the race with their
+    // replies, but never publish those replies as a review verdict.
+    for (size_t i = 0; i < council.size(); ++i)
         for (const auto& u : usages[i]) recordResponse(u, 0, &council[i], true);
+    if (opts_.cancel && opts_.cancel->load()) return "";
+    for (size_t i = 0; i < council.size(); ++i) {
         const auto& r = votes[i];
         std::string t = r.ok ? trim(r.value.text) : "";
         if (t.empty()) {
@@ -1145,6 +1219,7 @@ std::string Agent::councilReview() {
 // follow-up message to send, or "" to finish. Every check fires at most a
 // bounded number of times: the overseer can never trap a turn.
 std::string Agent::stopGate(const std::string& text) {
+    if (opts_.cancel && opts_.cancel->load()) return "";
     bool goalMode = goalStatus_ == GoalStatus::Active;
     if (++turnGates_ > (goalMode ? 8 : 4)) return "";
     if (opts_.autonomy && turnNudges_ < (goalMode ? 4 : 2)) {
@@ -1153,8 +1228,12 @@ std::string Agent::stopGate(const std::string& text) {
         // Plain Q&A that the native classifier calls finished skips the remote check.
         bool worked = false;
         for (size_t i = turnStart_; i < messages_.size() && !worked; ++i) worked = !messages_[i].toolCalls.empty();
+        bool changed = opts_.tools && !opts_.tools->changedFiles.empty();
         StopGuess local = classifyStop(text);
-        bool skipRemote = !worked && !goalMode && local.kind == StopKind::Done && local.p >= 0.8;
+        bool skipRemote = !goalMode && local.kind == StopKind::Done &&
+            ((!worked && taskPolicy_.scale == TaskScale::Simple && !taskPolicy_.workspaceWork) ||
+             (worked && changed && !unverified_ && taskPolicy_.scale < TaskScale::Complex &&
+              !taskObserved_.failures && local.p >= 0.8));
         std::map<std::string, double> v;
         if (!skipRemote)
             v = ask(turnTranscript(text),
@@ -1168,7 +1247,8 @@ std::string Agent::stopGate(const std::string& text) {
             if (v["ask"] >= 0.8) why = "permission";
             else if (v["announce"] >= 0.8) why = "announce";
             else if (v["ignored"] >= 0.85) why = "ignored";
-            else if (v["premature"] >= 0.9 && (goalMode || unverified_)) why = "premature";
+            else if (v["premature"] >= 0.9 &&
+                     (goalMode || unverified_ || (taskPolicy_.workspaceWork && !worked))) why = "premature";
         } else {
             StopGuess g = local;
             bool stop = g.kind != StopKind::Done && g.p >= 0.85;
@@ -1211,9 +1291,11 @@ std::string Agent::stopGate(const std::string& text) {
     }
     if (opts_.tools && !opts_.tools->changedFiles.empty())
         for (const auto& hook : opts_.stopHooks) {
+            auto passed = hookPassedRevision_.find(hook);
+            if (passed != hookPassedRevision_.end() && passed->second == workRevision_) continue;
             if (hookNagged_[hook] >= 3) continue;  // re-run after each fix; give up after three nags
             ToolResult h = runHook(*opts_.tools, hook);
-            if (h.ok) continue;
+            if (h.ok) { hookPassedRevision_[hook] = workRevision_; continue; }
             ++hookNagged_[hook];
             if (opts_.onNotice) opts_.onNotice("stop hook failed: " + hook);
             return "[stop hook failed] `" + hook + "`\n" + capToolResult(h.output) + "\nFix the cause, then finish.";
@@ -1233,23 +1315,12 @@ std::string Agent::stopGate(const std::string& text) {
             return "[lint] Fix before finishing (or state why a finding is a false positive):\n" + capToolResult(found + dup);
         }
     }
-    if ((opts_.review || goalMode) && changed && !reviewed_) {
+    if ((opts_.review || goalMode) && changed && !reviewed_ && reviewPasses_ < 2) {
         reviewed_ = true;
+        ++reviewPasses_;
         return councilReview();
     }
     return "";
-}
-
-bool needsBrief(const std::string& userText) {
-    std::vector<std::string> ws = words(userText);
-    if (ws.size() < 6 || startsWith(trim(userText), "[")) return false;
-    static const char* kVerbs[] = {"fix", "make", "build", "create", "improve", "redesign", "implement", "add",
-                                   "refactor", "write", "design", "polish", "optimize", "optimise", "migrate",
-                                   "port", "rewrite", "develop", "overhaul", "modernize", "clean", "upgrade", "setup"};
-    for (size_t i = 0; i < ws.size() && i < 40; ++i)
-        for (const char* v : kVerbs)
-            if (ws[i] == v) return true;
-    return false;
 }
 
 void Agent::readWorkspaceUpdates() {
@@ -2006,6 +2077,20 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
     turnNudges_ = turnGates_ = 0;
     verifyNudged_ = reviewed_ = linted_ = false;
     hookNagged_.clear();
+    hookPassedRevision_.clear();
+    reviewPasses_ = 0;
+    workRevision_ = 0;
+    if (!continuation) {
+        policyRequest_ = goalStatus_ == GoalStatus::Active ? goal_ : userText;
+        taskObserved_ = {};
+    }
+    taskPolicy_ = taskPolicy(policyRequest_, taskObserved_);
+    if (!continuation && opts_.adaptiveModel && opts_.thinking == "adaptive" &&
+        taskPolicy_.fastModel && !opts_.fast.empty()) {
+        fastPreferred_ = brainPreferFast(opts_.model.provider.name, opts_.fast[0].provider.name);
+        if (!fastPreferred_ && opts_.onNotice)
+            opts_.onNotice("execution policy: main route preferred by observed provider health/latency");
+    }
     if (!continuation && goalStatus_ != GoalStatus::Active) {
         unverified_ = false;
         if (opts_.tools) opts_.tools->changedFiles.clear();
@@ -2019,7 +2104,8 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
     std::thread briefWorker;
     std::atomic<bool> briefStop{false}, briefDone{false};
     const int64_t briefStart = nowMs();
-    if (!continuation && opts_.brief && goalStatus_ != GoalStatus::Active && needsBrief(userText))
+    if (!continuation && opts_.brief && goalStatus_ != GoalStatus::Active &&
+        taskPolicy_.planningBrief && taskPolicy_.workspaceWork)
         briefWorker = std::thread([&] {
             try {
                 brief = makeBrief(userText, &briefUsage, &briefStop);
@@ -2061,6 +2147,7 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
     if (!hint.empty()) text += "\n\n" + hint;
     stats_.turns++;
     pushUser(text);
+    thinkNow_ = taskPolicy_.thinking;
     // Double mode: two concurrent independent first passes plus one
     // reconciled plan seed the normal single-stream loop. Goal work already
     // plans via brief/council/audit, and continuation chunks extend a decided
@@ -2073,7 +2160,7 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
     int repeats = 0;
     std::map<std::string, int> failures;
     int emptyReplies = 0, lengthRetries = 0;
-    int progressAdvisories = 0;
+    int progressAdvisories = 0, progressChecks = 0, lastProgressCheck = -6;
     int lastProgressRound = -1;
     std::deque<std::string> recentTools;
 
@@ -2138,9 +2225,22 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
             continue;
         }
 
+        // A small original instruction can uncover a risky subtask or todo.
+        // Observe declared work and actual mutating commands, without feeding
+        // tool output back into the policy as authoritative instructions.
+        if (answer.find("TODO:") != std::string::npos || answer.find("[todo]") != std::string::npos ||
+            answer.find("[subtask]") != std::string::npos)
+            taskObserved_.actionScale = std::max(taskObserved_.actionScale, taskPolicy(answer).scale);
+
         std::string signature;
         bool batchFailed = false, batchChanged = false;
         for (const auto& tc : calls) {
+            if (tc.name == "bash") {
+                auto args = json::parse(tc.argsJson);
+                std::string command = args.ok ? args.value.at("command").asStr() : "";
+                if (!command.empty() && !isReadOnlyBash(command))
+                    taskObserved_.actionScale = std::max(taskObserved_.actionScale, taskPolicy(command).scale);
+            }
             bool stopped = !persistenceError_.empty() || (opts_.cancel && opts_.cancel->load());
             size_t changedBefore = opts_.tools ? opts_.tools->changedFiles.size() : 0;
             ToolResult tr = stopped ? ToolResult{false, "not executed: turn interrupted"} :
@@ -2154,18 +2254,22 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
                 stats_.costSeen = true;
                 opts_.tools->sideCost = 0;
             }
-            if (tc.name == "bash" && tr.ok) unverified_ = false;
             if (opts_.tools && (opts_.tools->changedFiles.size() > changedBefore ||
-                                ((tc.name == "write" || tc.name == "edit") && tr.ok)))
+                                ((tc.name == "write" || tc.name == "edit") && tr.ok))) {
                 unverified_ = batchChanged = true;
-            batchFailed = batchFailed || !tr.ok;
+                ++workRevision_;
+                linted_ = reviewed_ = false;
+            }
             std::string content = tr.output;
             if (!tr.ok) content = "TOOL FAILED: " + content;
             std::string observation = trim(tr.output);
-            bool explicitFailure = observation.find("Traceback (most recent call last):") != std::string::npos ||
+            bool explicitFailure = tc.name == "bash" &&
+                (observation.find("Traceback (most recent call last):") != std::string::npos ||
                 startsWith(observation, "FAIL ") || startsWith(observation, "FAILED (") ||
                 observation.find("\nFAIL ") != std::string::npos || observation.find("\nFAILED (") != std::string::npos ||
-                observation.find("\nok: False") != std::string::npos || startsWith(observation, "ok: False");
+                observation.find("\nok: False") != std::string::npos || startsWith(observation, "ok: False"));
+            batchFailed = batchFailed || !tr.ok || explicitFailure;
+            if (tc.name == "bash" && tr.ok && !explicitFailure) unverified_ = false;
             if (tr.ok && !explicitFailure && (observation.size() >= 24 || tc.name == "write" ||
                                               tc.name == "edit" || tc.name == "bash")) {
                 size_t fingerprint = std::hash<std::string>{}(
@@ -2182,7 +2286,7 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
             if (recentTools.size() > 8) recentTools.pop_front();
             signature += tc.name + tc.argsJson + content;  // before any overseer annotation
             // Watchmaker: an identical call failing again is a strategy problem.
-            if (!tr.ok && ++failures[tc.name + tc.argsJson] == 3)
+            if ((!tr.ok || explicitFailure) && ++failures[tc.name + tc.argsJson] == 3)
                 content += "\n[overseer] This exact call has now failed 3 times. Stop retrying it; change approach.";
             // Exact duplicates of a large earlier result cost tokens and teach nothing.
             std::string wire = capToolResult(distill(content));
@@ -2199,7 +2303,13 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
         }
         // Adaptive thinking: think hard after failures, check edits with
         // moderate effort, skim through successful reading.
-        thinkNow_ = batchFailed ? "high" : batchChanged ? "medium" : "low";
+        taskObserved_.failures = batchFailed ? taskObserved_.failures + 1 : 0;
+        taskObserved_.changedFiles = opts_.tools ? (int)opts_.tools->changedFiles.size() : 0;
+        ++taskObserved_.toolRounds;
+        taskObserved_.stalledRounds = round - lastProgressRound;
+        taskPolicy_ = taskPolicy(policyRequest_, taskObserved_);
+        thinkNow_ = batchFailed ? "high" : batchChanged ? "medium" :
+                    taskPolicy_.scale == TaskScale::Critical ? "medium" : "low";
         if (opts_.tools && !opts_.tools->viewImages.empty()) {
             // Tool messages can't carry pixels on every wire: attach them to a
             // short user message right after the batch. Transient by design:
@@ -2218,7 +2328,13 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
             goalYielded_ = true;
             return "";
         }
-        if (opts_.progress && progressAdvisories < 2 && (round + 1) % 12 == 0) {
+        // A local observer is useful after failed or stalled attempts. A
+        // fixed 12-round timer spent inference on healthy discovery too.
+        bool observe = taskObserved_.failures >= 2 || taskObserved_.stalledRounds >= 6;
+        if (opts_.progress && progressAdvisories < 2 && progressChecks < 3 && observe &&
+            round - lastProgressCheck >= 6) {
+            ++progressChecks;
+            lastProgressCheck = round;
             std::string trace;
             for (const auto& item : recentTools) trace += item + "\n\n";
             double cost = 0;

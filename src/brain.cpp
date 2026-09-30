@@ -241,6 +241,76 @@ const char* stopKindName(StopKind k) {
     return k == StopKind::Done ? "done" : k == StopKind::Announce ? "announce" : "permission";
 }
 
+TaskPolicy taskPolicy(std::string_view request, const TaskObservation& observed) {
+    // Whole words prevent e.g. "authentication" from becoming a match for
+    // "cat". The policy only allocates effort; it never certifies success.
+    auto tokens = words(request);
+    std::set<std::string> ws(tokens.begin(), tokens.end());
+    auto has = [&](std::initializer_list<const char*> terms) {
+        for (const char* term : terms) if (ws.count(term)) return true;
+        return false;
+    };
+    bool critical = has({"production", "deploy", "deployment", "release", "publish", "credentials", "auth", "oauth",
+                         "authentication", "authorization", "security", "payment", "payments",
+                         "destructive", "irreversible"});
+    bool uncertain = has({"debug", "diagnose", "investigate", "race", "deadlock", "corruption",
+                          "regression", "intermittent", "algorithm", "algorithms", "training", "finetune",
+                          "finetuning", "qlora", "lora", "peft", "sft", "colab"});
+    bool tuning = has({"finetune", "finetuning", "training"}) ||
+                  (ws.count("fine") && has({"tune", "tuning"})) ||
+                  (has({"qlora", "lora", "peft", "sft", "colab"}) && has({"train", "create", "build", "tune"}));
+    bool mediaPipeline = has({"video", "animation", "film", "music", "soundtrack"}) &&
+                         has({"create", "build", "compose", "produce", "animate"});
+    bool broad = has({"architecture", "redesign", "overhaul", "migrate", "migration", "substantially",
+                      "comprehensive", "pipeline", "benchmark", "benchmarks"}) || tokens.size() > 80 ||
+                 tuning || mediaPipeline;
+    int acceptance = 0;
+    for (const char* term : {"implement", "test", "tests", "verify", "documentation", "benchmark", "deliver"})
+        acceptance += ws.count(term);
+    bool multi = acceptance >= 3 || (ws.count("across") && has({"modules", "services", "repositories", "platforms"}));
+    TaskScale scale = critical ? TaskScale::Critical : broad || multi ? TaskScale::Complex :
+                      uncertain || tokens.size() > 24 ? TaskScale::Standard : TaskScale::Simple;
+    scale = std::max(scale, observed.actionScale);
+    if (observed.changedFiles > 3 || observed.toolRounds >= 12 || observed.failures >= 3)
+        scale = std::max(scale, TaskScale::Complex);
+    else if (observed.changedFiles || observed.failures || observed.toolRounds >= 4)
+        scale = std::max(scale, TaskScale::Standard);
+    TaskPolicy p;
+    p.scale = scale;
+    p.thinking = scale >= TaskScale::Complex || observed.failures ? "high" :
+                 scale == TaskScale::Standard ? "medium" : "low";
+    p.planningBrief = scale >= TaskScale::Complex;
+    p.fastModel = scale == TaskScale::Simple && !observed.failures && !observed.changedFiles;
+    bool explanation = !tokens.empty() && (tokens[0] == "what" || tokens[0] == "why" || tokens[0] == "how");
+    for (size_t i = 0; i < tokens.size() && i < 8; ++i)
+        explanation |= tokens[i] == "explain" || tokens[i] == "describe" || tokens[i] == "summarize";
+    bool artifact = has({"file", "files", "app", "application", "website", "ui", "code", "function", "module",
+                         "project", "parser", "repository", "script", "program", "video", "animation", "music",
+                         "soundtrack", "pdf", "mp4", "docx", "xlsx", "pptx", "document", "sheet", "deck",
+                         "image", "logo", "illustration", "png", "svg", "wav", "mp3", "audio"});
+    bool action = has({"fix", "edit", "implement", "refactor", "migrate", "deploy", "redesign", "rewrite",
+                       "optimize", "optimise", "upgrade", "install", "remove", "delete", "rename", "update",
+                       "build", "develop", "repair", "publish", "release"});
+    // Writing a poem or correcting a sentence can finish in chat. Writing a
+    // requested program/artifact, or fixing a project, needs observed work.
+    bool prose = has({"poem", "sentence", "grammar", "wording", "email", "haiku"}) && !artifact;
+    p.workspaceWork = !explanation && !prose &&
+                      (action || tuning || mediaPipeline ||
+                       (artifact && has({"create", "make", "write", "produce", "compose"})));
+    p.reviewers = scale >= TaskScale::Complex ? 3 : 1;
+    return p;
+}
+
+const char* taskScaleName(TaskScale scale) {
+    switch (scale) {
+        case TaskScale::Simple: return "simple";
+        case TaskScale::Standard: return "standard";
+        case TaskScale::Complex: return "complex";
+        case TaskScale::Critical: return "critical";
+    }
+    return "standard";
+}
+
 // ---------------------------------------------------------------------------
 // Learned state.
 // ---------------------------------------------------------------------------
@@ -327,6 +397,24 @@ double brainHealth(const std::string& provider) {
     std::lock_guard<std::mutex> lk(g_brainMu);
     BrainLock disk;
     return brainLocked().at("health").at(provider).at("ok").asNum(1);
+}
+
+bool brainPreferFast(const std::string& mainProvider, const std::string& fastProvider) {
+    if (mainProvider == fastProvider) return true; // health is provider-level
+    std::lock_guard<std::mutex> lk(g_brainMu);
+    BrainLock disk;
+    const auto brain = brainLocked(); // one coherent cross-process snapshot
+    const auto& fast = brain.at("health").at(fastProvider);
+    constexpr long sufficientSamples = 8;
+    if (fast.at("n").asInt(0) < sufficientSamples) return true;
+    double fastHealth = fast.at("ok").asNum(1);
+    if (fastHealth < .8) return false;
+    const auto& main = brain.at("health").at(mainProvider);
+    if (main.at("n").asInt(0) < sufficientSamples || main.at("ok").asNum(1) < .8) return true;
+    double mainMs = main.at("ms").asNum(0), fastMs = fast.at("ms").asNum(0);
+    // Latency varies with prompt size. Reject only a large, well-observed
+    // disadvantage; do not turn a small timing difference into a model verdict.
+    return mainMs <= 0 || fastMs <= mainMs * 3 || fastMs <= mainMs + 1000;
 }
 
 std::string brainStatus() {

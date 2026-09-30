@@ -17,7 +17,7 @@ Improve the artifact, not its perceived authorship. No heuristic can prove that 
 Read `references/patterns.md` for code and evidence review. For prose, use `../natural-editorial-writing/SKILL.md`. Check real failure behavior and claim provenance before polishing presentation.
 
 ## Interfaces
-Read `../ui-antipattern-review/SKILL.md` when UI is central. For website work, apply the 200-rule checklist in `docs/ANTI-SLOP-CHECKLIST.md` (core principle, decision test, final rule) and the observer-book `anti-slop` passages. Inspect real content and interaction states. A screenshot demonstrates appearance, not keyboard behavior. When visual tooling is unavailable, use DOM, geometry and contrast evidence and explicitly limit the conclusion.
+Read `../ui-antipattern-review/SKILL.md` when UI is central and `../ai-design-slop/SKILL.md` for the installed design doctrine. Inspect real content and interaction states. A screenshot demonstrates appearance, not keyboard behavior. When visual tooling is unavailable, use DOM, geometry and contrast evidence and explicitly limit the conclusion. Preserve the existing project identity; a style cue needs context, not an automatic palette/font replacement.
 
 ## Never produce (generated-UI ornaments)
 
@@ -44,4 +44,4 @@ These are standing requirements even when the current prompt omits them. Inspect
 
 Does the artifact solve the requested problem? Are claims supported? Are boundaries and failure behavior coherent? Did verification exercise the actual change? Optimize for contextual necessity, not visible completeness: every section, claim, widget and page must earn its place for this reader — apparent sophistication without necessity is the underlying failure mode (see the website necessity catalog in `references/patterns.md`). Avoid broad rewrites solely to satisfy a style heuristic.
 
-Use available `artifact_check` with `operation:"ui"` for component source cues, then verify rendered and interaction states. For code, `code_quality` finds copies (`duplicates`, add `changed:true` for a branch), placeholders, leftovers and dead code (`slop`) and complexity hotspots; for prose, `code_quality` `prose` lists stock phrases with plain replacements and readability numbers. Findings are leads to inspect, not verdicts. See `references/patterns.md` for shared review evidence and code/prose checks.
+Use installed native `pocket kit` quality commands after checking current help, then verify rendered and interaction states. External `artifact_check`/`code_quality` tools are optional equivalents only when actually available; this repository does not imply that they exist. Findings are leads to inspect, not verdicts. Use one focused review of the changed artifact and reuse its evidence; repeat only for changed inputs, failures or a specific unresolved concern. See `references/patterns.md` for shared review evidence and code/prose checks.

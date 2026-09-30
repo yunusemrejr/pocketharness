@@ -149,13 +149,14 @@ std::string afterChange(ToolEnv& env, const std::string& path, const std::string
             }
     if (visual && firstTouch && env.cfg && content.size() >= 300) {
         auto v = decide(*env.cfg, json::Object{{"file", path}, {"content", content.substr(0, 20000)}},
-                        {{"generic", "Is this generic AI-template work (stock purple/blue gradients, emoji decoration, "
-                                     "pulsing dots, buzzword hero copy, glassmorphism everywhere, lorem-style filler)?"},
+                        {{"generic", "Does this use unjustified generic templates (gratuitous gradients, cream-and-cursive "
+                                     "layouts, repeated SaaS cards, buzzword hero copy or filler)? Preserve the project's "
+                                     "existing identity: intentional colors, fonts and components alone are not defects."},
                          {"fake", "Does it contain placeholder, fake or made-up content presented as real?"}},
                         false, &env.sideCost, env.cancel, env.onEvent);
         if (v.count("generic") && v["generic"] >= 0.8)
             out += "\n[quality:jev] reads as generic AI-template design/copy (p=" + std::to_string(v["generic"]).substr(0, 4) +
-                   "): give it a deliberate identity.";
+                   "): inspect the concrete pattern and preserve the project's established identity when repairing it.";
         if (v.count("fake") && v["fake"] >= 0.85)
             out += "\n[quality:jev] contains placeholder or fake content (p=" + std::to_string(v["fake"]).substr(0, 4) + ").";
     }
@@ -612,13 +613,15 @@ ToolResult toolSkill(ToolEnv& env, const json::Value& args) {
         return r;
     }
     if (action == "load") {
-        std::string name = args.at("name").asStr();
+        std::string name = trim(args.at("name").asStr());
         auto loaded = skillLoad(all, name);
         if (!loaded.ok) {
             r.output = loaded.error;
             return r;
         }
         emit(env, "skill load " + name);
+        if (std::find(env.loadedSkills.begin(), env.loadedSkills.end(), name) == env.loadedSkills.end())
+            env.loadedSkills.push_back(name);
         if (name == kUiDocSkill) env.uiDocLoaded = true;
         if (name == kVideoDocSkill) env.videoDocLoaded = true;
         r.ok = true;

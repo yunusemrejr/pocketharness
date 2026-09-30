@@ -1170,18 +1170,22 @@ std::string shortPrompt() { return std::string(col(C_BOLD)) + "> " + col(C_RESET
 struct BottomBar {
     Editor* ed = nullptr;
     std::function<std::string(int)> kpi;  // kpi(cols)
+    std::function<std::string()> activity;
     bool active = false;
     int rows = 0, cols = 0, region = 0, inputTop = 0;
+    int cursorRow = 1, cursorCol = 1;
     bool firstDraw = true, inTranscript = false;
-    int64_t lastKpi = 0;
     int footerH = 1;
     int fixedInputH = 0, fixedFooterH = 0;
 
+    bool canPin(int height) const {
+        const char* t = getenv("TERM");
+        return isatty(STDOUT_FILENO) && height >= 6 && (!t || std::string(t) != "dumb");
+    }
     void setup() {
         rows = termRows();
         cols = termWidth();
-        const char* t = getenv("TERM");
-        active = isatty(STDOUT_FILENO) && rows >= 6 && (!t || std::string(t) != "dumb");
+        active = canPin(rows);
     }
     void teardown() {
         if (!active) return;
@@ -1193,8 +1197,15 @@ struct BottomBar {
         writeAll(STDOUT_FILENO, gotoRc(region, 1) + "\n");
         inTranscript = true;
     }
+    std::string activityRow() const {
+        // Reserve one row for liveness regardless of how far metadata wraps.
+        // Leave the final column free to avoid terminal autowrap on ticks.
+        auto text = activity();
+        return layoutTuiInput({text}, 0, text.size(), "", (size_t)std::max(1, cols - 1)).rows.front();
+    }
     std::vector<std::string> statusRows() const {
         std::vector<std::string> result;
+        if (activity) result.push_back(activityRow());
         for (const auto& line : splitLines(kpi(cols))) {
             auto wrapped = layoutTuiInput({line}, 0, line.size(), "", (size_t)cols).rows;
             if (wrapped.size() > 1 && wrapped.back().empty()) wrapped.pop_back();
@@ -1202,43 +1213,46 @@ struct BottomBar {
         }
         return result;
     }
-    void drawKpi(bool save, const std::vector<std::string>& lines) {
+    void drawKpi(const std::vector<std::string>& lines) {
         std::string out;
-        if (save) out += "\0337";
         for (int i = 0; i < footerH; ++i) {
             out += gotoRc(rows - footerH + i + 1) + "\033[K";
-            if ((size_t)i < lines.size()) out += col(C_DIM) + lines[(size_t)i] + col(C_RESET);
+            if ((size_t)i < lines.size()) out += col(activity && i == 0 ? C_CYAN : C_DIM) + lines[(size_t)i] + col(C_RESET);
         }
-        if (save) out += "\0338";
         writeAll(STDOUT_FILENO, out);
     }
-    void liveKpi() {
-        if (!active) return;
-        int64_t now = nowMs();
-        if (now - lastKpi < 250) return;
-        lastKpi = now;
-        drawKpi(true, statusRows());  // save/restore: never disturbs the stream cursor
+    void drawActivity() {
+        if (!active || !activity) return;
+        // The terminal's saved cursor belongs to the transcript. Use the
+        // editor's absolute position so a tick cannot overwrite that anchor.
+        writeAll(STDOUT_FILENO, gotoRc(rows - footerH + 1) + "\033[K" +
+                 col(C_CYAN) + activityRow() + col(C_RESET) + gotoRc(cursorRow, cursorCol));
     }
     void draw() {
-        ed->pinned = active;
-        if (!active) {
-            ed->redraw();
-            return;
-        }
         if (g_tstp) {  // resumed from suspend: region was reset, re-sync all
             g_tstp = 0;
             region = 0;
             firstDraw = true;
         }
         int r = termRows(), c = termWidth();
-        if (r < 6) {
-            teardown();
+        if (!canPin(r)) {
+            if (active) {
+                teardown();
+                ed->lastRows = 1;
+                ed->lastCursorRow = 0;
+            }
+            rows = r;
+            cols = c;
             ed->pinned = false;
-            ed->lastRows = 1;
-            ed->lastCursorRow = 0;
             ed->redraw();
             return;
         }
+        if (!active) {
+            active = true;
+            region = inputTop = 0;
+            firstDraw = true;
+        }
+        ed->pinned = true;
         if (r != rows || c != cols) {
             rows = r;
             cols = c;
@@ -1268,8 +1282,10 @@ struct BottomBar {
         for (int i = 0; i < inputH && start + (size_t)i < view.rows.size(); ++i)
             out += gotoRc(inputTop + i) + view.rows[start + (size_t)i];
         writeAll(STDOUT_FILENO, out);
-        drawKpi(false, status);
-        writeAll(STDOUT_FILENO, gotoRc(inputTop + (int)(view.cursorRow - start), (int)view.cursorCol + 1));
+        drawKpi(status);
+        cursorRow = inputTop + (int)(view.cursorRow - start);
+        cursorCol = (int)view.cursorCol + 1;
+        writeAll(STDOUT_FILENO, gotoRc(cursorRow, cursorCol));
         inTranscript = false;
     }
 };
@@ -1589,11 +1605,11 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
     };
     Editor& ed = *bar->ed;
     StreamRenderer rend;
-    // A held flag with nothing held is stale (Esc on an empty queue): drop
-    // it so this turn's footer reports "working", not "paused". A held
-    // non-empty queue is real and stays held.
+    // A held flag with nothing held is stale. A held non-empty queue stays
+    // held, independently of whether this new turn is actively working.
     if (queue.messages.empty()) queue.held = false;
     bool finished = false, interrupted = false, approvalPending = false;
+    cancel.store(false);
     bool clearRequested = false, pauseRequested = false;
     std::atomic<bool> queuedReady{!queue.held && !queue.messages.empty()};
     std::string result;
@@ -1604,9 +1620,10 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
     int64_t turnStart = nowMs();
     std::string activity = "working";  // footer phase, set by pump
     int64_t lastEvent = turnStart;
-    bar->kpi = [&](int) {
+    bar->kpi = [&](int) { return status; };
+    bar->activity = [&] {
         std::string hint = approvalPending ? "approval: y/N" : queue.picker ? "picker waiting · Esc pause" : "Enter queue · Esc pause";
-        return status + "\n" + busyLine(nowMs(), turnStart, queue.messages.size(), queue.held, hint, activity, lastEvent);
+        return busyLine(nowMs(), turnStart, queue.messages.size(), interrupted || cancel.load(), hint, activity, lastEvent);
     };
     bar->fixedInputH = 3;
     bar->fixedFooterH = (int)bar->statusRows().size();
@@ -1615,18 +1632,21 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
     writeAll(STDOUT_FILENO, col("\033[38;5;37m") + std::string(goal || resume ? "◎ goal" : agent.doubleEnabled() ? "◆ pocket 2×" : "◆ pocket") + col(C_RESET) + "\n");
     if (bar->active) writeAll(STDOUT_FILENO, "\0337");
     bar->draw();
+    auto geometryChanged = [&] {
+        return g_tstp || termRows() != bar->rows || termWidth() != bar->cols;
+    };
     auto draw = [&] {
-        if (bar->active && (g_tstp || termRows() != bar->rows || termWidth() != bar->cols)) {
-            writeAll(STDOUT_FILENO, "\0338");
+        if (geometryChanged()) {
+            if (bar->active) writeAll(STDOUT_FILENO, "\0338");
             rend.endLine();
             bar->draw();
             bar->toTranscript();
-            writeAll(STDOUT_FILENO, "\0337");
+            if (bar->active) writeAll(STDOUT_FILENO, "\0337");
         }
         bar->draw();
     };
     auto output = [&](const std::function<void()>& emit) {
-        if (bar->active && (g_tstp || termRows() != bar->rows || termWidth() != bar->cols)) draw();
+        if (geometryChanged()) draw();
         rend.viewportRows = bar->active ? std::max(1, bar->region) : 0;
         if (bar->active) {
             writeAll(STDOUT_FILENO, "\0338");
@@ -1649,7 +1669,6 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
         queuedReady.store(false);
         events.cv.notify_all();
     };
-    cancel.store(false);
     agent.setGoalYield([&] { return queuedReady.load(); });
     int64_t lastStatus = 0;
     // Only the thread running the turn may snapshot Agent. It owns messages_,
@@ -1767,13 +1786,15 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
             waitingApproval.reset();
             draw();
         }
-        // Redraw periodically even with no events so the footer spinner and
-        // elapsed time advance while the model or a tool is silently busy.
-        // Unpinned terminals have no footer: spare them the extra redraws.
+        // Quiet ticks repaint only liveness, keeping large drafts cheap and
+        // leaving the transcript's saved cursor untouched.
         int64_t now = nowMs();
-        if (!batch.empty() || (bar->active && now - lastSpin >= 120)) {
+        if (!batch.empty() || geometryChanged()) {
             lastSpin = now;
             draw();
+        } else if (bar->active && now - lastSpin >= (getenv("POCKET_NO_ANIM") ? 1000 : 100)) {
+            lastSpin = now;
+            bar->drawActivity();
         }
         return !finished;
     };
@@ -1891,6 +1912,7 @@ int runTurnInteractive(TuiOpts& opts, Agent& agent, const std::string& input, Sh
         }
     });
     bar->fixedInputH = bar->fixedFooterH = 0;
+    bar->activity = {};
     bar->kpi = std::move(originalKpi);
     bar->draw();
     return 0;

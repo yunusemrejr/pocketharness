@@ -53,6 +53,7 @@ struct ToolEnv {
     bool uiDocLoaded = false;                 // ai-design-slop read this session (UI work gate)
     bool videoDocLoaded = false;              // video-studio read this session (video work gate)
     bool videoNagged = false;                 // the first kit video render was already stopped once
+    std::vector<std::string> loadedSkills;    // successfully loaded this session; suppress duplicate hints
     double sideCost = 0;                      // USD spent by tool-side judges (agent collects)
     std::vector<ChatImage> viewImages;        // images `read` this batch (agent attaches them)
     std::map<std::string, ChildUsage> childUsage;
