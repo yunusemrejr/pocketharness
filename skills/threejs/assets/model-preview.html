@@ -1,0 +1,52 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Local model preview</title>
+<style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#121d24}canvas{display:block}</style>
+<!-- Copy beside model.gltf and its dependencies; `kit asset get three three` supplies the modules.
+     Replace the model URL and visual direction with the project's actual asset and identity. -->
+<body data-model="./model.gltf">
+<script type="importmap">{"imports":{"three":"./three/three.module.min.js","three/addons/":"./three/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#121d24');
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, .1, 50);
+camera.position.set(3.4, 2.1, 3.4); camera.lookAt(0, 0, 0);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(1); renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+scene.add(new THREE.HemisphereLight('#dbeeff', '#283126', 2));
+const key = new THREE.DirectionalLight('#fff0dc', 3);
+key.position.set(4, 6, 3); scene.add(key);
+const turntable = new THREE.Group(); scene.add(turntable);
+let mixer;
+
+// The exporter waits for this Promise. A loader failure is propagated with its
+// actual source URL; an empty canvas must never become a successful final video.
+window.renderReady = new GLTFLoader().loadAsync(document.body.dataset.model).then(gltf => {
+    const model = gltf.scene;
+    const bounds = new THREE.Box3().setFromObject(model), size = bounds.getSize(new THREE.Vector3());
+    const span = Math.max(size.x, size.y, size.z);
+    if (!Number.isFinite(span) || span <= 0) throw new Error('Model has no finite visible bounds');
+    model.position.sub(bounds.getCenter(new THREE.Vector3()));
+    turntable.add(model); turntable.scale.setScalar(2 / span);
+    if (gltf.animations.length) {
+        mixer = new THREE.AnimationMixer(model);
+        mixer.clipAction(gltf.animations[0]).play();
+    }
+    window.renderFrame(0);
+});
+window.renderFrame = seconds => {
+    turntable.rotation.y = seconds * Math.PI / 3;
+    if (mixer) mixer.setTime(seconds);
+    renderer.render(scene, camera);
+};
+addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight); window.renderFrame(0);
+});
+</script>

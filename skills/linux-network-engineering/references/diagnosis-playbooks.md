@@ -24,13 +24,15 @@ Check negative caching and TTL behavior with `dig +trace` sparingly (it walks fr
 
 `ss -tlnp` shows what the host actually listens on; a refused connection to a port nothing listens on is a service problem. `ss -tnp` during a failure shows socket state — `SYN-SENT` stuck means no reply, `ESTABLISHED` with no progress means an application or window stall.
 
-`mtr --report-wide <target>` combines traceroute with per-hop loss over time; run it long enough to separate persistent loss from single-probe noise. Compare forward-path hops against the reverse direction when possible. Treat ICMP-filtered hops (`???`) as unknown, not as faulty — many routers deprioritize or drop ICMP while forwarding TCP normally.
+Start with `pocket kit reach <host>:<port> 3` for bounded NSS/TCP evidence and `pocket kit ports <port>` for a local listener. An established TCP connection does not establish TLS or application health. `mtr --report --report-wide --report-cycles 5 <target>` samples path behavior when the actual failure needs that evidence; choose a finite duration/count, then broaden only if the sample leaves an unresolved question. Compare the reverse direction when possible. ICMP-filtered hops (`???`) are unknown, not proven faulty; router replies and forwarded TCP have different treatment.
 
 ## Rung 5: TLS and application
 
 `curl -v` (or `openssl s_client -connect host:port -servername host` for TLS detail) separates TCP success from TLS failure: certificate expiry, hostname mismatch, missing intermediates, and protocol or cipher refusal each have distinct messages. Verify the system trust store and clock — an expired-looking certificate on a host with a wrong date is a clock problem.
 
 Only after TLS succeeds does application debugging begin. Carry the verified lower rungs as evidence so application work does not re-litigate the network.
+
+For an existing capture, analyze it before collecting another. A new focused capture can use an installed `timeout` and a packet count such as `timeout 10s tcpdump -i <interface> -nn -c 200 'host <authorized-target>'`; inspect current help and permissions. Set file/time/packet bounds before writing a capture, and preserve only evidence required for the fault. Never dump cookies, credentials or unrelated traffic into a shared transcript.
 
 ## NetworkManager versus systemd-networkd
 

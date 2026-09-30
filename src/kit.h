@@ -6,6 +6,7 @@
 #pragma once
 
 #include <string>
+#include <map>
 #include <string_view>
 #include <vector>
 
@@ -16,6 +17,7 @@ int kitMain(int argc, char** argv);  // argv[0] = "kit"
 // Pure helpers (unit-tested).
 std::string htmlToText(std::string_view html, std::vector<std::string>* links = nullptr);
 std::string urlDecode(std::string_view s);
+std::map<std::string, std::string> htmlAttrs(std::string_view tag);  // case-insensitive keys, decoded values
 std::string htmlAttr(std::string_view tag, const std::string& name);  // attribute value, "" if absent
 double noteFreq(const std::string& note);  // "A4" -> 440, "C#5", "Eb3"; -1 invalid
 // Damped spring sampled to CSS linear(); empty if invalid or outside bounded

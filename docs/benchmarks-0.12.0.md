@@ -165,3 +165,9 @@ standard C++/libc/math linked dependencies. Python is used for development check
 it is not a new mandatory runtime dependency. Remote hosting deployment and model
 training are reusable capability-aware workflows; this release does not establish
 credentials, launch a Colab training job or deploy an unrelated production site.
+
+The 0.13.0 benchmark review found that the original fixture's input-token
+estimate omitted the system message, which the live provider prepends after
+`buildOpenAiBody`. Historical fixture estimates above retain their original
+accounting; live provider-reported totals are unaffected. The 0.13.0 report
+recomputes both baseline and candidate with the complete request envelope.

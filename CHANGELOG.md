@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.13.0
+
+More precise execution, targeted quality checks and bounded native diagnostics.
+
+- Compact the stable system prompt and repeated guide protocol. Reuse exact
+  large tool results before relevance judgment only while their original
+  evidence remains in context. Distinct raw results stay distinct even when
+  truncation produces the same excerpt; tool execution is never cached.
+- Preserve bounded Bash verification receipts in reviewer evidence, combine
+  overlapping small-task assessments and skip prefilters that cannot change
+  required complex-task review. Reviews target concrete defects and accept
+  observed passing checks without demanding repeated verbatim output.
+- Give generated plans explicit advisory status throughout execution, review
+  and goal audit. Human requirements stay authoritative; inferred acceptance
+  criteria cannot replace requested behavior.
+- No-op writes/edits preserve undo and validation state. Later revisions report
+  new native findings without repeating unchanged ones; substantial revisions
+  receive bounded Jev batches for design, claims, prose and code defects.
+  Excerpts include task intent and changed-region evidence. Detected credential
+  material stays out of tool-side judges. Semantic results remain advisory.
+- Add `kit quality FILE [--semantic] [--intent TEXT]` and contextual `post_bash`
+  hooks with quoted command/result/status fields. Hook failures preserve the
+  original command outcome; cancellation and read-only passes skip new hooks.
+- Preserve intentional fonts and palettes in native, rendered-scene and council
+  anti-slop checks; keep concrete layout/readability faults. Explicit SEO,
+  writing, packet, network and Linux routes skip irrelevant stack discovery
+  and design doctrine for source-only SEO audits.
+- Enforce one deadline across `kit wait` resolution/connect/HTTP polling;
+  require completed HTTP 2xx/3xx by default. Add bounded `kit reach` DNS/NSS+TCP
+  evidence and `kit sys` Linux pressure/process snapshots without environment
+  or command-line secrets. Network diagnostics reject failed transport and
+  redact response cookies.
+- Parse SEO source tags/attributes with case, whitespace, comments and raw text
+  handled correctly. Distinguish source/indexability defects from editorial
+  recommendations; do not infer ranking or rendered metadata from source.
+- Seek paused embedded video to absolute scene time, including placement,
+  source offsets and explicit looping. Required image decode failures stop
+  export without replacing completed artifacts.
+- Add streaming local glTF/GLB preflight, decoder/dependency/range checks and a
+  reusable time-driven Three.js asset scene. Validate asset downloads before
+  creating directories and use private unique staging names.
+- Normalize recursive deletion targets before checking workspace scope. Keep
+  exit 141/SIGPIPE evidence instead of treating every piped failure as success.
+  Run compiler CI with the same strict warning policy as native release builds.
+
+Measured scope, correctness checks and refreshed fixture token accounting are
+recorded in `docs/benchmarks-0.13.0.md`.
+
 ## 0.12.0
 
 Adaptive native execution, reusable project workflows, and media reliability.

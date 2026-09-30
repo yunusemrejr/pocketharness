@@ -1,0 +1,60 @@
+{
+  "method": "3 paired sequential runs; alternate order; loopback TCP backlog=0 already filled by one held connection; requested 100ms deadline, external 2s safety cutoff",
+  "scope": "failed connection deadline correctness; native commands make no model or coordination calls",
+  "rows": [
+    {
+      "phase": "before",
+      "repeat": 0,
+      "wall_ms": 2002.591,
+      "deadline_ms": 100,
+      "timeout_at_ms": 2000,
+      "timed_out": true,
+      "exit_code": null
+    },
+    {
+      "phase": "after",
+      "repeat": 0,
+      "wall_ms": 102.59,
+      "deadline_ms": 100,
+      "timeout_at_ms": 2000,
+      "timed_out": false,
+      "exit_code": 1
+    },
+    {
+      "phase": "after",
+      "repeat": 1,
+      "wall_ms": 102.396,
+      "deadline_ms": 100,
+      "timeout_at_ms": 2000,
+      "timed_out": false,
+      "exit_code": 1
+    },
+    {
+      "phase": "before",
+      "repeat": 1,
+      "wall_ms": 2003.619,
+      "deadline_ms": 100,
+      "timeout_at_ms": 2000,
+      "timed_out": true,
+      "exit_code": null
+    },
+    {
+      "phase": "before",
+      "repeat": 2,
+      "wall_ms": 2003.117,
+      "deadline_ms": 100,
+      "timeout_at_ms": 2000,
+      "timed_out": true,
+      "exit_code": null
+    },
+    {
+      "phase": "after",
+      "repeat": 2,
+      "wall_ms": 102.763,
+      "deadline_ms": 100,
+      "timeout_at_ms": 2000,
+      "timed_out": false,
+      "exit_code": 1
+    }
+  ]
+}

@@ -5,6 +5,10 @@ description: Linux system understanding — /proc mental model, systematic debug
 
 # Linux Understanding
 
+## Start with a bounded snapshot
+
+Use `pocket kit sys` for kernel, load, available memory/swap, CPU/memory/I/O pressure and workspace disk/inodes; `pocket kit sys PID` shows process state, threads, RSS/swap, wait channel and accessible I/O counters. These native snapshots read no environment or command-line secrets. Missing procfs/permissions remain unavailable, not proof of a healthy resource. Compare repeated bounded snapshots before claiming growth or a bottleneck, then use a targeted installed diagnostic. Preserve already verified state and use one focused failure hypothesis per check.
+
 ## Mental model
 
 Everything is a process in a namespace with a cgroup, every observable is a file, every limit is a number in sysctl/cgroup/rlimit. When something is "mysterious," there's a file describing it.
@@ -18,14 +22,14 @@ Everything is a process in a namespace with a cgroup, every observable is a file
 
 | Symptom | First tools |
 |---|---|
-| Process stuck / D state | `cat /proc/pid/wchan`, `strace -p PID` (which syscall), `whois` the NFS/disk (iostat) |
+| Process stuck / D state | `pocket kit sys PID`, bounded `strace -p PID`, `findmnt -T /affected/path`, `iostat -xz 1 3` |
 | CPU high | `top -H -p PID` (which thread) → `perf top -t TID` or `perf record -p PID` on the hot function |
 | Latency spikes | `perf record` + flamegraph; `bpftrace` for syscalls if kernel-side; check `cat /proc/pressure/cpu` (PSI) |
 | Memory growth | `smem -s rss -k -t P<pid>`, pmap, cgroup `memory.peak`; `journalctl -k` (OOM kills: "Killed process … (oom_kill)") |
-| Disk full | `df -h` vs `du -xsh / *` discrepancy → **deleted-but-open files**: `lsof +L1`; inode exhaustion: `df -i` |
+| Disk full | `df -h /affected/path`, targeted `du -xsh /affected/path`, deleted-open files with available `lsof +L1`, and `df -i /affected/path` |
 | Slow disk | `iostat -xz 1` (util, await), `iotop`; NVMe `smartctl` |
-| Networking | `ss -tnp` (states/owners), `ip route` (often the answer), `tcpdump -i any host X -nn` (capture small!), `mtr` (path), `ethtool -S` (NIC counters: drops, errors) |
-| "Who opened/changed file X" | `auditd -w X -p rw` + `ausearch`; or `inotifywait` |
+| Networking | `pocket kit reach HOST:PORT 3`, `ss -tnp`, `ip route get DEST`, bounded authorized capture/path checks, available NIC counters |
+| "Who opened/changed file X" | Existing audit records with `ausearch -f X --start recent`; adding a watch uses `auditctl`, changes policy and needs an authorized scope |
 | Service misbehavior | `journalctl -u svc -n 200 --since -1h`, `systemctl status svc` (full: ` systemctl status --lines=200`) |
 | Startup slow | `systemd-analyze blame` (service times), `systemd-analyze critical-chain` |
 
@@ -43,7 +47,7 @@ Text reflexes: `strace -f -e trace=openat,write` to see a process's IO story; `l
 ## Permissions & identity
 
 - Unix perms (rwx owner/group/other, sticky bit on /tmp), **ACLs** (`getfacl`/`setfacl`) for the case where one user needs one exception, **capabilities** (`getcap -r /`, `capsh --print`) for granting one privilege instead of setuid-root.
-- `umask` (022 default for files, dirs get 755) is where "I chmod'd it but it came out different" lives — check `umask` and the *parent* dir's perms (write needs `w` on every ancestor, `x` on every non-leaf).
+- Inspect the actual `umask`, mode, ACL and mount state. Creating/removing a directory entry needs write and execute permission on its parent; path traversal needs execute permission on ancestors. Writing an existing file follows that file's permissions and applicable ACL/security policy. A default umask is not guaranteed in a service.
 - selinux/apparmor: when "it works as root, fails as the user" with no obvious perms, `getenforce` / `dmesg | grep -i denial` first.
 - `chattr +i` (immutable) files are the silent killer of "permission denied" on root — `lsattr` to check, `chattr -i` to clear.
 
@@ -52,7 +56,7 @@ Text reflexes: `strace -f -e trace=openat,write` to see a process's IO story; `l
 - Mount: `findmnt -T /path` (what fs, which options — `noatime`, `ro`…), fstab entries survive reboots, `mount` doesn't.
 - XFS/ext4: `xfs_info` / `tune2fs -l`; snapshots are LVM/zfs/btrfs features, not ext4.
 - **Sparse files & `du`**: apparent size (`du -h --apparent-size`) vs allocated — report the right one; `df` counts blocks, `du` counts inodes' blocks (deleted-but-open discrepancy: same as above).
-- `fsck` only on unmount/ro mount; `e2fsck` while mounted = corruption.
+- Filesystem repair needs the target unmounted and the filesystem-specific recovery procedure; a read-only mount alone does not make concurrent `e2fsck` safe. Inspect first and preserve a recovery path before an authorized repair.
 
 ## Networking
 

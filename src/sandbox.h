@@ -59,8 +59,10 @@ Result<int> boxOpenRead(const Authority& a, const std::string& path);  // owned 
 Result<std::string> boxRead(const Authority& a, const std::string& path, size_t maxBytes);
 // Atomic write (tmp + rename). Creates parent dirs inside the owning root.
 // Preserves the owner-execute bit when overwriting an executable file.
+// With changed, an identical authorized regular file is left untouched; the
+// flag records actual replacement. Write authority and symlink checks still apply.
 VoidResult boxWrite(const Authority& a, const std::string& path,
-                    const std::string& data, mode_t mode = 0644);
+                    const std::string& data, mode_t mode = 0644, bool* changed = nullptr);
 Result<bool> boxExists(const Authority& a, const std::string& path);
 // Remove a regular file using the same anchored, no-symlink write authority.
 VoidResult boxRemove(const Authority& a, const std::string& path);

@@ -146,7 +146,9 @@ SkillSelection skillAutoSelect(const std::vector<SkillMeta>& all, const std::str
     };
 
     result.ui = has({"ui", "ux", "gui", "user interface", "landing page", "website", "web page", "webapp",
-                     "web app", "frontend", "front end", "dashboard", "mockup", "wireframe", "css", "html"});
+                     "web app", "frontend", "front end", "dashboard", "mockup", "wireframe", "css", "html",
+                     "stylesheet", "tailwind", "navbar", "hero section", "figma", "tui", "terminal interface",
+                     "desktop app", "desktop application", "gtk", "qt", "fltk"});
     const bool animation = has({"animation", "animated", "motion graphics", "gif"});
     result.video = has({"video", "youtube", "shorts", "reels", "voiceover", "voice over", "narration", "storyboard",
                        "mp4", "motion graphics"}) || (animation && has({"audio", "sound", "music"}));
@@ -171,6 +173,25 @@ SkillSelection skillAutoSelect(const std::vector<SkillMeta>& all, const std::str
     const bool tuning = has({"fine tuning", "finetuning", "fine tune", "finetune", "lora", "qlora", "peft", "sft"});
     const bool colab = has({"colab", "google colab"});
     const bool ml = has({"machine learning", "ml", "model training", "classification", "regression model", "neural network"});
+    const bool seo = has({"seo", "search discoverability", "search engine", "crawlability", "canonical", "robots txt",
+                         "sitemap", "structured data", "indexability", "meta description", "title tags", "schema org"});
+    const bool proseArtifact = has({"article", "blog post", "essay", "email", "proposal", "copy", "prose", "paragraph",
+                                   "readme", "documentation", "markdown", "story"}) ||
+                               (has({"report"}) && !has({"script", "code", "bash", "python", "javascript", "java", "rust", "go", "shell"}));
+    const bool writing = has({"writing", "copywriting", "technical writing", "blogging", "proofread", "proofreading"}) ||
+                         (has({"write", "rewrite", "edit", "draft", "polish"}) &&
+                          proseArtifact);
+    const bool quality = has({"quality review", "code quality", "prose quality", "anti slop", "desloppify", "design slop"});
+    const bool network = has({"network troubleshooting", "network diagnosis", "dns", "resolver", "dhcp", "firewall",
+                             "connection refused", "connectivity", "wifi", "wi fi", "ethernet"}) ||
+                         (has({"network", "networking", "tcp", "tls", "routing", "ip address"}) &&
+                          has({"fix", "debug", "diagnose", "troubleshoot", "failure", "fails", "broken", "slow", "unreachable", "connect", "connection"}));
+    const bool packet = has({"pcap", "packet capture", "capture forensics", "packet trace", "tcpdump", "wireshark"});
+    const bool lan = has({"lan discovery", "discover devices", "unknown devices", "local network inventory"});
+    const bool linux = has({"linux troubleshooting", "linux system", "linux service", "systemd", "journalctl", "sysadmin",
+                           "out of memory", "disk full", "permission denied", "process stuck", "slow disk", "it troubleshooting"});
+    if (seo && !has({"design", "redesign", "restyle", "layout", "css", "ui", "ux", "gui", "visual", "build", "create"}))
+        result.ui = false;  // a source metadata audit is not a visual redesign
     const bool work = php || node || react || browser || go || rust || java || python || shell || cpp || c || desktop ||
                       localWeb || algorithm || tuning || colab || ml || result.ui || result.video || animation || delivery;
 
@@ -179,6 +200,15 @@ SkillSelection skillAutoSelect(const std::vector<SkillMeta>& all, const std::str
         if (text.find(normalized(skill.name)) != std::string::npos) add(skill.name);
     if (result.ui) add("ai-design-slop");
     if (result.video) add("video-studio");
+    if (seo) add("search-discoverability");
+    if (writing) add("natural-editorial-writing");
+    if (quality) add("anti-ai-slop");
+    if (packet) add("network-traffic-analysis");
+    if (packet && has({"timeline", "handshake", "retransmission", "packet trace"})) add("packet-trace-analysis");
+    if (lan) add("local-network-analysis");
+    if (network && !packet && !lan) add("linux-network-engineering");
+    if (linux) add("linux");
+    if (linux && has({"ubuntu"})) add("ubuntu-operations");
     if (delivery) add("shared-hosting-deployment");
     if (work) add("project-workflows");
     if (colab) add("google-colab-training");
@@ -209,7 +239,7 @@ SkillSelection skillAutoSelect(const std::vector<SkillMeta>& all, const std::str
     const bool explicitRuntime = php || node || react || browser || go || rust || java || python || shell || cpp || c;
     const bool documentationOnly = has({"readme", "markdown", "documentation", "docs", "changelog", "typo", "spelling", "grammar"}) &&
                                    !has({"implement", "debug", "code", "function", "parser", "test", "tests", "crash"});
-    if (!workspace.empty() && !explicitRuntime && !documentationOnly &&
+    if (!workspace.empty() && !explicitRuntime && !documentationOnly && !seo && !writing && !network && !packet && !lan && !linux &&
         has({"implement", "fix", "debug", "refactor", "optimize", "improve", "build", "test", "tests", "bug", "failure"})) {
         auto exists = [&](const char* file) {
             struct stat st;

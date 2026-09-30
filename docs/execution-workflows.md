@@ -26,6 +26,11 @@ stop hooks. Local observers address repeated failure or stalled progress with
 bounded calls; Jev/Span retain ambiguity, output-quality and goal-audit duties.
 Goals still need deliverables, passing completion hooks and audit evidence.
 
+Generated plans are advisory. Explicit human requirements and return/edge-case
+behavior remain authoritative during execution, council review and goal audit.
+A generated acceptance suggestion cannot replace a user requirement; optional
+choices must be labelled as choices.
+
 Independent specialists can use the existing recursive `pocket -p` path and
 Linux background jobs. The workflow contract requires one writer per overlapping
 file and allows concurrency only when independent work saves more time than
@@ -91,3 +96,38 @@ bundled data follows Pocket's established home data root.
 The version, installed routing, a real media command and binary checksum establish
 that a local installation contains the released changes. A version string alone
 is insufficient. See the benchmark report for measured scope and limitations.
+
+## Second-round precision and diagnostics
+
+Exact large tool output is reused before relevance judgment only while its
+referenced result remains in the current context. Each tool still executes;
+this is context reuse, not cached execution. Different raw output that happens
+to share a truncated excerpt remains a new observation. Compaction preserves
+applicable loaded-guide requirements and may reload details when needed.
+
+No-op mutations preserve verification/review state. A new native finding on a
+later edit is reported once; material artifact revisions receive at most two
+batched semantic checks per file per turn (continuing goals retain their budget). The judge sees task intent, the
+changed region and limited reference context. Detected credentials are withheld
+from these tool-side assessments. Unknown probabilities never certify quality.
+Fonts and palette choices alone do not count as slop; native template cues need
+supporting generic content, while Jev can assess the actual task and identity.
+
+`kit reach` and `kit wait` have bounded resolution/connect deadlines. `kit sys`
+provides Linux process/resource evidence without environment or command-line
+secrets. `kit seo` reports source indexability, metadata and accessibility defects
+separately from optional editorial suggestions. `kit asset inspect` preflights
+local glTF/GLB files without a network request or loading the binary geometry.
+
+For motion scenes, embedded video follows absolute scene time. Use
+`data-render-start` for clip placement, `data-render-offset` for source offset,
+and `loop` for explicit looping. Mark an intentionally unavailable decorative
+image `data-render-optional`; otherwise failed required images stop export.
+Autonomous work stays within configured authority and resource bounds. Blocked
+destructive actions return a recovery instruction; they do not grant permission
+or weaken the filesystem/network sandbox.
+
+New sessions use the compact base prompt. Resumed sessions retain their frozen
+prompt and cache identity; the release does not rewrite their saved history.
+Explicit `kit quality --semantic` requires judge credentials in the calling
+process. Provider credentials are not implicitly passed to model shell commands.

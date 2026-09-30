@@ -49,6 +49,10 @@ struct ToolEnv {
     std::function<void(const std::string& name, bool ok, const std::string& summary)> onToolDone;
     std::vector<UndoEntry> undo;              // newest last, max kMaxUndo
     std::vector<std::string> changedFiles;    // paths written this turn (agent resets)
+    std::string taskIntent;                   // current user request, for tool-side assessment
+    std::map<std::string, std::vector<std::string>> qualitySeen;  // current findings per file
+    struct SemanticCheck { int calls = 0; };
+    std::map<std::string, SemanticCheck> semanticChecks;  // material revisions only, bounded per turn
     long bashRuns = 0;                        // successful+failed bash calls (verification signal)
     bool uiDocLoaded = false;                 // ai-design-slop read this session (UI work gate)
     bool videoDocLoaded = false;              // video-studio read this session (video work gate)
@@ -71,6 +75,7 @@ bool looksLikeVideoWork(const std::string& text);
 struct ToolResult {
     bool ok = false;
     std::string output;  // bounded, human/model-readable
+    bool changed = false;  // a successful write/edit actually changed file contents
 };
 
 // Schemas advertised to the provider (also used by /help and tests).

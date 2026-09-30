@@ -94,26 +94,52 @@ std::string decodeEntities(std::string_view s) {
     return o;
 }
 
-std::string attr(std::string_view tag, const std::string& name) {
-    std::string lt = toLower(tag);
+std::map<std::string, std::string> attributes(std::string_view tag) {
+    std::map<std::string, std::string> out;
     size_t p = 0;
-    while ((p = lt.find(name + "=", p)) != std::string::npos) {
-        if (p > 0 && !isspace((unsigned char)lt[p - 1])) { ++p; continue; }
-        p += name.size() + 1;
-        char q = p < tag.size() ? tag[p] : 0;
-        if (q == '"' || q == '\'') {
-            size_t e = tag.find(q, p + 1);
-            return std::string(tag.substr(p + 1, e == std::string_view::npos ? std::string_view::npos : e - p - 1));
-        }
-        size_t e = tag.find_first_of(" \t\n>", p);
-        return std::string(tag.substr(p, e == std::string_view::npos ? std::string_view::npos : e - p));
+    if (!tag.empty() && tag[0] == '<') {
+        p = 1;
+        if (p < tag.size() && tag[p] == '/') ++p;
+        while (p < tag.size() && !isspace((unsigned char)tag[p]) && tag[p] != '>') ++p;
     }
-    return "";
+    while (p < tag.size() && out.size() < 256) {
+        while (p < tag.size() && isspace((unsigned char)tag[p])) ++p;
+        if (p == tag.size() || tag[p] == '>') break;
+        if (tag[p] == '/') { ++p; continue; }
+        size_t begin = p;
+        while (p < tag.size() && !isspace((unsigned char)tag[p]) && tag[p] != '=' && tag[p] != '>' && tag[p] != '/') ++p;
+        if (begin == p) { ++p; continue; }
+        std::string name = toLower(tag.substr(begin, p - begin));
+        while (p < tag.size() && isspace((unsigned char)tag[p])) ++p;
+        std::string value;
+        if (p < tag.size() && tag[p] == '=') {
+            ++p;
+            while (p < tag.size() && isspace((unsigned char)tag[p])) ++p;
+            char quote = p < tag.size() ? tag[p] : 0;
+            if (quote == '\"' || quote == '\'') {
+                begin = ++p;
+                while (p < tag.size() && tag[p] != quote) ++p;
+                value = std::string(tag.substr(begin, p - begin));
+                if (p < tag.size()) ++p;
+            } else {
+                begin = p;
+                while (p < tag.size() && !isspace((unsigned char)tag[p]) && tag[p] != '>') ++p;
+                value = std::string(tag.substr(begin, p - begin));
+            }
+        }
+        out.emplace(std::move(name), decodeEntities(value));
+    }
+    return out;
 }
 
 }  // namespace
 
-std::string htmlAttr(std::string_view tag, const std::string& name) { return attr(tag, name); }
+std::map<std::string, std::string> htmlAttrs(std::string_view tag) { return attributes(tag); }
+std::string htmlAttr(std::string_view tag, const std::string& name) {
+    auto attrs = attributes(tag);
+    auto it = attrs.find(toLower(name));
+    return it == attrs.end() ? "" : it->second;
+}
 
 std::string urlDecode(std::string_view s) {
     std::string o;
@@ -171,7 +197,7 @@ std::string htmlToText(std::string_view html, std::vector<std::string>* links) {
         else if (name == "td" || name == "th") out += close ? "" : " | ";
         else if (block.count(name)) out += "\n";
         else if (name == "a" && links) {
-            if (!close) { href = attr(tag, "href"); linkStart = out.size(); }
+            if (!close) { href = htmlAttr(tag, "href"); linkStart = out.size(); }
             else if (!href.empty() && !startsWith(href, "#") && !startsWith(href, "javascript:") &&
                      out.size() > linkStart) {
                 links->push_back(decodeEntities(href));
@@ -441,7 +467,7 @@ std::vector<Hit> scrape(const std::string& h, const std::string& anchorMark, con
         size_t open = h.rfind("<a", p), tagEnd = h.find('>', p), close = h.find("</a>", tagEnd);
         if (open == std::string::npos || tagEnd == std::string::npos || close == std::string::npos) break;
         Hit hit;
-        hit.url = decodeEntities(attr(std::string_view(h).substr(open, tagEnd - open), "href"));
+        hit.url = decodeEntities(htmlAttr(std::string_view(h).substr(open, tagEnd - open), "href"));
         hit.title = trim(htmlToText(h.substr(tagEnd + 1, close - tagEnd - 1)));
         if (!titleMark.empty()) {  // engines whose link also wraps the site name and breadcrumb
             size_t t = h.find(titleMark, tagEnd);
@@ -582,8 +608,8 @@ int kitImg(const std::vector<std::string>& a) {
             if (p != std::string::npos && end != std::string::npos && p + 4 < n &&
                 (isspace(b[p + 4]) || b[p + 4] == '>' || b[p + 4] == '/')) {
                 std::string tag = t.value.substr(p, end - p);
-                printf("%s: svg viewBox=\"%s\" width=%s height=%s, %zu bytes\n", path.c_str(), attr(tag, "viewbox").c_str(),
-                       attr(tag, "width").c_str(), attr(tag, "height").c_str(), n);
+                printf("%s: svg viewBox=\"%s\" width=%s height=%s, %zu bytes\n", path.c_str(), htmlAttr(tag, "viewbox").c_str(),
+                       htmlAttr(tag, "width").c_str(), htmlAttr(tag, "height").c_str(), n);
                 continue;
             }
         }
@@ -619,9 +645,9 @@ int kitSvg(const std::vector<std::string>& a) {
             continue;
         }
         ++counts[name];
-        std::string id = attr(tag, "id");
+        std::string id = htmlAttr(tag, "id");
         if (!id.empty() && ++ids[id] == 2) problems.push_back("duplicate id \"" + id + "\"");
-        if (name == "svg" && stack.empty() && attr(tag, "viewbox").empty()) problems.push_back("root <svg> lacks viewBox (won't scale)");
+        if (name == "svg" && stack.empty() && htmlAttr(tag, "viewbox").empty()) problems.push_back("root <svg> lacks viewBox (won't scale)");
         if (!self) stack.push_back(name);
     }
     for (const auto& n : stack) problems.push_back("unclosed <" + n + ">");
@@ -829,7 +855,7 @@ int kitMain(int argc, char** argv) {
         "  vcheck FILE.mp4        finished-video QA: streams, duration, black/frozen/silent spans, clipping\n"
         "  vsheet FILE.mp4 OUT.png contact sheet of the whole video in one image (timestamped)\n"
         "  say OUT.wav \"text\"     neural narration (Piper) + timing json, srt, captions.html, cues.css; --setup once\n"
-        "  asset search|get|font   open-licensed images/audio/3D/HDRI/fonts + three.js, with ATTRIBUTION.txt\n"
+        "  asset search|get|font|inspect   open-licensed images/audio/3D/HDRI/fonts + three.js, with ATTRIBUTION.txt\n"
         "  theme \"topic\"          palette + font pair derived from the subject (avoids the default looks)\n"
         "  sfx OUT.wav PRESET     native click/chime/laser/whoosh/impact/tone/noise\n"
         "  music OUT.wav          generative stereo score: --style ambient/lofi/corporate/cinematic/tech/upbeat --duration --key --seed\n"
@@ -840,12 +866,15 @@ int kitMain(int argc, char** argv) {
         "  wav OUT \"C4:.25 R:.25\"  music to WAV: chords C4+E4, tracks a|b, drums K/S/H, saw> prefix\n"
         "  audio FILE.wav         loudness, peak, clipping, pitch, silence\n"
         "  lint [PATH...]         security, perf, DRY, backend/coding patterns, UI slop + a11y, SVG hygiene, stubs (runs automatically on every write)\n"
+        "  quality FILE           native checks + targeted Jev review (--semantic, --intent TEXT); advisory findings\n"
         "  find QUERY             ranked code search (BM25 over chunks; no index to maintain)\n"
         "  sym NAME|.             definitions of NAME (\".\" = outline of every declaration)\n"
         "  refs NAME              whole-word references to NAME\n"
         "  ports [PORT]           listening TCP sockets with owning pid + command\n"
         "  wait PORT|URL [SEC]    block until a server accepts (instead of sleep)\n"
         "  net URL                HTTP timing (dns/connect/tls/ttfb), redirects, headers\n"
+        "  reach HOST:PORT [SEC]   bounded DNS/NSS and TCP reachability evidence; bracket IPv6\n"
+        "  sys [PID]              Linux pressure, memory/disk or sanitized process diagnostics\n"
         "  seo FILE|URL           on-page SEO: title, meta, canonical, headings, alt, OG, JSON-LD\n"
         "  csv FILE               dataset profile: types, missing, stats, class balance\n"
         "  bench [-n N] 'CMD'      timing: min/median/p95 wall, CPU, peak RSS\n"
@@ -883,12 +912,15 @@ int kitMain(int argc, char** argv) {
     if (sub == "spring") return kitSpring(a);
     if (sub == "slop") return kitSlop(a);
     if (sub == "lint") return kitLint(a);
+    if (sub == "quality") return kitQuality(a);
     if (sub == "find") return kitFind(a);
     if (sub == "sym") return kitSym(a, false);
     if (sub == "refs") return kitSym(a, true);
     if (sub == "ports") return kitPorts(a);
     if (sub == "wait") return kitWait(a);
     if (sub == "net") return kitNet(a);
+    if (sub == "reach") return kitReach(a);
+    if (sub == "sys") return kitSys(a);
     if (sub == "seo") return kitSeo(a);
     if (sub == "csv") return kitCsv(a);
     if (sub == "bench") return kitBench(a);

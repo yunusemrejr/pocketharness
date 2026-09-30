@@ -17,6 +17,7 @@
 
 #include "common.h"
 #include "json.h"
+#include "kit_lint.h"
 #include "process.h"
 
 namespace pocket {
@@ -255,7 +256,7 @@ const char* kLintJs = R"JS((() => {
         }
         text = text.trim();
         if (!text || !r || !shown(e) || moving(e)) continue;
-        const cs = getComputedStyle(e), fs = parseFloat(cs.fontSize), name = label(e, text), fam = cs.fontFamily.split(',')[0].replace(/["']/g, '').trim();
+        const cs = getComputedStyle(e), fs = parseFloat(cs.fontSize), name = label(e, text);
         boxes.push({e, r, name, a: alphaOf(e)});
         if (r.left < -2 || r.top < -2 || r.right > W + 2 || r.bottom > H + 2) out.push(['edge:' + name, name + ' is cut off by the frame edge']);
         else if (!e.closest('[data-bleed]') && (r.left < margin || r.top < margin || r.right > W - margin || r.bottom > H - margin))
@@ -267,9 +268,6 @@ const char* kLintJs = R"JS((() => {
                 if (r.right > q.right + 2 || r.left < q.left - 2 || r.bottom > q.bottom + slack || r.top < q.top - slack) { out.push(['clip:' + name, name + ' is clipped by an overflow:hidden container']); break; } }
         }
         if (fs < minPx) out.push(['small:' + name, name + ' is ' + Math.round(fs) + 'px, under the ' + Math.round(minPx) + 'px legibility floor']);
-        if (/mono|courier|consolas|menlo|monaco/i.test(cs.fontFamily.split(',')[0]) && fs >= minPx * 1.6) out.push(['mono:' + fam, 'monospace (' + fam + ') used for display text; keep mono for code and data only']);
-        if (/^(inter|space grotesk|geist|instrument serif)$/i.test(fam)) out.push(['font:' + fam, fam + ' is the default AI font rotation; pick a deliberate pair (kit theme)']);
-        if (/^(arial|helvetica|times new roman|system-ui|sans-serif|serif|segoe ui|roboto)$/i.test(fam)) out.push(['sys:' + fam, 'text falls back to the system font "' + fam + '"; load a real typeface (kit asset font)']);
         const over = document.elementsFromPoint((r.left + r.right) / 2, (r.top + r.bottom) / 2).some(n => /^(IMG|CANVAS|VIDEO)$/i.test(n.tagName));
         const bg = over ? null : backdrop(e), fg = rgba(cs.color);  // over a photo or 3D view the backdrop is unknown
         if (bg && fg) { const a = Math.min(1, fg.a * alphaOf(e)), mix = {r: bg.r * (1 - a) + fg.r * a, g: bg.g * (1 - a) + fg.g * a, b: bg.b * (1 - a) + fg.b * a};
@@ -290,26 +288,13 @@ const char* kLintJs = R"JS((() => {
     return JSON.stringify(out);
 })())JS";
 
-// Source-level tells the DOM cannot show: purple gradients and the default font names.
-std::vector<std::string> styleTells(const std::string& html) {
+// Reuse the same contextual source review as writes and `kit lint`. These are
+// suggestions, separate from defects measured in the rendered frame: owned
+// fonts and palettes alone do not establish a generic design.
+std::vector<std::string> sourceSuggestions(const std::string& html) {
     std::vector<std::string> out;
-    for (size_t p = html.find("gradient("); p != std::string::npos; p = html.find("gradient(", p + 9)) {
-        size_t end = html.find(')', p);
-        std::string body = html.substr(p, end == std::string::npos ? 200 : std::min<size_t>(end - p, 300));
-        int violet = 0;
-        for (size_t h = body.find('#'); h != std::string::npos; h = body.find('#', h + 1)) {
-            if (h + 7 > body.size()) break;
-            const std::string digits = body.substr(h + 1, 6);
-            char* e = nullptr;
-            long v = strtol(digits.c_str(), &e, 16);
-            if (*e) continue;
-            double r = ((v >> 16) & 255) / 255.0, g = ((v >> 8) & 255) / 255.0, b = (v & 255) / 255.0;
-            double mx = std::max({r, g, b}), mn = std::min({r, g, b}), d = mx - mn, hue = 0;
-            if (d > 0.001) hue = mx == r ? 60 * std::fmod((g - b) / d + 6, 6) : mx == g ? 60 * ((b - r) / d + 2) : 60 * ((r - g) / d + 4);
-            if (d / (mx > 0 ? mx : 1) > .4 && mx > .4 && hue >= 245 && hue <= 335) ++violet;
-        }
-        if (violet >= 2) { out.push_back("an indigo/purple gradient is the learned default look; derive colour from the subject (kit theme)"); break; }
-    }
+    for (const auto& finding : lintScan("scene.html", html))
+        if (finding.find("[slop/") != std::string::npos) out.push_back(finding);
     return out;
 }
 
@@ -340,11 +325,16 @@ void lintScene(Cdp& cdp, const std::vector<double>& times, const std::string& so
             snprintf(at, sizeof at, "t=%.1fs ", seen[key].second.first);
             lines.push_back(std::string(at) + seen[key].second.second);
         }
-    for (const auto& tell : styleTells(source)) lines.push_back(tell);
-    if (lines.empty()) { fprintf(stderr, "lint: no layout, legibility or style faults at %zu sampled time%s\n", times.size(), times.size() == 1 ? "" : "s"); return; }
-    fprintf(stderr, "lint: %zu issue%s; fix before the final render\n", lines.size(), lines.size() == 1 ? "" : "s");
-    for (size_t i = 0; i < lines.size() && i < 12; ++i) fprintf(stderr, "  lint: %s\n", sanitizeTerminal(lines[i]).c_str());
-    if (lines.size() > 12) fprintf(stderr, "  lint: ... and %zu more\n", lines.size() - 12);
+    if (lines.empty()) fprintf(stderr, "lint: no layout or legibility findings at %zu sampled time%s\n", times.size(), times.size() == 1 ? "" : "s");
+    else {
+        fprintf(stderr, "lint: %zu issue%s; fix before the final render\n", lines.size(), lines.size() == 1 ? "" : "s");
+        for (size_t i = 0; i < lines.size() && i < 12; ++i) fprintf(stderr, "  lint: %s\n", sanitizeTerminal(lines[i]).c_str());
+        if (lines.size() > 12) fprintf(stderr, "  lint: ... and %zu more\n", lines.size() - 12);
+    }
+    const auto suggestions = sourceSuggestions(source);
+    for (size_t i = 0; i < suggestions.size() && i < 12; ++i)
+        fprintf(stderr, "  lint: source review suggestion: %s\n", sanitizeTerminal(suggestions[i]).c_str());
+    if (suggestions.size() > 12) fprintf(stderr, "  lint: ... and %zu more source suggestions\n", suggestions.size() - 12);
 }
 
 std::string render(const std::vector<std::string>& args, bool still) {
@@ -482,10 +472,58 @@ std::string render(const std::vector<std::string>& args, bool still) {
     auto ready = cdp.evaluate(R"JS((async()=>{
         if (window.renderReady !== undefined) await window.renderReady;
         if (document.fonts) await document.fonts.ready;
-        await Promise.all(Array.from(document.images, image => image.decode().catch(() => {})));
+        await Promise.all(Array.from(document.images, async image => {
+            if ((!image.currentSrc && !image.getAttribute('src')) || image.hasAttribute('data-render-optional')) return;
+            try { await image.decode(); } catch (_) {
+                throw new Error('Image failed to decode: ' + new URL(image.currentSrc || image.src, location.href).pathname);
+            }
+        }));
+        const mediaReady = async video => {
+            video.pause(); video.muted = true;
+            if (!video.currentSrc && !video.getAttribute('src') && !video.querySelector('source[src]')) return false;
+            if (video.readyState < 2) await new Promise((resolve, reject) => {
+                const sources = Array.from(video.querySelectorAll('source[src]')), failedSources = new Set();
+                const finish = () => {
+                    video.removeEventListener('loadeddata', loaded); video.removeEventListener('error', failed);
+                    for (const source of sources) source.removeEventListener('error', sourceFailed);
+                };
+                const loaded = () => { finish(); resolve(); };
+                const failed = () => { finish(); reject(new Error('Video failed to decode: ' +
+                    new URL(video.currentSrc || video.src || sources[0]?.src || location.href, location.href).pathname)); };
+                // Child source failures do not bubble to the video element. Wait
+                // for all alternatives to fail, so a working fallback can load.
+                const sourceFailed = event => {
+                    failedSources.add(event.currentTarget);
+                    if (failedSources.size === sources.length) failed();
+                };
+                video.addEventListener('loadeddata', loaded); video.addEventListener('error', failed);
+                for (const source of sources) source.addEventListener('error', sourceFailed);
+                if (video.error) failed();
+                else { video.preload = 'auto'; if (video.readyState === 0) video.load(); }
+            });
+            if (!Number.isFinite(video.duration) || video.duration <= 0) throw new Error('Embedded video needs a finite clip duration');
+            return true;
+        };
+        const seekMedia = async (video, t) => {
+            if (!await mediaReady(video)) return;
+            const start = Number(video.dataset.renderStart || 0), offset = Number(video.dataset.renderOffset || 0);
+            if (!Number.isFinite(start) || !Number.isFinite(offset) || start < 0 || offset < 0 || offset >= video.duration)
+                throw new Error('Video data-render-start and data-render-offset need non-negative source/timeline seconds');
+            let sourceTime = offset + Math.max(0, t - start);
+            if (video.loop && t >= start) sourceTime %= video.duration;
+            sourceTime = Math.min(sourceTime, Math.max(0, video.duration - .001));
+            if (video.seeking || Math.abs(video.currentTime - sourceTime) > .0005) await new Promise((resolve, reject) => {
+                const finish = () => { video.removeEventListener('seeked', sought); video.removeEventListener('error', failed); };
+                const sought = () => { finish(); resolve(); };
+                const failed = () => { finish(); reject(new Error('Embedded video seek failed')); };
+                video.addEventListener('seeked', sought); video.addEventListener('error', failed);
+                video.currentTime = sourceTime;
+            });
+        };
+        await Promise.all(Array.from(document.querySelectorAll('video'), mediaReady));
         // A scene may be pure CSS/SVG animation: seeking the timeline is then all a frame needs.
         if (typeof window.renderFrame !== 'function') {
-            if (!document.getAnimations().length && !document.querySelector('svg'))
+            if (!document.getAnimations().length && !document.querySelector('svg,video[src],video source[src]'))
                 throw new Error('Nothing to render: define window.renderFrame(timeSeconds) or animate with CSS/SVG animations');
             window.renderFrame = () => {};
         }
@@ -495,6 +533,7 @@ std::string render(const std::vector<std::string>& args, bool still) {
         for (const a of document.getAnimations()) seen.add(a);
         window.__pocketSeek = async (t) => {
             await window.renderFrame(t);
+            await Promise.all(Array.from(document.querySelectorAll('video'), video => seekMedia(video, t)));
             for (const a of document.getAnimations()) seen.add(a);
             for (const a of seen) { a.pause(); a.currentTime = t * 1000; }
             for (const s of document.querySelectorAll('svg')) if (s.pauseAnimations) { s.pauseAnimations(); s.setCurrentTime(t); }

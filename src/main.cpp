@@ -603,7 +603,7 @@ int pocketMain(int argc, char** argv) {
         std::vector<std::string> keep;
         for (const auto& skill : selected.skills)
             if (skill.name != kUiDocSkill && skill.name != kVideoDocSkill) keep.push_back(skill.name);
-        bool ui = selected.ui || looksLikeUiWork(text);
+        bool ui = selected.ui;
         bool video = selected.video;
         // Deterministic domain routes need no paid relevance check. Ask Jev
         // only for ambiguous substantial work, in one bounded batch.

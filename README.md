@@ -150,6 +150,25 @@ file (never via environment, which the model can read). Provider keys are
 never inherited implicitly: a child authenticates only through explicit
 user-level `expose_env` passthrough. Kernel confinement is inherited and
 cannot be shed — under `--offline` the whole subtree loses `AF_INET`.
+Local diagnostics remain small native commands:
+
+```sh
+pocket kit reach localhost:8080 .5
+pocket kit wait http://127.0.0.1:8080/health 5
+pocket kit sys                  # pressure, memory and filesystem evidence
+pocket kit sys 1234             # status and I/O; no environment or command line
+pocket kit seo index.html       # source defects and separate recommendations
+pocket kit asset inspect scene.glb
+```
+
+HTTP readiness requires transport success and 2xx/3xx; `--any-status` explicitly
+checks only whether an HTTP response arrived. TCP diagnostics use bounded NSS
+resolution and nonblocking connections, including bracketed IPv6. SEO does not
+infer ranking, robots.txt policy or rendered metadata from source alone.
+Asset inspection checks local glTF/GLB structure, dependencies, references and
+accessor ranges before rendering. Embedded video is paused and sought for each
+absolute scene time; required images must decode before export. See the bundled
+Three.js starter for a local asset scene with explicit time-driven motion.
 
 ## The overseer
 
@@ -167,9 +186,15 @@ Weak and strong models get the same standards, enforced by the harness:
    triggers the same demand).
 3. **Guardian on every change.** Writes/edits are scanned natively
    (placeholders, "rest unchanged" elisions, stubs, conflict markers,
-   invalid JSON, AI-tell prose); UI and prose files also get a Jev taste
-   check for template-grade design and fake content. `post_edit` hooks run
-   too. Findings return to the model immediately.
+   invalid JSON, AI-tell prose). New findings return immediately without
+   repeating unchanged warnings. Targeted Jev batches inspect design identity,
+   factual claims, prose precision and substantial/risky code. A material
+   revision can receive one fresh batch; detected credential material stays in
+   native checks. These are advisory signals, requiring concrete verification.
+   No-op writes/edits skip undo, quality hooks and review invalidation.
+   `post_edit` hooks run after actual changes; `post_bash` receives the command
+   and bounded outcome. `pocket kit quality FILE --semantic --intent TEXT`
+   uses the same content checks for explicit inspection.
 4. **Watchmaker.** The same call failing three times gets a "change
    approach" note; long turns get a convergence check; identical batches stop.
    Model quirks are absorbed instead of ending the turn: a reasoning-only
@@ -359,8 +384,10 @@ a QA gate. The tools underneath are native and cheap:
 - `kit mix` normalises voice, ducks the music while someone speaks, places effects,
   and finishes at -14 LUFS with a look-ahead limiter.
 - `kit frame`/`kit video` lint the scene at sampled times (safe margins, clipping,
-  overlap, legibility floor, contrast, blank frames, mono display fonts, default
-  fonts, purple gradients). Encoding is tagged BT.709, so colours match the scene.
+  overlap, legibility floor, contrast, blank frames and failed assets). Shared
+  source review reports generic copy and template cues as separate suggestions;
+  intentional fonts and palettes alone are not defects. Encoding is tagged
+  BT.709, so colours match the scene.
 - Real assets: Poly Haven CC0 models, HDRIs and textures, Openverse images and audio,
   Google Fonts as local files, and three.js for software-WebGL scenes, each with a
   written `ATTRIBUTION.txt`.
@@ -412,6 +439,7 @@ One transparent user config, optional project overlay. See
   "hooks": {
     "post_edit": ["case {file} in *.py) python3 -m py_compile {file};; esac"],
     "pre_bash": [],
+    "post_bash": [],
     "stop": ["make -s test"]
   },
   "review": true,
@@ -437,7 +465,13 @@ One transparent user config, optional project overlay. See
 
 Hooks run in exactly the bash-tool sandbox (`{file}`/`{cmd}` expand
 shell-quoted): `post_edit` failures return to the model, a failing
-`pre_bash` blocks the command, failing `stop` hooks keep the turn going. A
+`pre_bash` blocks the command. `post_bash` runs once after each executed
+command with `{cmd}`, `{ok}` (`true`/`false`) and `{result}` (first 4,000 bytes).
+A failed outcome hook makes the tool result fail while preserving its original
+exit evidence. Placeholders expand from the original template once; quoted
+command/result text cannot introduce another substitution. Read-only evidence
+passes skip user hooks, and cancellation prevents new outcome hooks.
+Failing `stop` hooks keep the turn going. A
 `goal_done` hook runs before a goal may be certified: any failure sends the
 agent back to work with the hook output (put the project's real acceptance
 check there). A failing `stop` hook is re-run after each fix, three times per turn.

@@ -6,6 +6,7 @@
 
 #include <string>
 #include <vector>
+#include "oversee.h"
 
 namespace pocket {
 
@@ -19,5 +20,14 @@ std::vector<std::string> lintScan(const std::string& path, const std::string& co
 std::string lintPaths(const std::vector<std::string>& paths, char minSev = 'M');
 
 int kitLint(const std::vector<std::string>& args);
+
+// Targeted content questions, shared by write/edit and `kit quality`.
+// Empty means native checks suffice; probabilities are advisory findings.
+std::vector<Question> qualityQuestions(const std::string& path, const std::string& content,
+                                     const std::vector<std::string>* findings = nullptr);
+json::Value qualityState(const std::string& path, const std::string& content,
+                         const std::string& before, const std::string& intent);
+std::string qualityAdvice(const std::map<std::string, double>& answers);
+int kitQuality(const std::vector<std::string>& args);
 
 }  // namespace pocket

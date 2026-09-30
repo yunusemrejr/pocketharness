@@ -1,0 +1,152 @@
+{
+  "method": "sequential paired runs; order alternates; median wall and waited child CPU time",
+  "workload": "video",
+  "environment_notes": [],
+  "scope": "native kit commands; LLM token/tool/coordination metrics are not applicable",
+  "binaries": {
+    "before": {
+      "path": "/home/yemre/.cache/pocketharness-verification/0.13.0/pocket-0.12.0-released",
+      "sha256": "0ed2d260c727ac5a078da36d63c23e2c6777c10c4e6cabebc5da34a40bb928ac"
+    },
+    "after": {
+      "path": "/home/yemre/src/pocketharness/pocket",
+      "sha256": "5f1e6294d58e1e3ff6c6035e74e756c23720795be5f31616a03094d98f8bc236"
+    }
+  },
+  "music": {},
+  "video": {
+    "before": [
+      {
+        "command": [
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/pocket-0.12.0-released",
+          "kit",
+          "video",
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/scene.html",
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/before.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 2.9906249510022462,
+        "cpu_s": 1.352088,
+        "report": "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/before.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.42s render"
+      },
+      {
+        "command": [
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/pocket-0.12.0-released",
+          "kit",
+          "video",
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/scene.html",
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/before.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.348379910999938,
+        "cpu_s": 1.3289350000000004,
+        "report": "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/before.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.87s render"
+      },
+      {
+        "command": [
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/pocket-0.12.0-released",
+          "kit",
+          "video",
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/scene.html",
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/before.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.435453222002252,
+        "cpu_s": 1.3948909999999999,
+        "report": "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/before.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.93s render"
+      }
+    ],
+    "after": [
+      {
+        "command": [
+          "/home/yemre/src/pocketharness/pocket",
+          "kit",
+          "video",
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/scene.html",
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/after.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.1811579530003655,
+        "cpu_s": 1.3929750000000003,
+        "report": "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/after.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.69s render"
+      },
+      {
+        "command": [
+          "/home/yemre/src/pocketharness/pocket",
+          "kit",
+          "video",
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/scene.html",
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/after.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.374016033998487,
+        "cpu_s": 1.275073,
+        "report": "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/after.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.90s render"
+      },
+      {
+        "command": [
+          "/home/yemre/src/pocketharness/pocket",
+          "kit",
+          "video",
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/scene.html",
+          "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/after.mp4",
+          "--duration",
+          "3",
+          "--fps",
+          "12",
+          "--size",
+          "960x540",
+          "--no-lint"
+        ],
+        "wall_s": 3.13195558499865,
+        "cpu_s": 1.453989,
+        "report": "/home/yemre/.cache/pocketharness-verification/0.13.0/video-pairs/after.mp4: H.264 MP4 960x540, 36 frames, 3.000s media, 2.50s render"
+      }
+    ],
+    "medians": {
+      "before": {
+        "wall_s": 3.348379910999938,
+        "cpu_s": 1.352088
+      },
+      "after": {
+        "wall_s": 3.1811579530003655,
+        "cpu_s": 1.3929750000000003
+      }
+    },
+    "decoded_rgb_sha256": {
+      "before": "94284927f8ccddbcab11c3dc17f05ca5fbc6aff2433a26f7a4f4b03d370a1e46",
+      "after": "94284927f8ccddbcab11c3dc17f05ca5fbc6aff2433a26f7a4f4b03d370a1e46"
+    },
+    "identical_decoded_video": true
+  }
+}

@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <limits>
 #include <set>
 
 #include "config.h"
@@ -55,7 +57,10 @@ std::string download(const std::string& url, const std::string& dest, long sec =
     if (!startsWith(url, "http://") && !startsWith(url, "https://")) return "not an http(s) URL: " + url;
     std::error_code ec;
     fs::create_directories(fs::path(dest).parent_path(), ec);
-    const std::string tmp = dest + ".part";
+    std::string tmp = dest + ".part-XXXXXX";
+    int fd = mkstemp(tmp.data());
+    if (fd < 0) return "cannot stage download beside " + dest;
+    close(fd);
     SpawnResult r = run({"curl", "--disable", "-fsSL", "-A", kUA, "--connect-timeout", "10", "--max-time", std::to_string(sec),
                          "--max-filesize", "400000000", "--proto", "=http,https", "-o", tmp, url}, (sec + 5) * 1000, 1 << 16);
     struct stat st{};
@@ -63,7 +68,7 @@ std::string download(const std::string& url, const std::string& dest, long sec =
         unlink(tmp.c_str());
         return "download failed (" + url + "): " + trim(r.err.substr(0, 200));
     }
-    if (rename(tmp.c_str(), dest.c_str())) return "cannot write " + dest;
+    if (rename(tmp.c_str(), dest.c_str())) { unlink(tmp.c_str()); return "cannot write " + dest; }
     return "";
 }
 std::string slug(const std::string& s) {
@@ -473,9 +478,14 @@ int assetSearch(const std::vector<std::string>& a) {
 }
 
 int assetGet(const std::vector<std::string>& a) {
-    if (a.size() < 2) return fail("usage: kit asset get URL|polyhaven:ID|three OUT_DIR [--res 1k|2k|4k]");
+    if (a.size() < 2 || a.size() % 2) return fail("usage: kit asset get URL|polyhaven:ID|three OUT_DIR [--res 1k|2k|4k|8k|16k] [--credit TEXT]");
     std::string res = "1k", credit;
-    for (size_t i = 2; i + 1 < a.size(); i += 2) { if (a[i] == "--res") res = a[i + 1]; else if (a[i] == "--credit") credit = a[i + 1]; }
+    for (size_t i = 2; i < a.size(); i += 2) {
+        if (a[i] == "--res") res = a[i + 1];
+        else if (a[i] == "--credit") credit = a[i + 1];
+        else return fail("unknown asset option: " + a[i]);
+    }
+    if (res != "1k" && res != "2k" && res != "4k" && res != "8k" && res != "16k") return fail("resolution must be 1k, 2k, 4k, 8k or 16k");
     const std::string dir = a[1];
     std::error_code ec;
     fs::create_directories(dir, ec);
@@ -504,8 +514,13 @@ int assetGet(const std::vector<std::string>& a) {
         const std::string out = dir + "/" + id;
         std::vector<std::pair<std::string, std::string>> want;  // url, relative path
         const json::Value& f = files.value;
+        std::string selectionError;
         auto pickRes = [&](const json::Value& byRes) -> const json::Value& {
-            return byRes.has(res) ? byRes.at(res) : byRes.at("1k");
+            if (!byRes.has(res)) {
+                selectionError = "asset does not provide " + res + "; available resolutions:";
+                for (const auto& [key, unused] : byRes.asObj()) { (void)unused; selectionError += " " + key; }
+            }
+            return byRes.at(res);
         };
         if (f.has("gltf")) {
             const auto& g = pickRes(f.at("gltf")).at("gltf");
@@ -523,6 +538,7 @@ int assetGet(const std::vector<std::string>& a) {
                     if (pick.at("url").isStr()) want.push_back({pick.at("url").asStr(), std::string(map) + mediaExt(pick.at("url").asStr())});
                 }
         }
+        if (!selectionError.empty()) return fail(selectionError);
         if (want.empty()) return fail("no downloadable files for " + id);
         for (auto& [url, rel] : want) {
             if (rel.find("..") != std::string::npos || (!rel.empty() && rel[0] == '/')) return fail("refusing unsafe path in asset listing");
@@ -797,16 +813,221 @@ std::vector<std::vector<std::vector<Utterance>>> scriptSentences(const std::stri
     return beats;
 }
 
+Result<json::Value> inspectGltf(const std::string& path) {
+    using Res = Result<json::Value>;
+    constexpr size_t maxJson = 8u << 20;
+    std::error_code ec;
+    if (!fs::is_regular_file(path, ec)) return Res::Err("asset must be a regular local file");
+    const uintmax_t fileBytes = fs::file_size(path, ec);
+    std::ifstream input(path, std::ios::binary);
+    if (ec || !input) return Res::Err("cannot read asset");
+    char header[12]{};
+    input.read(header, std::min<uintmax_t>(fileBytes, sizeof header));
+    auto u32 = [](const char* b) { uint32_t n = 0; for (int i = 0; i < 4; ++i) n |= uint32_t((unsigned char)b[i]) << (i * 8); return n; };
+    const bool glb = std::string_view(header, 4) == "glTF";
+    std::string text;
+    uint64_t binaryBytes = 0;
+    if (glb) {
+        if (fileBytes < 20 || u32(header + 4) != 2 || u32(header + 8) != fileBytes)
+            return Res::Err("invalid GLB v2 header or file length");
+        bool jsonChunk = false, binChunk = false;
+        for (uint64_t at = 12; at < fileBytes;) {
+            char chunk[8]{};
+            input.seekg(at); input.read(chunk, 8);
+            if (!input || fileBytes - at < 8) return Res::Err("truncated GLB chunk header");
+            const uint32_t length = u32(chunk), type = u32(chunk + 4);
+            if (length % 4 || length > fileBytes - at - 8) return Res::Err("invalid GLB chunk length or alignment");
+            if (at == 12 && type != 0x4e4f534a) return Res::Err("GLB must start with its JSON chunk");
+            if (type == 0x4e4f534a) {
+                if (jsonChunk || !length || length > maxJson) return Res::Err("GLB needs one JSON chunk, at most 8 MiB");
+                jsonChunk = true; text.resize(length); input.read(text.data(), length);
+                if (!input) return Res::Err("truncated GLB JSON");
+            } else if (type == 0x004e4942) {
+                if (binChunk) return Res::Err("duplicate GLB binary chunk");
+                binChunk = true; binaryBytes = length;
+            }
+            at += 8 + length;
+        }
+    } else {
+        auto f = readFileBounded(path, maxJson);
+        if (!f.ok) return Res::Err(f.error);
+        text = std::move(f.value);
+    }
+    auto parsed = json::parse(text);
+    if (!parsed.ok || !parsed.value.isObj()) return Res::Err("invalid glTF JSON: " + parsed.error);
+    const auto& doc = parsed.value;
+    json::Array issues, notes, dependencies, loaders;
+    auto issue = [&](std::string s) { issues.emplace_back(std::move(s)); };
+    auto integer = [](const json::Value& v, int64_t def = -1) -> int64_t {
+        if (v.isNull()) return def;
+        const double n = v.asNum(-1);
+        return std::isfinite(n) && n >= 0 && n <= UINT32_MAX && n == std::floor(n) ? int64_t(n) : -1;
+    };
+    if (doc.at("asset").at("version").asStr() != "2.0") issue("asset.version must be 2.0");
+    for (const char* name : {"buffers", "bufferViews", "accessors", "meshes", "nodes", "scenes", "images", "textures", "materials", "animations"})
+        if (doc.has(name) && !doc.at(name).isArr()) issue(std::string(name) + " must be an array");
+    const auto& buffers = doc.at("buffers").asArr();
+    const auto& views = doc.at("bufferViews").asArr();
+    const auto& accessors = doc.at("accessors").asArr();
+    const fs::path base = fs::weakly_canonical(fs::absolute(path).parent_path(), ec);
+    auto uriBytes = [&](const std::string& uri) -> int64_t {
+        if (startsWith(uri, "data:")) {
+            const size_t comma = uri.find(',');
+            if (comma == std::string::npos) { issue("invalid data URI"); return -1; }
+            const std::string_view body(uri.data() + comma + 1, uri.size() - comma - 1);
+            if (uri.substr(0, comma).find(";base64") == std::string::npos) {
+                notes.emplace_back("non-base64 data URI payload was not checked"); return -1;
+            }
+            const size_t padding = endsWith(uri, "==") ? 2 : endsWith(uri, "=") ? 1 : 0;
+            if (body.size() % 4 || body.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") != std::string_view::npos ||
+                body.substr(0, body.size() - padding).find('=') != std::string_view::npos) {
+                issue("invalid base64 data URI"); return -1;
+            }
+            return int64_t(body.size() / 4 * 3 - padding);
+        }
+        if (startsWith(uri, "https://") || startsWith(uri, "http://")) {
+            dependencies.emplace_back(json::Object{{"uri", uri.substr(0, uri.find('?'))}, {"status", "remote-unverified"}});
+            notes.emplace_back("remote dependency was not fetched; bundle it before offline rendering"); return -1;
+        }
+        std::string decoded;
+        auto digit = [](unsigned char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; };
+        for (size_t p = 0; p < uri.size() && uri[p] != '?' && uri[p] != '#'; ++p) {
+            unsigned char c = uri[p];
+            if (c == '%') {
+                if (p + 2 >= uri.size() || digit(uri[p + 1]) < 0 || digit(uri[p + 2]) < 0) { issue("invalid encoded dependency URI"); return -1; }
+                c = digit(uri[p + 1]) * 16 + digit(uri[p + 2]); p += 2;
+            }
+            if (!c || c == '\\' || c == ':') { issue("unsupported dependency URI"); return -1; }
+            decoded += char(c);
+        }
+        const fs::path relative(decoded), resolved = fs::weakly_canonical(base / relative, ec);
+        const fs::path within = resolved.lexically_relative(base);
+        if (relative.is_absolute() || ec || within.empty() || *within.begin() == "..") {
+            issue("dependency escapes the asset folder: " + decoded); return -1;
+        }
+        if (!fs::is_regular_file(resolved, ec)) {
+            dependencies.emplace_back(json::Object{{"uri", decoded}, {"status", "missing"}});
+            issue("missing dependency: " + decoded); return -1;
+        }
+        const uintmax_t bytes = fs::file_size(resolved, ec);
+        dependencies.emplace_back(json::Object{{"uri", decoded}, {"status", "local"}, {"bytes", double(bytes)}});
+        return ec || bytes > INT64_MAX ? -1 : int64_t(bytes);
+    };
+    uint64_t declaredBytes = 0;
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        const auto& b = buffers[i]; const int64_t declared = integer(b.at("byteLength"));
+        if (declared <= 0) { issue("buffer byteLength must be positive"); continue; }
+        declaredBytes += declared;
+        const std::string uri = b.at("uri").asStr();
+        const int64_t actual = uri.empty() ? (glb && i == 0 ? int64_t(binaryBytes) : -1) : uriBytes(uri);
+        bool meshopt = false;
+        for (const auto& ext : doc.at("extensionsRequired").asArr()) if (ext.asStr() == "EXT_meshopt_compression") meshopt = true;
+        if (uri.empty() && (!glb || i != 0)) {
+            if (meshopt) notes.emplace_back("Meshopt placeholder buffer is resolved by its decoder");
+            else issue("buffer needs a URI or the first GLB binary chunk");
+        }
+        if (actual >= 0 && actual < declared) issue("buffer " + std::to_string(i) + " is shorter than its declared byteLength");
+        if (uri.empty() && actual > declared + 3) issue("GLB binary padding exceeds three bytes");
+    }
+    auto validIndex = [&](const json::Value& v, size_t size, const std::string& what) -> int64_t {
+        const int64_t index = integer(v);
+        if (index < 0 || uint64_t(index) >= size) { issue("invalid " + what + " index"); return -1; }
+        return index;
+    };
+    for (const auto& view : views) {
+        const int64_t b = validIndex(view.at("buffer"), buffers.size(), "bufferView buffer");
+        const int64_t offset = integer(view.at("byteOffset"), 0), length = integer(view.at("byteLength"));
+        if (b >= 0 && (offset < 0 || length <= 0 || offset + length > integer(buffers[b].at("byteLength")))) issue("bufferView exceeds its buffer");
+    }
+    for (const auto& a : accessors) {
+        const int64_t count = integer(a.at("count")), offset = integer(a.at("byteOffset"), 0), type = integer(a.at("componentType"));
+        const int component = type == 5120 || type == 5121 ? 1 : type == 5122 || type == 5123 ? 2 : type == 5125 || type == 5126 ? 4 : 0;
+        const std::string shape = a.at("type").asStr();
+        const int cols = shape == "MAT2" ? 2 : shape == "MAT3" ? 3 : shape == "MAT4" ? 4 : 1;
+        const int rows = shape == "SCALAR" ? 1 : shape == "VEC2" || shape == "MAT2" ? 2 : shape == "VEC3" || shape == "MAT3" ? 3 : shape == "VEC4" || shape == "MAT4" ? 4 : 0;
+        const int element = cols > 1 ? cols * ((rows * component + 3) / 4 * 4) : rows * component;
+        if (count <= 0 || offset < 0 || !component || !rows || offset % std::max(1, component)) { issue("invalid accessor count, type or alignment"); continue; }
+        if (a.has("bufferView")) {
+            const int64_t v = validIndex(a.at("bufferView"), views.size(), "accessor bufferView");
+            if (v >= 0) {
+                const int64_t stride = integer(views[v].at("byteStride"), element), length = integer(views[v].at("byteLength"));
+                if (stride < element || stride > 252 || stride % component ||
+                    (views[v].has("byteStride") && (stride < 4 || stride % 4)) || offset + (count - 1) * stride + element > length)
+                    issue("accessor exceeds its bufferView or has invalid stride");
+            }
+        }
+        if (a.has("sparse")) notes.emplace_back("sparse accessor payload values are not decoded by this preflight");
+    }
+    uint64_t vertices = 0, triangles = 0, primitives = 0;
+    for (const auto& mesh : doc.at("meshes").asArr()) for (const auto& p : mesh.at("primitives").asArr()) {
+        ++primitives;
+        const int64_t position = validIndex(p.at("attributes").at("POSITION"), accessors.size(), "POSITION accessor");
+        int64_t count = position >= 0 ? std::max<int64_t>(0, integer(accessors[position].at("count"))) : 0;
+        vertices += count;
+        if (position >= 0 && accessors[position].at("type").asStr() != "VEC3") issue("POSITION accessor must be VEC3");
+        if (p.has("indices")) {
+            const int64_t idx = validIndex(p.at("indices"), accessors.size(), "primitive indices");
+            if (idx >= 0) count = std::max<int64_t>(0, integer(accessors[idx].at("count")));
+        }
+        const int64_t mode = integer(p.at("mode"), 4);
+        if (mode == 4) { triangles += count / 3; if (count % 3) issue("triangle primitive needs a multiple of three vertices/indices"); }
+        else if (mode == 5 || mode == 6) triangles += count > 2 ? count - 2 : 0;
+        else if (mode < 0 || mode > 6) issue("invalid primitive drawing mode");
+        if (p.has("material")) validIndex(p.at("material"), doc.at("materials").size(), "primitive material");
+    }
+    const auto& nodes = doc.at("nodes").asArr();
+    std::vector<size_t> incoming(nodes.size()), queue;
+    for (const auto& n : nodes) {
+        if (n.has("mesh")) validIndex(n.at("mesh"), doc.at("meshes").size(), "node mesh");
+        for (const auto& c : n.at("children").asArr()) { auto index = validIndex(c, nodes.size(), "child node"); if (index >= 0) ++incoming[index]; }
+    }
+    for (size_t count : incoming) if (count > 1) { issue("node hierarchy gives a child multiple parents"); break; }
+    for (size_t i = 0; i < nodes.size(); ++i) if (!incoming[i]) queue.push_back(i);
+    for (size_t at = 0; at < queue.size(); ++at) for (const auto& c : nodes[queue[at]].at("children").asArr()) {
+        const int64_t index = integer(c);
+        if (index >= 0 && uint64_t(index) < nodes.size() && --incoming[index] == 0) queue.push_back(index);
+    }
+    if (queue.size() != nodes.size()) issue("node hierarchy contains a cycle");
+    for (const auto& scene : doc.at("scenes").asArr()) for (const auto& n : scene.at("nodes").asArr()) validIndex(n, nodes.size(), "scene node");
+    if (doc.has("scene")) validIndex(doc.at("scene"), doc.at("scenes").size(), "default scene");
+    for (const auto& image : doc.at("images").asArr()) {
+        if (image.has("uri")) uriBytes(image.at("uri").asStr());
+        else if (image.has("bufferView")) validIndex(image.at("bufferView"), views.size(), "image bufferView");
+        else issue("image needs a URI or bufferView");
+    }
+    for (const auto& texture : doc.at("textures").asArr()) if (texture.has("source")) validIndex(texture.at("source"), doc.at("images").size(), "texture image");
+    for (const auto& ext : doc.at("extensionsRequired").asArr()) {
+        const std::string name = ext.asStr();
+        if (name == "KHR_draco_mesh_compression") loaders.emplace_back("Draco: configure GLTFLoader.setDRACOLoader with local matching decoder files");
+        if (name == "EXT_meshopt_compression") loaders.emplace_back("Meshopt: configure GLTFLoader.setMeshoptDecoder");
+        if (name == "KHR_texture_basisu") loaders.emplace_back("KTX2: call detectSupport(renderer), then GLTFLoader.setKTX2Loader");
+    }
+    return Res::Ok(json::Object{{"valid", issues.empty()}, {"format", glb ? "glb" : "gltf"}, {"file_bytes", double(fileBytes)},
+        {"buffer_bytes", double(declaredBytes)}, {"nodes", long(nodes.size())}, {"meshes", long(doc.at("meshes").size())},
+        {"primitives", double(primitives)}, {"vertex_references", double(vertices)}, {"triangles", double(triangles)},
+        {"materials", long(doc.at("materials").size())}, {"images", long(doc.at("images").size())}, {"animations", long(doc.at("animations").size())},
+        {"required_extensions", doc.at("extensionsRequired")}, {"loader_notes", std::move(loaders)}, {"dependencies", std::move(dependencies)},
+        {"issues", std::move(issues)}, {"notes", std::move(notes)}, {"scope", "local container, dependency and geometry-range preflight; payload, extension semantics and visual quality need a renderer"}});
+}
+
 int kitAsset(const std::vector<std::string>& a) {
     const char* usage =
         "usage: kit asset search QUERY [--kind image|audio|model|hdri|texture] [-n 8]   open-licensed assets (Openverse, Poly Haven CC0)\n"
         "       kit asset get URL|polyhaven:ID|three OUT_DIR [--res 1k] [--credit TXT]  download; writes ATTRIBUTION.txt\n"
-        "       kit asset font \"Family\" OUT_DIR [--weights 400,700]                     Google Font as local woff2 + css";
+        "       kit asset font \"Family\" OUT_DIR [--weights 400,700]                     Google Font as local woff2 + css\n"
+        "       kit asset inspect FILE.gltf|FILE.glb                                 bounded local 3D preflight; JSON report";
     if (a.empty() || a[0] == "--help") { puts(usage); return a.empty() ? 2 : 0; }
     std::vector<std::string> rest(a.begin() + 1, a.end());
     if (a[0] == "search") return assetSearch(rest);
     if (a[0] == "get") return assetGet(rest);
     if (a[0] == "font") return assetFont(rest);
+    if (a[0] == "inspect") {
+        if (rest.size() != 1) return fail("usage: kit asset inspect FILE.gltf|FILE.glb");
+        auto report = inspectGltf(rest[0]);
+        if (!report.ok) return fail(report.error);
+        puts(json::stringify(report.value, true).c_str());
+        return report.value.at("valid").asBool() ? 0 : 1;
+    }
     return fail(usage);
 }
 

@@ -3,6 +3,7 @@
 #include "../src/common.h"
 #include "../src/json.h"
 #include "../src/kit_video.h"
+#include "../src/kit_media.h"
 #include "../src/process.h"
 
 #include <algorithm>
@@ -236,6 +237,28 @@ TEST(video_Frame_And_Sequence_Use_Explicit_Times) {
     return "";
 }
 
+TEST(video_Source_Review_Preserves_Palette_And_Separates_Generic_Copy) {
+    VideoScratch scratch;
+    CHECK(scratch.setup());
+    const std::string brand = "<style>\n"
+        "body{font-family:Inter,sans-serif;background:linear-gradient(90deg,#6366f1,#ec4899)}\n"
+        "</style><h1>Original score at 64 beats per minute</h1>";
+    CHECK(atomicWriteFile(scratch.scene(), brand).ok);
+    auto intentional = scratch.render("ok", true, {"--size", "320x240"});
+    CHECK(intentional.ok && intentional.exitCode == 0);
+    CHECK(intentional.err.find("source review suggestion") == std::string::npos);
+    CHECK(intentional.err.find("purple gradient") == std::string::npos);
+    CHECK(atomicWriteFile(scratch.scene(), brand + "<p>Build faster. Ship smarter.</p>").ok);
+    auto generic = scratch.render("ok", true, {"--size", "320x240"});
+    CHECK(generic.ok && generic.exitCode == 0);
+    CHECK(generic.err.find("source review suggestion") != std::string::npos);
+    CHECK(generic.err.find("indigo/purple gradient") != std::string::npos);
+    CHECK(generic.err.find("copy names no capability") != std::string::npos);
+    CHECK(generic.err.find("fix before the final render") == std::string::npos);
+    CHECK(scratch.cleaned());
+    return "";
+}
+
 TEST(video_Browser_Failures_Preserve_Output_And_Clean_Children) {
     for (const char* mode : {"navigation_error", "js_error", "protocol_error", "bad_base64", "not_png", "truncated_png", "wrong_size", "browser_exit"}) {
         VideoScratch scratch;
@@ -331,5 +354,108 @@ TEST(video_Vcheck_Rejects_Bad_Usage_And_Non_Media) {
     CHECK_EQ(kitVcheck({"a.mp4", "--duration"}), 2);
     CHECK_EQ(kitVcheck({"a.mp4", "--duration", "-3"}), 2);
     CHECK_EQ(kitVcheck({"/nonexistent/none.mp4"}), 1);
+    return "";
+}
+
+TEST(media_Gltf_Preflight_Validates_Dependencies_Ranges_And_Scene_Graph) {
+    const std::string dir = makeTempDir("pocket-gltf");
+    struct Cleanup { std::string path; ~Cleanup() { rmRf(path); } } cleanup{dir};
+    CHECK(!dir.empty());
+    CHECK(atomicWriteFile(dir + "/mesh.bin", std::string(36, '\0')).ok);
+    auto parsed = json::parse(R"({"asset":{"version":"2.0"},"buffers":[{"uri":"mesh.bin","byteLength":36}],
+      "bufferViews":[{"buffer":0,"byteLength":36}],"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}],
+      "meshes":[{"primitives":[{"attributes":{"POSITION":0}}]}],"nodes":[{"mesh":0}],"scenes":[{"nodes":[0]}],"scene":0})");
+    CHECK(parsed.ok);
+    auto checkDoc = [&](const json::Value& doc) {
+        auto saved = atomicWriteFile(dir + "/model.gltf", json::stringify(doc));
+        return saved.ok ? inspectGltf(dir + "/model.gltf") : Result<json::Value>::Err(saved.error);
+    };
+    auto good = checkDoc(parsed.value);
+    CHECK(good.ok && good.value.at("valid").asBool());
+    CHECK(good.value.at("triangles").asInt() == 1 && good.value.at("vertex_references").asInt() == 3);
+    CHECK(good.value.at("dependencies").at(size_t(0)).at("status").asStr() == "local");
+    for (int fault = 0; fault < 7; ++fault) {
+        auto doc = parsed.value;
+        if (fault == 0) doc.asObj()["buffers"].asArr()[0].asObj()["uri"] = "missing.bin";
+        if (fault == 1) doc.asObj()["bufferViews"].asArr()[0].asObj()["byteLength"] = 64;
+        if (fault == 2) doc.asObj()["accessors"].asArr()[0].asObj()["count"] = 100;
+        if (fault == 3) doc.asObj()["nodes"].asArr()[0].asObj()["children"] = json::Array{0};
+        if (fault == 4) doc.asObj()["buffers"].asArr()[0].asObj()["uri"] = "../outside.bin";
+        if (fault == 5) doc.asObj()["accessors"].asArr()[0].asObj()["componentType"] = 123;
+        if (fault == 6) doc.asObj()["images"] = json::Array{json::Object{{"uri", "missing.png"}}};
+        auto bad = checkDoc(doc);
+        CHECK(bad.ok && !bad.value.at("valid").asBool() && !bad.value.at("issues").asArr().empty());
+    }
+    auto compressed = parsed.value;
+    compressed.asObj()["extensionsRequired"] = json::Array{"KHR_draco_mesh_compression", "EXT_meshopt_compression", "KHR_texture_basisu"};
+    auto requirements = checkDoc(compressed);
+    CHECK(requirements.ok && requirements.value.at("loader_notes").asArr().size() == 3);
+    return "";
+}
+
+TEST(media_Glb_Preflight_Checks_Framing_Without_Decoding_Payload) {
+    const std::string dir = makeTempDir("pocket-glb");
+    struct Cleanup { std::string path; ~Cleanup() { rmRf(path); } } cleanup{dir};
+    auto put = [](std::string& s, uint32_t v) { for (int i = 0; i < 4; ++i) s += char(v >> (i * 8)); };
+    std::string doc = R"({"asset":{"version":"2.0"},"buffers":[{"byteLength":36}],"bufferViews":[{"buffer":0,"byteLength":36}]})";
+    while (doc.size() % 4) doc += ' ';
+    std::string glb = "glTF";
+    put(glb, 2); put(glb, uint32_t(12 + 8 + doc.size() + 8 + 36));
+    put(glb, uint32_t(doc.size())); put(glb, 0x4e4f534a); glb += doc;
+    put(glb, 36); put(glb, 0x004e4942); glb.append(36, '\0');
+    CHECK(atomicWriteFile(dir + "/model.glb", glb).ok);
+    auto good = inspectGltf(dir + "/model.glb");
+    CHECK(good.ok && good.value.at("valid").asBool() && good.value.at("format").asStr() == "glb");
+    for (int fault = 0; fault < 3; ++fault) {
+        std::string broken = glb;
+        if (fault == 0) broken.pop_back();
+        if (fault == 1) broken[4] = 1;
+        if (fault == 2) broken[12] = 1;
+        CHECK(atomicWriteFile(dir + "/bad.glb", broken).ok);
+        CHECK(!inspectGltf(dir + "/bad.glb").ok);
+    }
+    return "";
+}
+
+TEST(media_Asset_Options_Are_Checked_Before_Output_Directory_Creation) {
+    const std::string dir = makeTempDir("pocket-asset-options");
+    struct Cleanup { std::string path; ~Cleanup() { rmRf(path); } } cleanup{dir};
+    for (const auto& extra : {std::vector<std::string>{"--res"}, {"--unknown", "x"}, {"--res", "99k"}}) {
+        std::vector<std::string> args = {"get", "invalid-source", dir + "/out"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        CHECK(kitAsset(args) == 1);
+        CHECK(!std::filesystem::exists(dir + "/out"));
+    }
+    return "";
+}
+
+TEST(media_Asset_Download_Stages_Privately_And_Preserves_Previous_Output) {
+    const std::string dir = makeTempDir("pocket-asset-download");
+    struct Cleanup { std::string path; ~Cleanup() { rmRf(path); } } cleanup{dir};
+    CHECK(ensureDir(dir + "/bin").ok && ensureDir(dir + "/assets").ok);
+    const std::string curl = dir + "/bin/curl";
+    CHECK(atomicWriteFile(curl, R"SH(#!/bin/sh
+output=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '-o' ]; then output=$2; shift 2; else shift; fi
+done
+printf 'fixture downloaded asset' > "$output"
+if [ "$POCKET_ASSET_DOWNLOAD_FAIL" = 1 ]; then exit 22; fi
+)SH").ok);
+    CHECK(chmod(curl.c_str(), 0700) == 0);
+    CHECK(atomicWriteFile(dir + "/protected", "preserved source").ok);
+    CHECK(symlink((dir + "/protected").c_str(), (dir + "/assets/test.bin.part").c_str()) == 0);
+    EnvGuard path("PATH", dir + "/bin"), mode("POCKET_ASSET_DOWNLOAD_FAIL", "0");
+    CHECK(kitAsset({"get", "https://example.invalid/test.bin", dir + "/assets", "--credit", "fixture"}) == 0);
+    CHECK(readFileBounded(dir + "/protected", 100).value == "preserved source");
+    CHECK(readFileBounded(dir + "/assets/test.bin", 100).value == "fixture downloaded asset");
+    CHECK(atomicWriteFile(dir + "/assets/test.bin", "previous completed asset").ok);
+    {
+        EnvGuard failure("POCKET_ASSET_DOWNLOAD_FAIL", "1");
+        CHECK(kitAsset({"get", "https://example.invalid/test.bin", dir + "/assets"}) == 1);
+    }
+    CHECK(readFileBounded(dir + "/assets/test.bin", 100).value == "previous completed asset");
+    for (const auto& entry : std::filesystem::directory_iterator(dir + "/assets"))
+        CHECK(entry.path().filename().string().find(".part-") == std::string::npos);
     return "";
 }

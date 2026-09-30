@@ -37,4 +37,15 @@ assert 'php-application-engineering' in report['skills']
 PYTHON
 "$installed" kit sfx "$root/installed.wav" chime --duration .1
 "$installed" kit audio "$root/installed.wav"
+test -f "$root/home/.local/share/pocketharness/skills/threejs/assets/model-preview.html"
+printf '{"asset":{"version":"2.0"},"scenes":[{"nodes":[]}],"scene":0}\n' > "$root/empty.gltf"
+"$installed" kit asset inspect "$root/empty.gltf" > "$root/asset.json"
+printf 'The released binary preserves the requested behavior.\n' > "$root/note.md"
+"$installed" kit quality "$root/note.md"
+"$installed" kit sys > "$root/sys.txt"
+python3 - "$root/asset.json" "$root/sys.txt" <<'PYTHON'
+import json,sys
+assert json.load(open(sys.argv[1]))['valid']
+assert 'MemAvailable:' in open(sys.argv[2]).read()
+PYTHON
 printf 'release package/install smoke passed\n'

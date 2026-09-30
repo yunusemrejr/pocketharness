@@ -226,6 +226,247 @@ TEST(agent_Wire_Trim_Caps) {
     return "";
 }
 
+TEST(agent_Exact_Large_Results_Are_Reused_Before_Distillation) {
+    std::string ws = makeTempDir("pocket-result-reuse");
+    auto auth = authorityInit(ws, {}, {}, false);
+    CHECK(auth.ok);
+    const std::string evidence(20000, 'x');
+    CHECK(atomicWriteFile(ws + "/evidence", evidence).ok);
+    ToolEnv env;
+    env.workspace = ws;
+    env.auth = &auth.value;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &env;
+    int requests = 0, decisions = 0;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        int n = requests++;
+        if (n < 4) r.calls = {{"c" + std::to_string(n), "read", json::stringify(json::Object{
+            {"path", "evidence"}, {"limit", n + 1}})}};
+        else r.text = "The evidence is unchanged.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    opts.decide = [&](const json::Value&, const std::vector<Question>& qs, bool, double*) {
+        ++decisions;
+        std::map<std::string, double> p;
+        for (const auto& q : qs) p[q.id] = 1;
+        return p;
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Inspect repeated observations.").empty());
+    CHECK_EQ(decisions, 1);
+    CHECK_EQ(agent.stats().deduped, 3);
+    CHECK(validateHistory(agent.messages()).empty());
+    for (const auto& m : agent.messages())
+        if (m.role == "tool" && m.toolCallId != "c0")
+            CHECK(m.content.find("earlier result of call c0") != std::string::npos);
+    authorityClose(auth.value);
+    rmRf(ws);
+    return "";
+}
+
+TEST(agent_Different_Raw_Results_With_Identical_Caps_Are_Not_Duplicates) {
+    std::string ws = makeTempDir("pocket-result-collision");
+    auto auth = authorityInit(ws, {}, {}, false);
+    CHECK(auth.ok);
+    std::string evidence(20000, 'x');
+    CHECK(atomicWriteFile(ws + "/evidence", evidence).ok);
+    ToolEnv env;
+    env.workspace = ws;
+    env.auth = &auth.value;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &env;
+    int requests = 0;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        int n = requests++;
+        if (n == 1) {
+            evidence[10000] = 'y'; // the cap omits this byte, but the result changed
+            (void)atomicWriteFile(ws + "/evidence", evidence);
+        }
+        if (n < 2) r.calls = {{"c" + std::to_string(n), "read", "{\"path\":\"evidence\"}"}};
+        else r.text = "Inspected both observations.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Inspect the evidence.").empty());
+    CHECK_EQ(agent.stats().deduped, 0);
+    for (const auto& m : agent.messages())
+        if (m.role == "tool") CHECK(m.content.find("identical to the earlier") == std::string::npos);
+    authorityClose(auth.value);
+    rmRf(ws);
+    return "";
+}
+
+TEST(agent_Result_Reuse_Never_References_Evidence_Evicted_By_Compaction) {
+    std::string ws = makeTempDir("pocket-result-compact");
+    auto auth = authorityInit(ws, {}, {}, false);
+    CHECK(auth.ok);
+    const std::string evidence(20000, 'x');
+    CHECK(atomicWriteFile(ws + "/evidence", evidence).ok);
+    for (int i = 0; i < 6; ++i) CHECK(atomicWriteFile(ws + "/small" + std::to_string(i), "unique evidence " + std::to_string(i)).ok);
+    ToolEnv env;
+    env.workspace = ws;
+    env.auth = &auth.value;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &env;
+    int requests = 0, decisions = 0;
+    Agent* current = nullptr;
+    std::string compactError;
+    bool staleReference = false;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (!req.stream) { r.text = "Inspected the earlier observations."; return Result<ChatResponse>::Ok(r); }
+        int n = requests++;
+        if (n == 7) {
+            compactError = current->compactNow();
+            auto changed = evidence;
+            changed[10000] = 'y'; // same wire cap; a reused ID must not alias the evicted result
+            (void)atomicWriteFile(ws + "/evidence", changed);
+        }
+        if (n == 8) (void)atomicWriteFile(ws + "/evidence", evidence);
+        if (n == 0 || n == 7 || n == 8)
+            r.calls = {{n == 7 ? "c0" : "c" + std::to_string(n), "read", "{\"path\":\"evidence\"}"}};
+        else if (n < 7) r.calls = {{"c" + std::to_string(n), "read", json::stringify(json::Object{
+            {"path", "small" + std::to_string(n - 1)}})}};
+        else {
+            for (const auto& m : req.messages)
+                if (m.role == "tool" && m.toolCallId == "c8") staleReference = m.content.find("earlier result") != std::string::npos;
+            r.text = "Inspected the repeated evidence after the checkpoint.";
+        }
+        return Result<ChatResponse>::Ok(r);
+    };
+    opts.decide = [&](const json::Value&, const std::vector<Question>& qs, bool, double*) {
+        ++decisions;
+        std::map<std::string, double> p;
+        for (const auto& q : qs) p[q.id] = 1;
+        return p;
+    };
+    Agent agent(opts);
+    current = &agent;
+    CHECK(agent.runTurn("Inspect all observations.").empty());
+    CHECK(compactError.empty());
+    CHECK_EQ(agent.stats().compactions, 1);
+    CHECK_EQ(decisions, 3);
+    CHECK(!staleReference);
+    CHECK(validateHistory(agent.messages()).empty());
+    authorityClose(auth.value);
+    rmRf(ws);
+    return "";
+}
+
+TEST(agent_Result_Reuse_Preserves_New_Failure_Guidance) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    int requests = 0, decisions = 0;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        r.calls = {{"c" + std::to_string(requests++), "read", "{}", std::string(20000, 'x')}};
+        return Result<ChatResponse>::Ok(r);
+    };
+    opts.decide = [&](const json::Value&, const std::vector<Question>& qs, bool, double*) {
+        ++decisions;
+        std::map<std::string, double> p;
+        for (const auto& q : qs) p[q.id] = 1;
+        return p;
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Inspect the evidence.").find("three identical tool batches") != std::string::npos);
+    CHECK_EQ(decisions, 2); // the third failure carries a fresh strategy warning
+    CHECK_EQ(agent.stats().deduped, 1);
+    CHECK(agent.messages().back().content.find("failed 3 times") != std::string::npos);
+    CHECK(validateHistory(agent.messages()).empty());
+    return "";
+}
+
+TEST(agent_NoOp_Writes_Do_Not_Create_Unverified_Work_Or_New_Goal_Progress) {
+    std::string ws = makeTempDir("pocket-agent-noop");
+    auto auth = authorityInit(ws, {}, {}, false);
+    CHECK(auth.ok);
+    CHECK(atomicWriteFile(ws + "/ready", "already correct\n").ok);
+    ToolEnv env;
+    env.workspace = ws;
+    env.auth = &auth.value;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &env;
+    opts.maxRounds = 1;
+    int requests = 0;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) {
+            r.text = "INTENT: Verify the ready file. ACCEPTANCE: It contains already correct.";
+            return Result<ChatResponse>::Ok(r);
+        }
+        ++requests;
+        r.calls = {{"noop" + std::to_string(requests), "write", "{\"path\":\"ready\",\"content\":\"already correct\\n\"}"}};
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    CHECK(agent.runGoal("Ensure ready contains already correct.", 2).find("no new successful observations") != std::string::npos);
+    CHECK_EQ(requests, 1); // a no-op cannot renew the chunk budget
+    CHECK(env.changedFiles.empty());
+    CHECK_EQ(agent.stats().nudges, 0);
+    authorityClose(auth.value);
+    rmRf(ws);
+    return "";
+}
+
+TEST(agent_Quality_State_And_Task_Intent_Reset_At_New_Turns) {
+    ToolEnv env;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &env;
+    bool cleared = true;
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        cleared = cleared && env.qualitySeen.empty() && env.semanticChecks.empty();
+        ChatResponse r;
+        r.text = "4";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    env.qualitySeen["a"] = {"prior finding"};
+    env.semanticChecks["a"].calls = 2;
+    CHECK(agent.runTurn("What is 2+2?").empty());
+    CHECK_EQ(env.taskIntent, std::string("What is 2+2?"));
+    env.qualitySeen["a"] = {"prior finding"};
+    env.semanticChecks["a"].calls = 2;
+    CHECK(agent.runTurn("What is 4+4?").empty());
+    CHECK_EQ(env.taskIntent, std::string("What is 4+4?"));
+    CHECK(cleared);
+    return "";
+}
+
+TEST(agent_Decision_Transcript_Does_Not_Repeat_Pinned_Request_And_Keeps_Attachments) {
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.autonomy = true;
+    opts.hint = [](const std::string&, double*) { return "[skill hint] NATIVE_GUIDE_REQUIREMENT"; };
+    int decisions = 0;
+    bool once = false, hintRetained = false;
+    opts.decide = [&](const json::Value& state, const std::vector<Question>&, bool, double*) {
+        ++decisions;
+        auto input = json::stringify(state.at("input"));
+        auto pos = input.find("NATIVE_REQUEST_UNIQUE");
+        once = pos != std::string::npos && input.find("NATIVE_REQUEST_UNIQUE", pos + 1) == std::string::npos;
+        hintRetained = input.find("NATIVE_GUIDE_REQUIREMENT") != std::string::npos;
+        return std::map<std::string, double>{{"ask", 0}, {"announce", 0}, {"premature", 0}, {"ignored", 0}};
+    };
+    opts.request = [](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        r.text = "The requested implementation is complete.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Implement NATIVE_REQUEST_UNIQUE in the existing project.").empty());
+    CHECK_EQ(decisions, 1);
+    CHECK(once && hintRetained);
+    return "";
+}
+
 TEST(agent_Cache_Window) {
     AgentStats st;
     noteCacheSample(st, -1, -1);  // unreported: not a sample
@@ -1528,9 +1769,179 @@ TEST(agent_Unknown_Quality_Evidence_Uses_Normal_Council) {
         return Result<ChatResponse>::Ok(response);
     };
     Agent agent(opts);
-    CHECK(agent.runTurn("Implement and verify the migration across production modules").empty());
+    CHECK(agent.runTurn("Fix and verify checked.cpp").empty());
     CHECK(decisionRequests == 1 && councilRequests == 1);
     CHECK(agent.stats().reviews == 1);
+    return "";
+}
+
+TEST(agent_Review_Digest_Includes_Observed_Command_Results_And_Trailing_Status) {
+    std::vector<ChatMessage> messages = {
+        {"user", "Fix and verify the library", {}, ""},
+        {"assistant", "", {{"test", "bash", "{\"command\":\"python3 -m unittest -v\"}"}}, ""},
+        {"tool", "[exit: 0]\n[stderr]\ntest_zero ... ok\nRan 14 tests in 0.003s\n\nOK\n", {}, "test"}};
+    auto digest = workDigest(messages, 0, messages.size(), 10000);
+    CHECK(digest.find("Ran 14 tests") != std::string::npos);
+    CHECK(digest.find("[exit: 0]") != std::string::npos);
+    messages.back().content = "test_first ... ok\n" + std::string(12000, 'x') + "\nFAIL: zero weight\n[exit: 1]\n";
+    digest = workDigest(messages, 0, messages.size(), 10000);
+    CHECK(digest.size() < 2500);
+    CHECK(digest.find("test_first ... ok") != std::string::npos);
+    CHECK(digest.find("FAIL: zero weight") != std::string::npos);
+    CHECK(digest.find("[exit: 1]") != std::string::npos);
+    return "";
+}
+
+TEST(agent_Complex_Review_Uses_Real_Verification_Without_Redundant_Prefilter) {
+    std::string ws = makeTempDir("pocket-review-evidence");
+    auto auth = authorityInit(ws, {}, {}, false);
+    CHECK(auth.ok);
+    ToolEnv env;
+    env.workspace = ws;
+    env.auth = &auth.value;
+    env.unsafe = true;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &env;
+    opts.review = opts.autonomy = true;
+    int main = 0, reviews = 0, decisions = 0;
+    bool sawEvidence = false;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("strict senior reviewer") != std::string::npos) {
+            ++reviews;
+            auto log = req.messages.back().content;
+            sawEvidence = log.find("verified ready") != std::string::npos && log.find("[exit: 0]") != std::string::npos;
+            r.text = sawEvidence ? "LGTM" : "Verification output is missing; run the command again.";
+        } else {
+            int n = main++;
+            if (n == 0) r.calls = {{"write", "write", "{\"path\":\"ready\",\"content\":\"ready\\n\"}"}};
+            else if (n == 1) r.calls = {{"test", "bash", json::stringify(json::Object{
+                {"command", "test \"$(cat ready)\" = ready && printf 'verified ready\\n'"}})}};
+            else r.text = "Implemented and verified the requested change.";
+        }
+        return Result<ChatResponse>::Ok(r);
+    };
+    opts.decide = [&](const json::Value&, const std::vector<Question>& qs, bool, double*) {
+        ++decisions;
+        // Unknown quality still requires the independent reviewer.
+        std::map<std::string, double> p;
+        for (const auto& q : qs) if (q.id == "ask" || q.id == "announce") p[q.id] = 0;
+        return p;
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Implement the migration across modules and verify correctness").empty());
+    CHECK(sawEvidence);
+    CHECK_EQ(reviews, 1);
+    CHECK_EQ(main, 3);
+    CHECK_EQ(decisions, 1);
+    CHECK(validateHistory(agent.messages()).empty());
+    authorityClose(auth.value);
+    rmRf(ws);
+    return "";
+}
+
+TEST(agent_Conflicting_Generated_Brief_Cannot_Amend_Human_Contract) {
+    std::string home = makeTempDir("pocket-advisory-contract");
+    HomeGuard isolated(home);
+    const std::string request = "Implement CSV export across modules and verify correctness. "
+        "For empty records, return the header row name followed by a newline; do not return an empty string.";
+    const std::string invented = "Empty records return an empty string.";
+    for (bool goal : {false, true}) {
+        std::string ws = home + (goal ? "/goal" : "/turn");
+        CHECK(ensureDir(ws, 0700).ok);
+        auto auth = authorityInit(ws, {}, {}, false);
+        CHECK(auth.ok);
+        ToolEnv env;
+        env.workspace = ws;
+        env.auth = &auth.value;
+        env.unsafe = true;
+        AgentOpts opts;
+        opts.model = resolveModel(defaultConfig(), "glm").value;
+        opts.tools = &env;
+        opts.brief = opts.review = true;
+        int plans = 0, main = 0, reviews = 0, audits = 0;
+        bool plannerContract = false, followedHuman = false, reviewAccepted = false, auditAccepted = false;
+        opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+            ChatResponse r;
+            if (req.system.find("planning council") != std::string::npos) {
+                ++plans;
+                plannerContract = req.system.find("Preserve explicit behavior and edge cases verbatim") != std::string::npos &&
+                    req.system.find("OPTIONAL") != std::string::npos && req.messages.back().content.find(request) != std::string::npos;
+                // A generated plan can still be wrong despite its instructions.
+                r.text = "INTENT: Export records.\nDECISIONS: OPTIONAL: omit the header for empty input.\nACCEPTANCE: " + invented;
+            } else if (req.system.find("strict senior reviewer") != std::string::npos) {
+                ++reviews;
+                const auto& log = req.messages.back().content;
+                reviewAccepted = req.system.find("User requirements are authoritative") != std::string::npos &&
+                    log.find(request) != std::string::npos && log.find(invented) != std::string::npos &&
+                    log.find("\nVerified empty-record header\n") != std::string::npos;
+                // Without precedence, the invented acceptance criterion rejects
+                // the correct human-requested behavior and demands another edit.
+                r.text = reviewAccepted ? "LGTM" : "The generated acceptance requires empty output; remove the header.";
+            } else if (req.system.find("You audit an autonomous agent") != std::string::npos) {
+                ++audits;
+                const auto& log = req.messages.back().content;
+                auditAccepted = req.system.find("User requirements are authoritative") != std::string::npos &&
+                    log.find(request) != std::string::npos && log.find(invented) != std::string::npos;
+                r.text = auditAccepted ? "DONE" : "CONTINUE\nReturn empty output as required by the generated acceptance.";
+            } else {
+                int n = main++;
+                if (n == 0) {
+                    const auto& input = req.messages.back().content;
+                    followedHuman = input.find(request) != std::string::npos && input.find(invented) != std::string::npos &&
+                        input.find("[ADVISORY GENERATED BRIEF]") != std::string::npos &&
+                        input.find("follow the human request on every conflict") != std::string::npos;
+                    r.calls = {{"write", "write", json::stringify(json::Object{
+                        {"path", "empty.csv"}, {"content", followedHuman ? "name\n" : ""}})}};
+                } else if (n == 1) {
+                    r.calls = {{"verify", "bash", json::stringify(json::Object{
+                        {"command", "test \"$(cat empty.csv)\" = name && printf 'Verified empty-record header\\n'"}})}};
+                } else r.text = "CSV export preserves the requested header for empty records and the check passed.";
+            }
+            return Result<ChatResponse>::Ok(r);
+        };
+        Agent agent(opts);
+        CHECK((goal ? agent.runGoal(request, 1) : agent.runTurn(request)).empty());
+        auto output = readFileBounded(ws + "/empty.csv", 100);
+        CHECK(output.ok && output.value == "name\n");
+        CHECK(plannerContract && followedHuman && reviewAccepted);
+        CHECK_EQ(plans, 1);
+        CHECK_EQ(main, 3);
+        CHECK_EQ(reviews, 1);
+        CHECK_EQ(audits, goal ? 1 : 0);
+        CHECK(!goal || (auditAccepted && agent.goalStatus() == GoalStatus::Completed));
+        CHECK(validateHistory(agent.messages()).empty());
+        authorityClose(auth.value);
+    }
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Small_Review_Reuses_Unknown_Completion_Assessment) {
+    ToolEnv tools;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &tools;
+    opts.review = opts.autonomy = true;
+    int reviews = 0, decisions = 0;
+    bool combined = false;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("strict senior reviewer") != std::string::npos) { ++reviews; r.text = "LGTM"; }
+        else { tools.changedFiles.push_back("checked.cpp"); r.text = "The requested change is implemented and checked."; }
+        return Result<ChatResponse>::Ok(r);
+    };
+    opts.decide = [&](const json::Value&, const std::vector<Question>& qs, bool, double*) {
+        ++decisions;
+        bool bad = false, premature = false;
+        for (const auto& q : qs) { bad |= q.id == "bad"; premature |= q.id == "premature"; }
+        combined = bad && premature;
+        return std::map<std::string, double>{{"ask", 0}, {"announce", 0}};
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Fix and verify checked.cpp").empty());
+    CHECK(combined && decisions == 1 && reviews == 1);
     return "";
 }
 

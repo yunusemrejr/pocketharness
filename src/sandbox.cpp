@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <set>
 
 #ifndef SYS_openat2
@@ -506,13 +507,20 @@ Result<std::string> boxRead(const Authority& a, const std::string& path, size_t 
 }
 
 VoidResult boxWrite(const Authority& a, const std::string& path, const std::string& data,
-                    mode_t mode) {
+                    mode_t mode, bool* changed) {
+    if (changed) *changed = false;
     if (a.unsafe) {
         std::string p = expandHome(path);
         if (p.empty() || p[0] != '/') p = a.workspace + "/" + p;
         struct stat st{};
         if (stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode)) mode = st.st_mode & 0777;
-        return atomicWriteFile(p, data, mode);
+        if (changed) {
+            auto current = readFileBounded(p, data.size() + 1);
+            if (current.ok && current.value == data) return VoidResult::Ok();
+        }
+        auto result = atomicWriteFile(p, data, mode);
+        if (changed) *changed = result.ok;
+        return result;
     }
     Resolved rs;
     std::string err;
@@ -536,6 +544,14 @@ VoidResult boxWrite(const Authority& a, const std::string& path, const std::stri
     }
     // Preserve access permissions; never broaden a private file to 0644/0755.
     if (haveSt && S_ISREG(leafSt.st_mode)) mode = leafSt.st_mode & 0777;
+    if (changed && haveSt && S_ISREG(leafSt.st_mode) && (uint64_t)leafSt.st_size == data.size()) {
+        int currentFd = openComp(dirfd, leaf.c_str(), O_RDONLY | O_NONBLOCK, 0, false, true);
+        if (currentFd >= 0) {
+            auto current = readAllFd(currentFd, data.size() + 1);
+            close(currentFd);
+            if (current.ok && current.value == data) { close(dirfd); return VoidResult::Ok(); }
+        }
+    }
     // Tmp file + rename inside the same directory (atomic for readers).
     std::string tmp = ".pocket-tmp-" + randHex(4);
     int fd;
@@ -578,6 +594,7 @@ VoidResult boxWrite(const Authority& a, const std::string& path, const std::stri
     }
     fsync(dirfd);
     close(dirfd);
+    if (changed) *changed = true;
     return VoidResult::Ok();
 }
 
@@ -1430,6 +1447,11 @@ GuardResult classifyCommand(const std::string& cmd, const std::string& workspace
         }
         if (!recursive) continue;
         for (const auto& t : targets) {
+            if (t.empty()) {
+                r.verdict = Verdict::Deny;
+                r.reason = "empty recursive rm target blocked";
+                return r;
+            }
             if (t == "/" || t == "/*") {
                 r.verdict = Verdict::Deny;
                 r.reason = "recursive rm of filesystem root blocked";
@@ -1445,10 +1467,17 @@ GuardResult classifyCommand(const std::string& cmd, const std::string& workspace
                         scratch = true;
             }
             if (scratch) continue;
-            if (t[0] == '/' && !workspace.empty() && !startsWith(t, workspace + "/") && t != workspace &&
-                t.find('*') == std::string::npos) {
+            std::string normalized = std::filesystem::path(t).lexically_normal().string();
+            std::string root = std::filesystem::path(workspace).lexically_normal().string();
+            if (t[0] == '/' && !workspace.empty() && !startsWith(normalized, root + "/") && normalized != root &&
+                t.find_first_of("*?$`") == std::string::npos) {
                 r.verdict = Verdict::Deny;
                 r.reason = "recursive rm outside the workspace blocked: " + t;
+                return r;
+            }
+            if (!root.empty() && t[0] == '/' && normalized == root) {
+                r.verdict = Verdict::Ask;
+                r.reason = "recursive rm of the workspace itself needs approval; remove a named build/scratch directory instead";
                 return r;
             }
             if (t.find_first_of("$`") != std::string::npos) {
@@ -1456,7 +1485,7 @@ GuardResult classifyCommand(const std::string& cmd, const std::string& workspace
                 r.reason = "recursive rm with a computed target needs approval (use $TMPDIR/name for scratch)";
                 return r;
             }
-            if (mentionsDot(t) || mentionsRootish(t) || (force && t.find('*') != std::string::npos &&
+            if (mentionsDot(normalized) || mentionsRootish(normalized) || (force && t.find('*') != std::string::npos &&
                                                          (t == "*" || startsWith(t, "/")))) {
                 r.verdict = Verdict::Ask;
                 r.reason = force ? "broad 'rm -rf' needs approval" : "broad recursive rm needs approval";

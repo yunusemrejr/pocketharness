@@ -4,6 +4,7 @@
 
 #include <string>
 #include <vector>
+#include "json.h"
 
 namespace pocket {
 
@@ -12,6 +13,9 @@ int kitSay(const std::vector<std::string>& args);
 int kitAsset(const std::vector<std::string>& args);
 int kitTheme(const std::vector<std::string>& args);
 int kitVsheet(const std::vector<std::string>& args);
+// Bounded local glTF/GLB preflight: framing, dependency sizes, geometry ranges,
+// scene references and decoder requirements. No renderer or network is involved.
+Result<json::Value> inspectGltf(const std::string& path);
 
 // Pure helpers (unit-tested).
 struct Utterance { std::string display, spoken; };

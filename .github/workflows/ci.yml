@@ -18,7 +18,7 @@ jobs:
         compiler: [g++, clang++]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: make -j2 test CXX=${{ matrix.compiler }} CXXFLAGS='-std=c++20 -O2 -Wall -Wextra -MMD -MP -Isrc'
+      - run: make -j2 test CXX=${{ matrix.compiler }}
       - run: make check-workflows
       - run: make bench CXX=${{ matrix.compiler }}
       - name: Package and installation smoke

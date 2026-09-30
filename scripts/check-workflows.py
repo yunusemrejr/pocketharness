@@ -9,6 +9,11 @@ required = {
     'bash-workflows': ['bash -n'],
     'local-webapp-workflows': ['loopback'],
     'shared-hosting-deployment': ['Namecheap', 'GoDaddy', 'GitHub'],
+    'linux': ['pocket kit sys', 'pressure'],
+    'linux-network-engineering': ['pocket kit reach', '--any-status', 'deadline'],
+    'search-discoverability': ['pocket kit seo', 'source', 'advisory'],
+    'natural-editorial-writing': ['pocket kit quality', 'facts'],
+    'threejs': ['pocket kit asset inspect', 'assets/model-preview.html'],
 }
 for name, snippets in required.items():
     path = root / 'skills' / name / 'SKILL.md'

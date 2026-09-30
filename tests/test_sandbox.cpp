@@ -240,6 +240,11 @@ TEST(sandbox_Guard) {
         {"rm -rf $HOME", Verdict::Ask},
         {"rm -rf ../sibling", Verdict::Ask},
         {"rm -rf /tmp/x", Verdict::Deny},  // outside workspace
+        {"rm -rf /ws/../tmp/x", Verdict::Deny},
+        {"rm -rf /ws/sub/../../elsewhere", Verdict::Deny},
+        {"rm -rf /ws", Verdict::Ask},
+        {"rm -rf /ws/sub/../build", Verdict::Allow},
+        {"rm -rf ''", Verdict::Deny},
         {"rm -rf --no-preserve-root x", Verdict::Deny},
         {"sudo rm -rf /etc", Verdict::Deny},
         {"cd /ws && rm -fr '/'", Verdict::Deny},

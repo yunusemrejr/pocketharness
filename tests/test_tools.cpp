@@ -408,9 +408,9 @@ TEST(tools_Edit_Tolerates_Whitespace_Drift_And_Pipe_Close) {
              std::string("int f() {\n    if (x) {\n        z();\n    }\n}\n"));
     r = runTool(f.env, "edit", R"({"path":"w.c","old_text":"if (x) {\n  q();","new_text":"no"})");
     CHECK(!r.ok && r.output.find("at line 2") != std::string::npos);
-    // `yes | head` ends in SIGPIPE (141) under pipefail: that is success.
+    // A closed pipe retains exit evidence; without stage statuses it is not certified as success.
     r = runTool(f.env, "bash", R"({"command":"yes | head -n 2"})");
-    CHECK(r.ok && r.output.find("exit 141") != std::string::npos);
+    CHECK(!r.ok && r.output.find("exit 141") != std::string::npos);
     return "";
 }
 
@@ -486,5 +486,89 @@ TEST(tools_Loaded_Skill_Names_Are_Canonical_And_Deduplicated) {
     CHECK_EQ(env.loadedSkills.size(), size_t(1));
     CHECK_EQ(env.loadedSkills.front(), std::string("ai-design-slop"));
     rmRf(home);
+    return "";
+}
+
+TEST(tools_No_Op_Edit_Skips_Undo_Checks_And_Hooks) {
+    ToolFixture f;
+    CHECK(f.ok);
+    f.cfg.jev = false;
+    f.cfg.hooks["post_edit"] = {"echo ran >> edits.log"};
+    auto r = runTool(f.env, "write", R"({"path":"same.py","content":"def sum(a, b): return a + b"})");
+    CHECK(r.ok && r.changed);
+    CHECK(chmod((f.ws + "/same.py").c_str(), 0700) == 0);
+    struct stat prior{}, after{};
+    CHECK(stat((f.ws + "/same.py").c_str(), &prior) == 0);
+    f.env.changedFiles.clear();
+    size_t undo = f.env.undo.size();
+    r = runTool(f.env, "write", R"({"path":"same.py","content":"def sum(a, b): return a + b"})");
+    CHECK(r.ok && !r.changed && r.output == "unchanged same.py");
+    r = runTool(f.env, "edit", R"({"path":"same.py","old_text":"a + b","new_text":"a + b"})");
+    CHECK(r.ok && !r.changed);
+    CHECK(stat((f.ws + "/same.py").c_str(), &after) == 0);
+    CHECK(prior.st_ino == after.st_ino && prior.st_mode == after.st_mode &&
+          prior.st_mtim.tv_sec == after.st_mtim.tv_sec && prior.st_mtim.tv_nsec == after.st_mtim.tv_nsec);
+    CHECK(f.env.changedFiles.empty() && f.env.undo.size() == undo);
+    CHECK_EQ(readFileBounded(f.ws + "/edits.log", 100).value, std::string("ran\n"));
+    CHECK(symlink("same.py", (f.ws + "/alias.py").c_str()) == 0);
+    CHECK(!runTool(f.env, "write", R"({"path":"alias.py","content":"def sum(a, b): return a + b"})").ok);
+    CHECK(ensureDir(f.base + "/readonly", 0700).ok);
+    CHECK(atomicWriteFile(f.base + "/readonly/same", "same").ok);
+    CHECK(authorityAddReadRoot(f.auth, f.base + "/readonly").ok);
+    CHECK(!runTool(f.env, "write", json::stringify(json::Object{{"path", f.base + "/readonly/same"}, {"content", "same"}})).ok);
+    return "";
+}
+
+TEST(tools_Later_Edit_Reports_New_Medium_Findings_Only) {
+    ToolFixture f;
+    CHECK(f.ok);
+    f.cfg.jev = false;
+    CHECK(runTool(f.env, "write", R"({"path":"logic.py","content":"def go(items):\n    return items\n"})").ok);
+    auto r = runTool(f.env, "edit", R"({"path":"logic.py","old_text":"def go(items):","new_text":"def go(items=[]):"})");
+    CHECK(r.ok && r.changed && r.output.find("mutable default") != std::string::npos);
+    r = runTool(f.env, "edit", R"json({"path":"logic.py","old_text":"return items","new_text":"return list(items)"})json");
+    CHECK(r.ok && r.changed && r.output.find("mutable default") == std::string::npos);
+    return "";
+}
+
+TEST(tools_Semantic_Check_Reassesses_Material_Revision_With_Budget) {
+    ToolFixture f;
+    CHECK(f.ok);
+    f.cfg.jev = false;
+    std::string first(500, 'a'), second(500, 'b');
+    auto write = [&](const std::string& text) {
+        return runTool(f.env, "write", json::stringify(json::Object{{"path", "guide.md"}, {"content", text}}));
+    };
+    CHECK(write("draft").ok);
+    CHECK(f.env.semanticChecks.empty());
+    CHECK(write(first).ok);
+    CHECK_EQ(f.env.semanticChecks["guide.md"].calls, 1);
+    CHECK(write(first + " ").ok);
+    CHECK_EQ(f.env.semanticChecks["guide.md"].calls, 1);
+    CHECK(write(second).ok);
+    CHECK_EQ(f.env.semanticChecks["guide.md"].calls, 2);
+    CHECK(write(first).ok);
+    CHECK_EQ(f.env.semanticChecks["guide.md"].calls, 2);
+    return "";
+}
+
+TEST(tools_Post_Bash_Receives_Quoted_Outcome_Without_Recursive_Expansion) {
+    ToolFixture f;
+    CHECK(f.ok);
+    f.cfg.hooks["post_bash"] = {"printf '%s\\n' {cmd} {ok} {result} > hook.txt"};
+    std::string cmd = "printf '%s\\n' 'literal {ok} $(touch injected)'";
+    auto r = runTool(f.env, "bash", json::stringify(json::Object{{"command", cmd}}));
+    CHECK(r.ok);
+    auto hook = readFileBounded(f.ws + "/hook.txt", 10000);
+    CHECK(hook.ok && hook.value.find(cmd) == 0);
+    CHECK(hook.value.find("literal {ok} $(touch injected)") != std::string::npos);
+    CHECK(!boxExists(f.auth, "injected").value);
+    f.cfg.hooks["post_bash"] = {"false"};
+    r = runTool(f.env, "bash", R"({"command":"printf success"})");
+    CHECK(!r.ok && r.output.find("[exit: 0]") != std::string::npos &&
+          r.output.find("[hook post_bash failed]") != std::string::npos);
+    f.cfg.hooks["post_bash"].clear();
+    r = runTool(f.env, "bash", R"({"command":"bash -c 'exit 141' | cat"})");
+    CHECK(!r.ok);
     return "";
 }

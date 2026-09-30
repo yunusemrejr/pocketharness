@@ -90,7 +90,9 @@ std::vector<SkillMeta> workflowCatalog() {
                              "java-platform-engineering", "python-software-engineering", "bash-workflows",
                              "cpp-performance-engineering", "c-systems-engineering", "linux-desktop-ui-ux",
                              "local-webapp-workflows", "algorithm-design", "ml-engineering", "llm-fine-tuning",
-                             "google-colab-training", "music-composition", "audio-processing", "browser-animation-engineering"})
+                             "google-colab-training", "music-composition", "audio-processing", "browser-animation-engineering",
+                             "search-discoverability", "natural-editorial-writing", "anti-ai-slop", "linux-network-engineering",
+                             "network-traffic-analysis", "packet-trace-analysis", "local-network-analysis", "linux", "ubuntu-operations"})
         all.push_back({name, "bundled", name, "", "skills/" + std::string(name) + "/SKILL.md"});
     return all;
 }
@@ -195,6 +197,31 @@ TEST(skills_AutoSelect_Project_Manifest_And_Explicit_Runtime) {
     auto resumed = skillAutoSelect(all, "Fix the failing test", {"modern-frontend-frameworks", "project-workflows"}, 4, ws);
     CHECK(resumed.skills.empty());
     rmRf(ws);
+    return "";
+}
+
+TEST(skills_AutoSelect_Precise_Network_Linux_SEO_And_Writing) {
+    const auto all = workflowCatalog();
+    auto dns = skillAutoSelect(all, "Diagnose DNS and slow TCP connectivity");
+    CHECK(selected(dns, "linux-network-engineering"));
+    CHECK(!selected(dns, "project-workflows"));
+    auto packet = skillAutoSelect(all, "Inspect a pcap packet trace handshake timeline");
+    CHECK(selected(packet, "network-traffic-analysis") && selected(packet, "packet-trace-analysis"));
+    CHECK(!selected(packet, "linux-network-engineering"));
+    auto sys = skillAutoSelect(all, "Troubleshoot an Ubuntu systemd service with out of memory errors");
+    CHECK(selected(sys, "linux") && selected(sys, "ubuntu-operations"));
+    auto seo = skillAutoSelect(all, "Audit SEO metadata on the website");
+    CHECK(selected(seo, "search-discoverability") && !seo.ui);
+    CHECK(!selected(seo, "ai-design-slop") && !selected(seo, "project-workflows"));
+    auto design = skillAutoSelect(all, "Design an SEO website layout");
+    CHECK(design.ui && selected(design, "ai-design-slop") && selected(design, "search-discoverability"));
+    auto writing = skillAutoSelect(all, "Rewrite the report and edit its prose with a quality review");
+    CHECK(selected(writing, "natural-editorial-writing") && selected(writing, "anti-ai-slop"));
+    CHECK(!selected(writing, "project-workflows"));
+    auto code = skillAutoSelect(all, "Write a Bash script that prints a report");
+    CHECK(selected(code, "bash-workflows"));
+    CHECK(!selected(code, "natural-editorial-writing"));
+    CHECK(skillAutoSelect(all, "The geological description is available").skills.empty());
     return "";
 }
 
