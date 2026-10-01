@@ -512,11 +512,98 @@ TEST(sandbox_ReadOnlyBash_Blocks_Mutations_And_Composition) {
         "git -c a=b status", "git --config-env=A status", "git diff --output=/tmp/x", "git diff -o /tmp/x",
         "git", "git --exec-path", "ls `id`", "ls $(id)", "ls $HOME", "ls ${X}", "(ls)", "ls &",
         "unbalanced 'quote", "trailing\\",
+        "find . -fprint0 out.txt", "find . -fprint out.txt", "find . -fprintf out.txt x",
+        "fd -X cat", "fd -xcat", "fd --exec=cat", "fd --exec-batch=cat", "tree -o out.txt", "tree -Lo out.txt",
+        "tree --output=out.txt", "file -C -m magic", "file --compile", "git diff --ext-diff",
+        "git show --textconv HEAD", "git grep -Oless pat", "git grep --open-files-in-pager=cat pat",
     };
     for (const char* c : bad) {
         std::string why;
         if (isReadOnlyBash(c, &why)) return std::string("dangerous allowed: ") + c;
         if (why.empty()) return std::string("no reason for: ") + c;
     }
+    return "";
+}
+
+// Spawn a read-only sandboxed shell; returns the SpawnResult.
+static SpawnResult runReadOnlyChild(const std::string& tmp, const std::string& script) {
+    ChildSpec cs;
+    cs.auth = &g_auth;
+    cs.workspace = g_auth.workspace;
+    cs.sessionTmp = tmp;
+    cs.readOnly = true;
+    SpawnOpts o;
+    o.exe = "/bin/bash";
+    o.argv = {"bash", "--noprofile", "--norc", "-c", script};
+    o.env = buildChildEnv({}, g_auth.workspace, tmp, tmp + "/home");
+    o.workdir = g_auth.workspace;
+    o.childSetup = [cs]() { childEnterSandbox(cs); };
+    return spawn(o);
+}
+
+TEST(sandbox_ReadOnly_Profile_Blocks_Writes_Even_For_Allowlisted_Tools) {
+    CHECK(setup().empty());
+    if (!sandboxCaps().landlock) { printf("    [skip] Landlock unavailable on this kernel\n"); return ""; }
+    std::string tmp = makeTempDir("pocket-ro");
+    struct Cleanup { std::string p; ~Cleanup() { rmRf(p); } } cleanup{tmp};
+    CHECK(ensureDir(tmp + "/home", 0700).ok);
+    CHECK(atomicWriteFile(g_ws + "/sentinel.txt", "original", 0644).ok);
+    // The classifier would reject these, but the kernel profile must hold
+    // independently of it: find -fprint0, shell redirection, rename, unlink,
+    // create, and scratch writes all fail; plain reads still work.
+    auto r = runReadOnlyChild(tmp,
+        "find . -maxdepth 1 -name sentinel.txt -fprint0 sentinel.txt 2>/dev/null;"
+        "echo changed > sentinel.txt 2>/dev/null;"
+        "mv sentinel.txt moved.txt 2>/dev/null; rm -f sentinel.txt 2>/dev/null;"
+        "echo x > created.txt 2>/dev/null; echo x > \"$TMPDIR/scratch\" 2>/dev/null;"
+        "mkdir newdir 2>/dev/null; echo x > /tmp/pocket-ro-probe-file 2>/dev/null;"
+        "cat sentinel.txt");
+    CHECK(r.ok);
+    CHECK(r.out == "original");
+    auto kept = boxRead(g_auth, "sentinel.txt", 100);
+    CHECK(kept.ok && kept.value == "original");
+    CHECK(!boxExists(g_auth, "moved.txt").value && !boxExists(g_auth, "created.txt").value);
+    CHECK(access((tmp + "/scratch").c_str(), F_OK) != 0);
+    CHECK(access("/tmp/pocket-ro-probe-file", F_OK) != 0);
+    return "";
+}
+
+TEST(sandbox_ReadOnly_Path_Drops_Writable_Roots) {
+    std::string p = readOnlyChildPath("/tmp/task/bin:/usr/bin:/work/ws/node_modules/.bin:/bin::rel/bin",
+                                      {"/tmp/task", "/work/ws"});
+    CHECK(p == "/usr/bin:/bin");
+    CHECK(readOnlyChildPath("/tmp/task/bin", {"/tmp/task"}) == "/usr/local/bin:/usr/bin:/bin");
+    return "";
+}
+
+TEST(sandbox_Landlock_Unexpected_Setup_Error_Fails_Closed) {
+    CHECK(setup().empty());
+    if (!sandboxCaps().landlock) { printf("    [skip] Landlock unavailable on this kernel\n"); return ""; }
+    std::string tmp = makeTempDir("pocket-llerr");
+    struct Cleanup { std::string p; ~Cleanup() { sandboxTestInjectLandlockErrno(0); rmRf(p); } } cleanup{tmp};
+    CHECK(ensureDir(tmp + "/home", 0700).ok);
+    for (int err : {EMFILE, ENFILE, ENOMEM}) {
+        sandboxTestInjectLandlockErrno(err);
+        auto r = runReadOnlyChild(tmp, "echo MARKER-RAN > \"" + g_ws + "/marker\"; echo MARKER-RAN");
+        CHECK(r.exitCode == 127);
+        CHECK(r.out.find("MARKER-RAN") == std::string::npos);
+        CHECK(!boxExists(g_auth, "marker").value);
+        CHECK(r.err.find("Landlock setup failed") != std::string::npos);
+    }
+    // A genuinely unsupported kernel still degrades for ordinary tool
+    // children (loud warning), but read-only profiles refuse to run.
+    sandboxTestInjectLandlockErrno(ENOSYS);
+    auto ro = runReadOnlyChild(tmp, "echo MARKER-RAN");
+    CHECK(ro.exitCode == 127 && ro.out.find("MARKER-RAN") == std::string::npos);
+    ChildSpec cs;
+    cs.auth = &g_auth; cs.workspace = g_ws; cs.sessionTmp = tmp; cs.allowNet = true;
+    SpawnOpts o;
+    o.exe = "/bin/sh";
+    o.argv = {"sh", "-c", "echo ordinary-ran"};
+    o.env = buildChildEnv({}, g_ws, tmp, tmp + "/home");
+    o.childSetup = [cs]() { childEnterSandbox(cs); };
+    auto ord = spawn(o);
+    CHECK(ord.exitCode == 0 && ord.out.find("ordinary-ran") != std::string::npos);
+    CHECK(ord.err.find("Landlock unavailable") != std::string::npos);
     return "";
 }

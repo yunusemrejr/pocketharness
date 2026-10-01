@@ -643,6 +643,9 @@ Result<ChatResponse> Agent::requestOnce() {
     };
     lastEstimate_ = estimateContext();
     int64_t t0 = nowMs();
+    if (opts_.requestBudgetMs > 0) req.deadlineAtMs = t0 + opts_.requestBudgetMs;
+    // One shared budget: escalation, fallback and recovery stop when it is spent.
+    auto budgetLeft = [&](long needMs = 0) { return req.deadlineAtMs <= 0 || nowMs() + needMs + 2000 < req.deadlineAtMs; };
     auto blind = [&] { return std::find(blind_.begin(), blind_.end(), req.model.spec) != blind_.end(); };
     auto send = [&] {
         if (blind()) stripImages(req.messages);
@@ -664,7 +667,7 @@ Result<ChatResponse> Agent::requestOnce() {
     const ResolvedModel* used = selected;
     // A simple task's fast route is advisory. A failed attempt escalates to
     // the original main model before trying its configured provider fallback.
-    if (!r.ok && selected != &opts_.model && r.error != "cancelled" &&
+    if (!r.ok && selected != &opts_.model && r.error != "cancelled" && budgetLeft() &&
         !(opts_.cancel && opts_.cancel->load())) {
         ++taskObserved_.failures;
         taskPolicy_ = taskPolicy(policyRequest_, taskObserved_);
@@ -682,7 +685,7 @@ Result<ChatResponse> Agent::requestOnce() {
         transient = !r.ok && isTransientProviderError(r.error);
         rejected = !r.ok && (startsWith(r.error, "HTTP 400") || startsWith(r.error, "HTTP 422"));
     }
-    if ((transient || rejected) && !opts_.fallback.empty() && opts_.fallback[0].spec != opts_.model.spec) {
+    if ((transient || rejected) && !opts_.fallback.empty() && opts_.fallback[0].spec != opts_.model.spec && budgetLeft()) {
         if (contextUsed() >= opts_.fallback[0].context)
             return Result<ChatResponse>::Err(r.error + "; fallback context window is too small for this conversation");
         if (opts_.onNotice) opts_.onNotice("main model failed (" + r.error.substr(0, 100) + "); using fallback " + opts_.fallback[0].spec);
@@ -698,6 +701,7 @@ Result<ChatResponse> Agent::requestOnce() {
     for (int again = 0; again < 2 && !r.ok && isTransientProviderError(r.error) &&
                         r.error.find("empty response") == std::string::npos && !(opts_.cancel && opts_.cancel->load()); ++again) {
         long ms = opts_.recoverDelayMs * (again ? 4 : 1);
+        if (!budgetLeft(ms)) break;
         if (opts_.onNotice)
             opts_.onNotice("provider error (" + r.error.substr(0, 120) + "); recovering, retry in " +
                            std::to_string(ms / 1000) + "s");
@@ -706,6 +710,7 @@ Result<ChatResponse> Agent::requestOnce() {
         r = send();
     }
     stats_.genMs += nowMs() - t0;
+    if (!r.ok && !budgetLeft() && r.error != "cancelled") r.error += " (request time budget spent; not retrying further)";
     if (!r.ok) return r;
     lastEstimate_ = estimateContext();
     if (!usageSeen) recordResponse(r.value, 0, used);
@@ -983,43 +988,151 @@ std::string Agent::turnDigest(size_t maxBytes) const {
     return workDigest(messages_, turnStart_, messages_.size(), maxBytes);
 }
 
+namespace {
+// Head + tail of text, cutting on UTF-8 boundaries. A defect usually sits in
+// the middle or end of a long write, not its first 4000 bytes.
+std::string clipMiddle(const std::string& text, size_t head, size_t tail) {
+    if (text.size() <= head + tail) return text;
+    size_t h = head, t = text.size() - tail;
+    while (h && ((unsigned char)text[h] & 0xc0) == 0x80) --h;
+    while (t < text.size() && ((unsigned char)text[t] & 0xc0) == 0x80) ++t;
+    return text.substr(0, h) + "\n[... " + std::to_string(t - h) + " bytes omitted ...]\n" + text.substr(t);
+}
+}  // namespace
+
+// Joins every call to its observed result by tool-call id, so a mutation is
+// always labelled attempted/succeeded/failed/not-run and a failure receipt
+// precedes any content. Read-tool bodies are not included (listed as reads).
 std::string workDigest(const std::vector<ChatMessage>& msgs, size_t from, size_t to, size_t maxBytes) {
     std::string d;
-    std::map<std::string, std::string> tools;
+    struct Call { std::string name, path; bool seen = false; };
+    std::map<std::string, Call> tools;
+    std::vector<std::string> order;
+    bool reads = false;
     for (size_t i = from; i < to && i < msgs.size(); ++i) {
         const auto& m = msgs[i];
         if (m.role == "user") d += "USER: " + m.content.substr(0, 3000) + "\n";
         for (const auto& tc : m.toolCalls) {
-            tools[tc.id] = tc.name;
             auto a = json::parse(tc.argsJson);
+            Call c{tc.name, a.ok ? a.value.at("path").asStr() : ""};
+            tools[tc.id] = c;
+            order.push_back(tc.id);
             if (!a.ok) continue;
             if (tc.name == "write")
-                d += "WRITE " + a.value.at("path").asStr() + ":\n" + a.value.at("content").asStr().substr(0, 4000) + "\n";
+                d += "WRITE (attempted) " + c.path + " [" + std::to_string(a.value.at("content").asStr().size()) + " bytes]:\n" +
+                     clipMiddle(a.value.at("content").asStr(), 2800, 1200) + "\n";
             else if (tc.name == "edit") {
-                d += "EDIT " + a.value.at("path").asStr() + ":\n";
+                d += "EDIT (attempted) " + c.path + ":\n";
                 json::Array edits = a.value.has("edits") ? a.value.at("edits").asArr() : json::Array{a.value};
                 for (const auto& e : edits)
-                    d += "- " + e.at("old_text").asStr().substr(0, 800) + "\n+ " + e.at("new_text").asStr().substr(0, 1500) + "\n";
+                    d += "- " + e.at("old_text").asStr().substr(0, 800) + "\n+ " + clipMiddle(e.at("new_text").asStr(), 1000, 500) + "\n";
             } else if (tc.name == "bash")
                 d += "$ " + a.value.at("command").asStr().substr(0, 300) + "\n";
+            else if (tc.name == "read") reads = true;
         }
-        if (m.role == "tool" && (tools[m.toolCallId] == "bash" || startsWith(m.content, "[exit:"))) {
-            // Native bash places its exit status before stdout/stderr. Keep
-            // the observed verification details too, not only that header.
-            std::string output = m.content;
-            if (output.size() > 2000) {
-                size_t head = 600, tail = output.size() - 1400;
-                while (head && ((unsigned char)output[head] & 0xc0) == 0x80) --head;
-                while (tail < output.size() && ((unsigned char)output[tail] & 0xc0) == 0x80) ++tail;
-                output = output.substr(0, head) + "\n[... command output omitted ...]\n" + output.substr(tail);
+        if (m.role == "tool") {
+            auto it = tools.find(m.toolCallId);
+            const std::string name = it == tools.end() ? "" : it->second.name;
+            if (it != tools.end()) it->second.seen = true;
+            if (name == "write" || name == "edit") {
+                bool failed = startsWith(m.content, "TOOL FAILED:");
+                std::string first = m.content.substr(0, m.content.find('\n'));
+                d += std::string("  -> ") + (failed ? "FAILED, NOT APPLIED " : "succeeded ") + name + " " + it->second.path + ": " +
+                     (failed ? m.content.substr(0, 600) : first.substr(0, 160)) + "\n";
+            } else if (name == "bash" || startsWith(m.content, "[exit:")) {
+                // Native bash places its exit status before stdout/stderr. Keep
+                // the observed verification details too, not only that header.
+                std::string output = m.content;
+                if (output.size() > 2000) {
+                    size_t head = 600, tail = output.size() - 1400;
+                    while (head && ((unsigned char)output[head] & 0xc0) == 0x80) --head;
+                    while (tail < output.size() && ((unsigned char)output[tail] & 0xc0) == 0x80) ++tail;
+                    output = output.substr(0, head) + "\n[... command output omitted ...]\n" + output.substr(tail);
+                }
+                d += "  -> " + output + "\n";
             }
-            d += "  -> " + output + "\n";
         }
         if (m.role == "assistant" && !m.content.empty() && m.toolCalls.empty())
             d += "ASSISTANT: " + m.content.substr(0, 3000) + "\n";
     }
+    // A call with no recorded result was interrupted or never run: its
+    // content above is intent, not a delivered change.
+    for (const auto& id : order) {
+        const auto& c = tools[id];
+        if (!c.seen && (c.name == "write" || c.name == "edit"))
+            d += "  -> NO RESULT RECORDED (interrupted or not run): " + c.name + " " + c.path + " was NOT confirmed applied\n";
+    }
+    if (reads) d += "[evidence note: read-tool contents are not included in this digest]\n";
     if (d.size() > maxBytes) d = d.substr(0, maxBytes / 3) + "\n[...]\n" + d.substr(d.size() - maxBytes * 2 / 3);
     return d;
+}
+
+bool isReviewApproval(const std::string& reply) {
+    std::string t = toLower(trim(reply));
+    while (!t.empty() && (t.back() == '.' || t.back() == '!' || t.back() == '*' || t.back() == '`' || t.back() == '_'))
+        t.pop_back();
+    size_t b = 0;
+    while (b < t.size() && (t[b] == '*' || t[b] == '`' || t[b] == '_')) ++b;
+    return t.substr(b) == "lgtm";
+}
+
+ReviewVerdict reviewQuorum(int answered, int objections) {
+    if (answered <= 0) return ReviewVerdict::Unavailable;
+    return objections * 2 >= answered ? ReviewVerdict::Rejected : ReviewVerdict::Approved;
+}
+
+bool isVerificationCommand(const std::string& cmd) {
+    // Segment on shell separators (quote-unaware on purpose: over-splitting
+    // only ever adds segments to inspect, and every segment is judged alone).
+    static const std::set<std::string> kInert = {
+        ":", "true", "false", "pwd", "echo", "printf", "ls", "ll", "cat", "head", "tail", "wc", "stat", "file",
+        "find", "fd", "tree", "grep", "egrep", "fgrep", "rg", "which", "type", "command", "env", "printenv", "id",
+        "whoami", "uname", "date", "hostname", "basename", "dirname", "realpath", "readlink", "du", "df", "sleep",
+        "cd", "pushd", "popd", "export", "set", "unset", "alias", "git", "less", "more", "sort", "uniq", "cut",
+        "tr", "nl", "column", "diff", "cmp", "ps", "pgrep", "jobs", "wait", "history", "clear", "tput", "xargs",
+        // pure mutators: changing files is not checking them
+        "cp", "mv", "rm", "rmdir", "touch", "mkdir", "chmod", "chown", "ln", "tee", "truncate", "install", "patch",
+        "dd", "rsync", "tar", "unzip", "zip", "gzip", "gunzip", "sed", "awk", "perl"};
+    std::string seg;
+    std::vector<std::string> segs;
+    for (size_t i = 0; i <= cmd.size(); ++i) {
+        char c = i < cmd.size() ? cmd[i] : '\n';
+        if (c == ';' || c == '\n' || c == '|' || c == '&' || c == '(' || c == ')' || c == '{' || c == '}') {
+            if (!trim(seg).empty()) segs.push_back(seg);
+            seg.clear();
+        } else seg += c;
+    }
+    for (const auto& s : segs) {
+        std::vector<std::string> w;
+        std::string cur;
+        for (char c : s + " ") {
+            if (c == ' ' || c == '\t') { if (!cur.empty()) w.push_back(cur); cur.clear(); } else cur += c;
+        }
+        size_t k = 0;
+        // Wrappers and leading VAR=value assignments do not change what runs.
+        while (k < w.size()) {
+            const std::string& x = w[k];
+            bool assign = x.find('=') != std::string::npos && x.find('=') > 0 &&
+                          x.find_first_of("/\"'$") > x.find('=') && isalpha((unsigned char)x[0]);
+            if (assign || x == "timeout" || x == "time" || x == "nice" || x == "nohup" || x == "exec") {
+                ++k;
+                if (x == "timeout" && k < w.size() && isdigit((unsigned char)w[k][0])) ++k;
+                continue;
+            }
+            break;
+        }
+        if (k >= w.size()) continue;
+        std::string bin = w[k];
+        size_t slash = bin.rfind('/');
+        if (slash != std::string::npos) bin = bin.substr(slash + 1);
+        if (kInert.count(bin)) {
+            // xargs runs whatever follows it: judge that command instead.
+            if (bin == "xargs" && k + 1 < w.size() && !kInert.count(w[k + 1])) return true;
+            continue;
+        }
+        return true;
+    }
+    return false;
 }
 
 std::map<std::string, double> Agent::ask(const json::Value& state, const std::vector<Question>& qs,
@@ -1149,7 +1262,8 @@ std::string Agent::distill(const std::string& output) {
 
 // The council: each reviewer returns LGTM or concrete defects; a majority of
 // objections sends the findings back to the working model once per turn.
-std::string Agent::councilReview() {
+std::string Agent::councilReview(ReviewVerdict* verdict) {
+    *verdict = ReviewVerdict::Cancelled;
     if (opts_.cancel && opts_.cancel->load()) return "";
     std::vector<ResolvedModel> council = opts_.reviewers;
     if (council.empty()) council.push_back(opts_.fast.empty() ? opts_.model : opts_.fast[0]);
@@ -1224,8 +1338,7 @@ std::string Agent::councilReview() {
             continue;
         }
         ++answered;
-        std::string lt = toLower(t);
-        if (startsWith(lt, "lgtm") && lt.size() < 48) continue;  // "LGTM." / "LGTM - looks fine"
+        if (isReviewApproval(t)) continue;  // exactly LGTM; any caveat is an objection
         ++objections;
         findings += (council.size() > 1 ? "(" + council[i].spec + ")\n" : "") + t.substr(0, 3000) + "\n";
     }
@@ -1233,7 +1346,13 @@ std::string Agent::councilReview() {
     if (opts_.onNotice)
         opts_.onNotice("review: " + std::to_string(answered - objections) + "/" + std::to_string(answered) + " approve" +
                        (silent.empty() ? "" : "; no verdict: " + silent));
-    if (answered == 0 || objections * 2 <= answered) return "";
+    *verdict = reviewQuorum(answered, objections);
+    if (*verdict == ReviewVerdict::Unavailable) {
+        turnIncomplete_ = "review unavailable (" + silent + "): the change was not independently reviewed";
+        if (opts_.onNotice) opts_.onNotice("review unavailable: finishing WITHOUT independent review");
+        return "";
+    }
+    if (*verdict == ReviewVerdict::Approved) return "";
     return "[overseer review] The review council found problems. Fix what is valid (briefly say why if "
            "you reject an item), re-verify, then finish:\n" + findings;
 }
@@ -1244,8 +1363,13 @@ std::string Agent::councilReview() {
 std::string Agent::stopGate(const std::string& text) {
     if (opts_.cancel && opts_.cancel->load()) return "";
     bool goalMode = goalStatus_ == GoalStatus::Active;
-    if (++turnGates_ > (goalMode ? 8 : 4)) return "";
     bool changed = opts_.tools && !opts_.tools->changedFiles.empty();
+    if (++turnGates_ > (goalMode ? 8 : 4)) {
+        // A finite retry limit keeps the turn bounded; it must not read as a pass.
+        if (changed && (unverified_ || ((opts_.review || goalMode) && !reviewed_)))
+            turnIncomplete_ = "completion gate limit reached with verification or review unresolved";
+        return "";
+    }
     bool prefilter = !goalMode && taskPolicy_.scale < TaskScale::Complex &&
                      opts_.review && changed && !reviewed_ && reviewPasses_ < 2;
     std::map<std::string, double> assessment;
@@ -1315,14 +1439,17 @@ std::string Agent::stopGate(const std::string& text) {
         verifyNudged_ = true;
         ++stats_.nudges;
         if (opts_.onNotice) opts_.onNotice("overseer: asking for verification of changed files");
-        return "[overseer] Files changed since the last command you ran. Verify now (build, test, run or "
+        return "[overseer] Files changed since your last verification (inspection commands like ls, cat, pwd do not count). Verify now (build, test, run or "
                "render), fix what fails, then finish. If verification is impossible, say exactly why.";
     }
     if (opts_.tools && !opts_.tools->changedFiles.empty())
         for (const auto& hook : opts_.stopHooks) {
             auto passed = hookPassedRevision_.find(hook);
             if (passed != hookPassedRevision_.end() && passed->second == workRevision_) continue;
-            if (hookNagged_[hook] >= 3) continue;  // re-run after each fix; give up after three nags
+            if (hookNagged_[hook] >= 3) {  // re-run after each fix; stop nagging after three
+                turnIncomplete_ = "required stop hook still failing: " + hook;
+                continue;
+            }
             ToolResult h = runHook(*opts_.tools, hook);
             if (h.ok) { hookPassedRevision_[hook] = workRevision_; continue; }
             ++hookNagged_[hook];
@@ -1358,9 +1485,14 @@ std::string Agent::stopGate(const std::string& text) {
                 return "";
             }
         }
-        reviewed_ = true;
         ++reviewPasses_;
-        return councilReview();
+        ReviewVerdict verdict = ReviewVerdict::Cancelled;
+        std::string follow = councilReview(&verdict);
+        // Only a real verdict counts as reviewed. Unavailable/cancelled leave
+        // the change unreviewed (turnIncomplete_ records why); the pass budget
+        // above still bounds how often a review is attempted.
+        if (verdict == ReviewVerdict::Approved || verdict == ReviewVerdict::Rejected) reviewed_ = true;
+        return follow;
     }
     return "";
 }
@@ -1392,7 +1524,8 @@ std::string Agent::makeBrief(const std::string& request, std::vector<ChatRespons
                              std::atomic<bool>* cancel, ResolvedModel* usedModel) {
     ResolvedModel m = opts_.fast.empty() ? opts_.model : opts_.fast[0];
     if (opts_.adaptiveModel && opts_.thinking == "adaptive" && !opts_.fast.empty() &&
-        !brainPreferFast(opts_.model.provider.name, m.provider.name))
+        !brainPreferFast(brainRouteKey(opts_.model.provider.name, opts_.model.model, opts_.model.routing),
+                         brainRouteKey(m.provider.name, m.model, m.routing)))
         m = opts_.model;
     // The worker returns its actual route so deferred usage and the notice
     // cannot be attributed to a configured fast role that it did not use.
@@ -2068,6 +2201,7 @@ std::string Agent::runDoublePass() {
 std::string Agent::runTurn(const std::string& userText) {
     goalYielded_ = false;
     turnStopReason_.clear();
+    turnIncomplete_.clear();
     turnMadeProgress_ = false;
     if (goalStatus_ != GoalStatus::Active) {
         if (originalRequest_.empty()) originalRequest_ = userText.substr(0, 65536);
@@ -2105,7 +2239,13 @@ std::string Agent::runTurn(const std::string& userText) {
 
     std::string reason = error == "cancelled" ? "cancelled" :
         goalYielded_ ? "yielded" : !turnStopReason_.empty() ? turnStopReason_ : outcomeReason(error);
-    recordOutcome("turn", reason, error);
+    if (error.empty() && !turnIncomplete_.empty() && reason != "yielded") {
+        // The turn ended inside its finite retry limits with a required check
+        // unresolved. Say so, in the UI and the session log, instead of
+        // letting an exhausted check look like a pass.
+        if (opts_.onNotice) opts_.onNotice("INCOMPLETE: " + turnIncomplete_);
+        recordOutcome("turn", "incomplete", turnIncomplete_);
+    } else recordOutcome("turn", reason, error);
     return persistenceError_.empty() ? error : "session persistence failed: " + persistenceError_;
 }
 
@@ -2140,7 +2280,9 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
     taskPolicy_ = taskPolicy(policyRequest_, taskObserved_);
     if (!continuation && opts_.adaptiveModel && opts_.thinking == "adaptive" &&
         taskPolicy_.fastModel && !opts_.fast.empty()) {
-        fastPreferred_ = brainPreferFast(opts_.model.provider.name, opts_.fast[0].provider.name);
+        fastPreferred_ = brainPreferFast(
+            brainRouteKey(opts_.model.provider.name, opts_.model.model, opts_.model.routing),
+            brainRouteKey(opts_.fast[0].provider.name, opts_.fast[0].model, opts_.fast[0].routing));
         if (!fastPreferred_ && opts_.onNotice)
             opts_.onNotice("execution policy: main route preferred by observed provider health/latency");
     }
@@ -2333,7 +2475,13 @@ std::string Agent::runTurnImpl(const std::string& userText, bool continuation) {
                 observation.find("\nFAIL ") != std::string::npos || observation.find("\nFAILED (") != std::string::npos ||
                 observation.find("\nok: False") != std::string::npos || startsWith(observation, "ok: False"));
             batchFailed = batchFailed || !tr.ok || explicitFailure;
-            if (tc.name == "bash" && tr.ok && !explicitFailure) unverified_ = false;
+            if (tc.name == "bash" && tr.ok && !explicitFailure) {
+                // A successful command is not a verification: pwd/true/ls must
+                // not clear the flag a mutation raised. Only a build, test, run
+                // or probe-style command does; a later mutation re-raises it.
+                auto bashArgs = json::parse(tc.argsJson);
+                if (bashArgs.ok && isVerificationCommand(bashArgs.value.at("command").asStr())) unverified_ = false;
+            }
             if (tr.ok && !explicitFailure &&
                 ((tc.name != "write" && tc.name != "edit") || tr.changed) &&
                 (observation.size() >= 24 || tr.changed || tc.name == "bash")) {
@@ -2491,7 +2639,7 @@ std::string Agent::runGoal(const std::string& goal, int maxCycles) {
     if (goal.size() > 65536) return "goal exceeds 64 KiB limit";
     if (maxCycles < 1) return "goal cycle limit must be positive";
     goal_ = goal;
-    deliverableChecked_ = false;
+    deliverableNags_ = 0;
     unverified_ = false;
     if (opts_.tools) {
         opts_.tools->changedFiles.clear();
@@ -2516,6 +2664,7 @@ std::string Agent::resumeGoal(const std::string& followup, int maxCycles) {
     if (maxCycles < 1) return "goal cycle limit must be positive";
     if (followup.size() > 16384) return "goal follow-up exceeds 16 KiB limit";
     goalStatus_ = GoalStatus::Active;
+    deliverableNags_ = 0;
     if (!trim(followup).empty()) {
         latestRequest_ = followup;
         // An explicit change of direction needs work, even if an earlier
@@ -2623,14 +2772,17 @@ std::string Agent::continueGoal(int maxCycles) {
         if (!persistenceError_.empty()) return finishGoal("session persistence failed: " + persistenceError_);
         if (goalYield_ && goalYield_()) return finishGoal("", false, "yielded");
         bool hookFailed = false;
-        if (!deliverableChecked_) {
-            // Checked once per goal. Re-walking the workspace (up to 20k entries)
-            // on every later cycle bought nothing: a gap already flips the flag,
-            // and a pass is not invalidated by the agent's later edits — the
-            // evidence auditor re-checks the goal itself.
-            deliverableChecked_ = true;
+        {
+            // Rechecked at every certification attempt: the requirement is
+            // derived from the goal text and the exact files are re-probed, so a
+            // deliverable that is missing, deleted or corrupted after an earlier
+            // pass can never be certified by a model verdict alone. If it stays
+            // missing after two corrections the goal pauses, explicitly blocked.
             const std::string gap = missingDeliverables(goal_, opts_.tools ? opts_.tools->workspace : "");
             if (!gap.empty()) {
+                if (++deliverableNags_ > 2)
+                    return finishGoal("goal paused: a required deliverable is still missing after two corrections. " + gap +
+                                      " Produce it, or tell me why it is impossible, then resume.", false, "deliverable_missing");
                 goalPhase_ = "work";
                 goalNext_ = continuation() + "\n[goal audit] " + gap + "\nProduce it, or say exactly why that format is impossible, then verify the file itself (open/probe it).";
                 saveStats();

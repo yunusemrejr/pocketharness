@@ -258,6 +258,39 @@ TEST(process_Session_Exit_Stops_Background_Groups) {
     return "";
 }
 
+// A retired owned group whose number was reused by an unrelated group must
+// receive no signal at shutdown; a still-owned group is still stopped.
+TEST(process_Shutdown_Never_Signals_A_Recycled_Group_Number) {
+    pid_t other = fork();
+    CHECK(other >= 0);
+    if (other == 0) {
+        setpgid(0, 0);
+        execl("/bin/sleep", "sleep", "30", (char*)nullptr);
+        _exit(127);
+    }
+    setpgid(other, other);
+    uint64_t start = processStartTime(other);
+    CHECK(start > 0);
+    // Simulates our retired group N: recorded with a different leader start
+    // time than the unrelated process that now owns number N.
+    processTestTrackGroup(other, start - 1);
+    killSessionProcesses(300);
+    usleep(100000);
+    CHECK(kill(other, 0) == 0);  // untouched, and still our child (not reaped)
+    // The same group registered with its true identity IS stopped.
+    processTestTrackGroup(other, start);
+    killSessionProcesses(300);
+    int status = 0;
+    bool reaped = false;
+    for (int i = 0; i < 80 && !reaped; ++i) {
+        reaped = waitpid(other, &status, WNOHANG) == other;
+        if (!reaped) usleep(25000);
+    }
+    CHECK(reaped && WIFSIGNALED(status));
+    CHECK(processStartTime(-1) == 0 && processStartTime(0) == 0);
+    return "";
+}
+
 TEST(process_Disk_Guard_Stops_Runaway_Writer) {
     std::string dir = makeTempDir("pocket-disk");
     CHECK(!dir.empty());

@@ -79,7 +79,17 @@ struct ChildSpec {
     // Trusted harness networking: minimal Landlock/seccomp profile instead of
     // the full tool profile (system RO + staging RW, network allowed).
     bool providerCurl = false;
+    // Evidence-only child: workspace, authority roots, session scratch and
+    // /tmp are all read-only at the kernel level, so no command, allowlisted
+    // or not, can write there. Refuses to run without Landlock (fail closed).
+    bool readOnly = false;
 };
+// Test seam: make landlock_create_ruleset fail with this errno (0 = off).
+void sandboxTestInjectLandlockErrno(int err);
+// PATH for read-only children: drops entries under a root the child could
+// otherwise have written (session bin, workspace, write roots), so a planted
+// binary can never shadow a trusted evidence tool.
+std::string readOnlyChildPath(const std::string& path, const std::vector<std::string>& writableRoots);
 void childEnterSandbox(const ChildSpec& spec);
 
 // Build the sanitized child environment (complete "K=V" list).

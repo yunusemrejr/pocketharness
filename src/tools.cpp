@@ -438,7 +438,8 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
     cs.auth = env.auth;  // read-only paths; the lambda below copies the pointer
     cs.workspace = env.workspace;
     cs.sessionTmp = env.sessionTmp;
-    cs.allowNet = env.allowNet;
+    cs.allowNet = env.allowNet && !env.readOnly;  // evidence passes read local files only
+    cs.readOnly = env.readOnly;
     cs.unsafe = env.unsafe;
     cs.providerCurl = false;
 
@@ -461,6 +462,12 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
             std::erase_if(o.env, [&](const std::string& e) { return startsWith(e, key); });
             o.env.push_back(kv);
         }
+        // A binary planted in a writable dir (session bin, workspace) must
+        // not shadow the trusted evidence tools.
+        std::vector<std::string> writable = {env.sessionTmp, env.workspace};
+        if (env.auth) writable.insert(writable.end(), env.auth->writeRoots.begin(), env.auth->writeRoots.end());
+        for (auto& e : o.env)
+            if (startsWith(e, "PATH=")) e = "PATH=" + readOnlyChildPath(e.substr(5), writable);
     }
     o.workdir = env.workspace;
     o.timeoutMs = timeoutSec * 1000L;

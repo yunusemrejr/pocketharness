@@ -113,7 +113,16 @@ TEST(brain_Implicit_Fast_Route_Avoids_Well_Observed_Unhealthy_Or_Slow_Providers)
     CHECK(!brainPreferFast("main", "slow"));
     CHECK(brainPreferFast("main", "fast"));
     CHECK(brainPreferFast("unknown", "slow")); // no main latency to compare
-    CHECK(brainPreferFast("unhealthy", "unhealthy")); // provider scores cannot distinguish models
+    CHECK(brainPreferFast("unhealthy", "unhealthy")); // the very same route is never compared with itself
+    // Two models behind one provider/gateway are judged separately.
+    std::string slowModel = brainRouteKey("gateway", "fast-model"), mainModel = brainRouteKey("gateway", "main-model");
+    for (int i = 0; i < 8; ++i) {
+        brainNoteHealth(mainModel, true, 1000);
+        brainNoteHealth(slowModel, true, 9000);
+    }
+    CHECK(!brainPreferFast(mainModel, slowModel));
+    CHECK(brainPreferFast(mainModel, brainRouteKey("gateway", "untried-model")));  // sparse data stays eligible
+    CHECK(brainRouteKey("gateway", "m", "anthropic") != brainRouteKey("gateway", "m"));  // explicit routing is its own route
     rmRf(home);
     return "";
 }

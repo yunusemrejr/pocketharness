@@ -3007,6 +3007,35 @@ TEST(agent_Provider_Error_Recovers_On_Same_Model) {
     return "";
 }
 
+TEST(agent_Request_Budget_Bounds_Escalation_Fallback_And_Recovery) {
+    AgentOpts ao;
+    ao.model = resolveModel(defaultConfig(), "glm").value;
+    ao.fallback = {resolveModel(defaultConfig(), "deepseek").value};
+    ao.recoverDelayMs = 1;
+    int calls = 0;
+    bool sawDeadline = true;
+    ao.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ++calls;
+        sawDeadline = sawDeadline && req.deadlineAtMs > 0;  // every layer sees the one shared deadline
+        return Result<ChatResponse>::Err("Provider returned error");
+    };
+    // A spent budget stops fallback and same-model recovery after the first attempt.
+    ao.requestBudgetMs = 1500;  // below the 2 s attempt margin: nothing further may start
+    Agent spent(ao);
+    std::string err = spent.runTurn("hi");
+    CHECK(err.find("request time budget spent") != std::string::npos);
+    CHECK_EQ(calls, 1);
+    // With ample budget the same outage still gets the existing bounded
+    // escalation: fallback once, then two recoveries.
+    calls = 0;
+    ao.requestBudgetMs = 600000;
+    Agent roomy(ao);
+    CHECK(!roomy.runTurn("hi").empty());
+    CHECK_EQ(calls, 4);
+    CHECK(sawDeadline);
+    return "";
+}
+
 TEST(agent_Double_Evidence_Budget_Forces_Conclusion) {
     DoubleTools tools;
     CHECK(tools.ok);
@@ -3075,7 +3104,7 @@ TEST(agent_Council_Reviewers_Run_Concurrently) {
             for (int mx = maxLive.load(); cur > mx && !maxLive.compare_exchange_weak(mx, cur);) {}
             std::this_thread::sleep_for(std::chrono::milliseconds(150));
             --live;
-            response.text = ++votes == 1 ? "LGTM." : "LGTM - looks fine";
+            response.text = ++votes == 1 ? "LGTM." : "**lgtm!**";
         } else {
             tools.changedFiles.push_back("checked.cpp");
             response.text = "The requested change is implemented and checked.";
@@ -3302,11 +3331,13 @@ TEST(agent_Adaptive_Failed_Fast_Request_Escalates_To_Main) {
 TEST(agent_Adaptive_Planning_Avoids_Known_Slow_Or_Unhealthy_Advisory_Routes) {
     std::string home = makeTempDir("pocket-planning-health");
     HomeGuard isolated(home);
+    const std::string model = resolveModel(defaultConfig(), "glm").value.model;
+    auto key = [&](const char* provider) { return brainRouteKey(provider, model); };
     for (int i = 0; i < 8; ++i) {
-        brainNoteHealth("fixture-main", true, 1000);
-        brainNoteHealth("fixture-healthy", true, 400);
-        brainNoteHealth("fixture-slow", true, 9000);
-        brainNoteHealth("fixture-unhealthy", false, 100);
+        brainNoteHealth(key("fixture-main"), true, 1000);
+        brainNoteHealth(key("fixture-healthy"), true, 400);
+        brainNoteHealth(key("fixture-slow"), true, 9000);
+        brainNoteHealth(key("fixture-unhealthy"), false, 100);
     }
     struct Case { const char* provider; bool implicit; const char* thinking; bool main; };
     const Case cases[] = {
@@ -3652,7 +3683,7 @@ TEST(agent_Missing_Deliverables_Checks_Named_Format) {
     return "";
 }
 
-TEST(agent_Goal_Deliverable_Gate_Fires_Once_And_Skips_Code_Goals) {
+TEST(agent_Goal_Deliverable_Gate_Rechecks_And_Blocks_Certification) {
     std::string home = makeTempDir("pocket-dg");
     CHECK(!home.empty());
     HomeGuard hg(home);
@@ -3674,15 +3705,19 @@ TEST(agent_Goal_Deliverable_Gate_Fires_Once_And_Skips_Code_Goals) {
     opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
         ChatResponse r;
         if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish";
-        else if (req.system.find("audit") != std::string::npos) { ++audits; r.text = "CONTINUE"; }
+        else if (req.system.find("audit") != std::string::npos) { ++audits; r.text = "DONE"; }
         else r.text = "Still working on it.";
         return Result<ChatResponse>::Ok(r);
     };
-    // A real artifact request with no .mp4 present is chased once, not every cycle.
+    // The named .mp4 never appears. An auditor that answers DONE must not
+    // certify it: the native gate rechecks the file every cycle, chases it
+    // twice, then pauses the goal as explicitly blocked (never Completed).
     Agent a(opts);
-    CHECK(a.runGoal("save a short video as mp4", 3).find("goal not confirmed") != std::string::npos);
-    CHECK_EQ(gapNotices, 1);
-    CHECK_EQ(audits, 2);  // the gate spent cycle 0; the other two reached the auditor
+    std::string stopped = a.runGoal("save a short video as mp4", 5);
+    CHECK(stopped.find("required deliverable is still missing") != std::string::npos);
+    CHECK(a.goalStatus() != GoalStatus::Completed);
+    CHECK_EQ(gapNotices, 2);
+    CHECK_EQ(audits, 0);  // a model verdict was never even consulted
 
     // A code goal that merely names a format must never trigger the gate, and
     // must be certifiable immediately by the auditor.
@@ -3700,5 +3735,174 @@ TEST(agent_Goal_Deliverable_Gate_Fires_Once_And_Skips_Code_Goals) {
     CHECK_EQ(gapNotices, 0);
     CHECK_EQ(audits, 1);
     rmRf(home);
+    return "";
+}
+
+TEST(agent_Goal_Deleted_Deliverable_Is_Not_Certified) {
+    std::string home = makeTempDir("pocket-dg2");
+    HomeGuard hg(home);
+    Config cfg = defaultConfig();
+    ToolEnv env;
+    env.cfg = &cfg;
+    env.workspace = home;
+    auto id = sessionCreate();
+    CHECK(id.ok);
+    CHECK(atomicWriteFile(home + "/out.mp4", std::string("\0\0\0\x18" "ftypisom", 12) + std::string(40, 'x'), 0644).ok);
+    AgentOpts opts;
+    opts.model = resolveModel(cfg, "glm").value;
+    opts.sessionId = id.value;
+    opts.tools = &env;
+    opts.maxRounds = 2;
+    int audits = 0, turns = 0;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) r.text = "INTENT: finish";
+        else if (req.system.find("audit") != std::string::npos) { ++audits; r.text = "DONE"; }
+        else { if (++turns == 1) unlink((home + "/out.mp4").c_str()); r.text = "Rendered it."; }
+        return Result<ChatResponse>::Ok(r);
+    };
+    // The file exists at the start but is gone by the first audit.
+    Agent a(opts);
+    CHECK(!a.runGoal("render the clip as mp4", 4).empty());
+    CHECK(a.goalStatus() != GoalStatus::Completed);
+    CHECK_EQ(audits, 0);
+    rmRf(home);
+    return "";
+}
+
+TEST(agent_Verification_Command_Classifier_Separates_Inspection_From_Checks) {
+    for (const char* inert : {"pwd", "true", "echo ok", "ls -la", "cat file.py", "git status", "git diff", "pwd && true",
+                              "cd src && ls", "grep -rn foo .", "echo done > marker.txt", "cp a b", "sed -i s/a/b/ f.py",
+                              "FOO=1 true", "touch x; mkdir y", "find . -name '*.py' | wc -l", "git add -A && git commit -m x"})
+        CHECK(!isVerificationCommand(inert));
+    for (const char* check : {"make test", "pytest -q", "python3 -m unittest", "python3 solver.py", "npm test", "cargo build",
+                              "./run_tests.sh", "cd build && ctest", "timeout 30 node app.js", "ffprobe out.mp4",
+                              "g++ -o t t.cpp && ./t", "echo go; make", "FOO=1 pytest", "ls | xargs pytest", "bash check.sh"})
+        CHECK(isVerificationCommand(check));
+    return "";
+}
+
+TEST(agent_Unrelated_Success_Does_Not_Clear_Verification_And_Reedit_Invalidates) {
+    std::string ws = makeTempDir("pocket-verify");
+    auto auth = authorityInit(ws, {}, {}, false);
+    CHECK(auth.ok);
+    ToolEnv env;
+    env.workspace = ws;
+    env.auth = &auth.value;
+    env.sessionTmp = ws;
+    env.unsafe = true;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.tools = &env;
+    int verifyNudges = 0, step = 0;
+    opts.onNotice = [&](const std::string& n) { if (n.find("asking for verification") != std::string::npos) ++verifyNudges; };
+    opts.request = [&](const ChatRequest&, const ChatCallbacks&) {
+        ChatResponse r;
+        auto call = [&](const char* name, const std::string& args) {
+            r.calls.push_back({"c" + std::to_string(step), name, args});
+        };
+        switch (step++) {
+        case 0: call("write", "{\"path\":\"broken.py\",\"content\":\"def f(:\\n\"}"); break;
+        case 1: call("bash", "{\"command\":\"pwd\"}"); break;       // succeeds, verifies nothing
+        case 2: r.text = "Done."; break;                            // gate must still ask for verification
+        case 3: call("bash", "{\"command\":\"python3 broken.py\"}"); break;
+        default: r.text = "Done."; break;
+        }
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    agent.runTurn("write broken.py");
+    CHECK_EQ(verifyNudges, 1);  // pwd did not satisfy the verification gate
+    rmRf(ws);
+    return "";
+}
+
+TEST(agent_Review_Digest_Labels_Failed_And_Interrupted_Mutations) {
+    std::vector<ChatMessage> messages = {
+        {"user", "Update the config", {}, ""},
+        {"assistant", "", {{"w1", "write", "{\"path\":\"a.txt\",\"content\":\"NEW-A\"}"},
+                           {"e1", "edit", "{\"path\":\"b.txt\",\"old_text\":\"x\",\"new_text\":\"NEW-B\"}"},
+                           {"w2", "write", "{\"path\":\"c.txt\",\"content\":\"NEW-C\"}"}}, ""},
+        {"tool", "wrote a.txt", {}, "w1"},
+        {"tool", "TOOL FAILED: edit: found 0 occurrence(s), expected 1; file untouched.", {}, "e1"}};
+    auto digest = workDigest(messages, 0, messages.size(), 10000);
+    CHECK(digest.find("succeeded write a.txt") != std::string::npos);
+    CHECK(digest.find("FAILED, NOT APPLIED edit b.txt") != std::string::npos);
+    CHECK(digest.find("found 0 occurrence") != std::string::npos);
+    CHECK(digest.find("NO RESULT RECORDED") != std::string::npos);
+    CHECK(digest.find("c.txt was NOT confirmed applied") != std::string::npos);
+    // A defect past the old 4000-byte cut stays visible.
+    std::string big = std::string(9000, 'a') + "TAIL-DEFECT";
+    messages.push_back({"assistant", "", {{"w3", "write", "{\"path\":\"big.txt\",\"content\":\"" + big + "\"}"}}, ""});
+    messages.push_back({"tool", "wrote big.txt", {}, "w3"});
+    digest = workDigest(messages, 0, messages.size(), 20000);
+    CHECK(digest.find("TAIL-DEFECT") != std::string::npos);
+    CHECK(digest.find("bytes omitted") != std::string::npos);
+    return "";
+}
+
+TEST(agent_Review_Approval_Parse_And_Quorum_Are_Explicit) {
+    CHECK(isReviewApproval("LGTM") && isReviewApproval(" lgtm. ") && isReviewApproval("**LGTM**") && isReviewApproval("LGTM!"));
+    CHECK(!isReviewApproval("LGTM except data loss"));
+    CHECK(!isReviewApproval("LGTM - but the parser drops the last row"));
+    CHECK(!isReviewApproval("") && !isReviewApproval("1. LGTM"));
+    CHECK(reviewQuorum(0, 0) == ReviewVerdict::Unavailable);
+    CHECK(reviewQuorum(1, 0) == ReviewVerdict::Approved && reviewQuorum(1, 1) == ReviewVerdict::Rejected);
+    CHECK(reviewQuorum(2, 1) == ReviewVerdict::Rejected);  // a tie rejects
+    CHECK(reviewQuorum(3, 1) == ReviewVerdict::Approved && reviewQuorum(3, 2) == ReviewVerdict::Rejected);
+    return "";
+}
+
+TEST(agent_Unavailable_Council_Is_Incomplete_Not_Approved) {
+    ToolEnv tools;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.reviewers = {opts.model, opts.model};
+    opts.tools = &tools;
+    opts.review = true;
+    std::vector<std::string> notices;
+    opts.onNotice = [&](const std::string& n) { notices.push_back(n); };
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        if (req.system.find("strict senior reviewer") != std::string::npos)
+            return Result<ChatResponse>::Err("provider down");
+        tools.changedFiles.push_back("checked.cpp");
+        ChatResponse r;
+        r.text = "The change is implemented.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Implement and verify the migration across production modules").empty());
+    bool incomplete = false, noReview = false;
+    for (const auto& n : notices) {
+        incomplete = incomplete || n.find("INCOMPLETE: review unavailable") != std::string::npos;
+        noReview = noReview || n.find("WITHOUT independent review") != std::string::npos;
+    }
+    CHECK(incomplete && noReview);
+    return "";
+}
+
+TEST(agent_Caveated_Lgtm_Is_An_Objection) {
+    ToolEnv tools;
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.reviewers = {opts.model};
+    opts.tools = &tools;
+    opts.review = true;
+    int reviews = 0;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("strict senior reviewer") != std::string::npos) {
+            r.text = ++reviews == 1 ? "LGTM except data loss on empty input" : "LGTM";
+        } else {
+            tools.changedFiles.push_back("checked.cpp");
+            r.text = "The change is implemented.";
+        }
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("Implement and verify the migration across production modules").empty());
+    bool relayed = false;
+    for (const auto& m : agent.messages()) relayed = relayed || m.content.find("review council found problems") != std::string::npos;
+    CHECK(relayed);
     return "";
 }

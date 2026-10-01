@@ -1072,8 +1072,16 @@ Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks
         return r;
     };
 
+    // True when a retry after `ms` of backoff still leaves time for an attempt.
+    auto fits = [&](long ms) { return req.deadlineAtMs <= 0 || nowMs() + ms + 2000 < req.deadlineAtMs; };
     for (int attempt = 0;; ++attempt) {
         if (cb.cancel && cb.cancel->load()) return Result<ChatResponse>::Err("cancelled");
+        long maxSec = 600;
+        if (req.deadlineAtMs > 0) {
+            long remaining = (long)(req.deadlineAtMs - nowMs());
+            if (remaining < 2000) return Result<ChatResponse>::Err("request deadline exceeded");
+            maxSec = std::min(600L, remaining / 1000);
+        }
         // All staging lives in a per-attempt parent-only dir: the confined
         // provider curl is granted exactly this dir, nothing else. (The
         // child-visible session tmp is deliberately unreachable to it.)
@@ -1120,7 +1128,7 @@ Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks
                   "--connect-timeout",
                   "25",
                   "--max-time",
-                  "600",
+                  std::to_string(maxSec),
                   "-X",
                   "POST",
                   "-H",
@@ -1147,7 +1155,7 @@ Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks
             o.argv.insert(o.argv.end() - 1, "anthropic-version: 2023-06-01");
         }
         lockTransport(o.argv, url);
-        o.timeoutMs = 620000;
+        o.timeoutMs = (maxSec + 20) * 1000;
         o.outLimit = 8 << 20;
         o.stopOnLimit = true;
         o.cancel = cb.cancel;
@@ -1278,8 +1286,9 @@ Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks
                             http != 422 && isTransientProviderMessage(failMsg.substr(std::min<size_t>(8, failMsg.size()))));
             bool retry = attempt + 1 < kChatMaxAttempts &&
                          (shouldRetryRequest(http, transportFailed, timedOut, emitted) || (gateway && !emitted && !timedOut));
-            if (!retry) return Result<ChatResponse>::Err(failMsg);
             long ms = std::max(retryDelayMs(attempt + 1), retryAfter);
+            if (retry && !fits(ms)) failMsg += " (request deadline reached; not retrying)";
+            if (!retry || !fits(ms)) return Result<ChatResponse>::Err(failMsg);
             if (cb.onNotice)
                 cb.onNotice("request failed (" + failMsg.substr(0, 120) + "); retry " +
                             std::to_string(attempt + 2) + "/" +
@@ -1296,6 +1305,7 @@ Result<ChatResponse> chatRequestOnce(const ChatRequest& req, const ChatCallbacks
         auto retryInBand = [&](const std::string& err) {
             if (emitted || attempt + 1 >= kChatMaxAttempts || !isTransientProviderMessage(err)) return false;
             long ms = retryDelayMs(attempt + 1);
+            if (!fits(ms)) return false;
             if (cb.onNotice)
                 cb.onNotice("provider error (" + err.substr(0, 120) + "); retry " + std::to_string(attempt + 2) +
                             "/" + std::to_string(kChatMaxAttempts) + " in " + std::to_string(ms / 1000) + "s");
@@ -1354,7 +1364,7 @@ Result<ChatResponse> chatRequest(const ChatRequest& original, const ChatCallback
         auto r = chatRequestOnce(req, cb);
         bool payloadFault = !r.ok && startsWith(r.error, "HTTP 4") && !startsWith(r.error, "HTTP 429");
         if (r.ok || (!payloadFault && r.error != "cancelled"))
-            brainNoteHealth(req.model.provider.name, r.ok, (long)(nowMs() - t0));
+            brainNoteHealth(brainRouteKey(req.model.provider.name, req.model.model, req.model.routing), r.ok, (long)(nowMs() - t0));
         if (r.ok || learned >= 3) return r;
         // A stale catalog can miss that reasoning is mandatory: lower it
         // instead of learning "no_reasoning" (which means default=max effort).

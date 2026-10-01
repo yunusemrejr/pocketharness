@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.13.3
+
+Make the read-only and completion guarantees mechanically true, from an
+independent source review of 0.13.2. Every item below has a regression test.
+
+- `/double` read-only passes are enforced by the sandbox: workspace, extra
+  roots, session scratch and `/tmp` are read-only under Landlock, networking
+  is denied, PATH drops every writable directory, and the passes refuse to run
+  shell commands without Landlock. The command filter additionally rejects
+  `find -fprint0`, `fd -X`/attached `-x`/`--exec=`, `tree -o`, `file -C` and
+  git `--ext-diff`/`--textconv`/`grep -O`.
+- Landlock setup now fails closed on unexpected errors (EMFILE, ENFILE, ENOMEM
+  and the like) instead of running unconfined; only ENOSYS, EOPNOTSUPP, EPERM
+  and EACCES mean "unsupported kernel".
+- A successful shell command no longer counts as verification. Only a
+  build/test/run/probe-style command clears the unverified-change flag;
+  `pwd`, `true`, `ls`, `cat`, `echo`, git inspection and pure file mutators do
+  not, and any later edit raises it again.
+- Reviews have explicit outcomes. Only `LGTM` (optionally with emphasis or a
+  trailing `.`/`!`) approves; "LGTM except data loss" is an objection. A tie
+  between reviewers rejects. An unavailable council no longer marks the change
+  reviewed, and exhausted required checks (stop hook still failing, gate limit,
+  no reviewer) finish with an `INCOMPLETE:` notice and an `incomplete` outcome
+  in the session log instead of looking like success.
+- Reviewer and goal-audit digests join each tool call to its result: writes and
+  edits are labelled succeeded, FAILED/NOT APPLIED (with the failure receipt)
+  or NO RESULT RECORDED, and long writes keep their head and tail.
+- The goal deliverable gate rechecks the named output at every certification
+  attempt. A missing, deleted or corrupt file can no longer be certified by a
+  model verdict; after two corrections the goal pauses as `deliverable_missing`.
+- Tracked process groups record their leader's start time, and shutdown never
+  signals a group number that was recycled by an unrelated process. Retired
+  groups are also pruned a few per spawn.
+- Health is learned per route (provider, model, routing) and expires after a
+  week, so a slow fast-role model behind the same gateway is no longer hidden
+  by provider-wide statistics.
+- One request budget (30 minutes by default) now spans transport retries,
+  fast-to-main escalation, fallback and same-model recovery: each transport
+  attempt's timeout is clamped to what remains and no retry that cannot fit is
+  started.
+
 ## 0.13.2
 
 Complete automatic media workflow selection on top of the execution, quality,

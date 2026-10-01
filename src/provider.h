@@ -55,6 +55,10 @@ struct ChatRequest {
     // Stable per-PocketHarness-session tag. Sent as OpenRouter `session_id`
     // for sticky routing to the warm-cache endpoint; ignored elsewhere.
     std::string sessionTag;
+    // Absolute end-to-end deadline for this logical request (monotonic nowMs;
+    // 0 = none). Each transport attempt's timeout is clamped to what remains,
+    // and no retry is started whose backoff would cross it.
+    int64_t deadlineAtMs = 0;
 };
 
 struct ChatResponse {

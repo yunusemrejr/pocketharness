@@ -1,4 +1,5 @@
 // PocketHarness - native intelligence implementation.
+#include <ctime>
 #include "brain.h"
 
 #include <fcntl.h>
@@ -379,6 +380,20 @@ void brainNoteQuirk(const std::string& modelKey, const std::string& quirk) {
     brainSaveLocked(brain);
 }
 
+namespace {
+constexpr long kHealthStaleSec = 7 * 24 * 3600;
+long epochSec() { return (long)time(nullptr); }
+// A route seen too long ago says nothing about now: report no samples.
+long freshSamples(const json::Value& h) {
+    long at = h.at("at").asInt(0);
+    return at > 0 && epochSec() - at > kHealthStaleSec ? 0 : h.at("n").asInt(0);
+}
+}  // namespace
+
+std::string brainRouteKey(const std::string& provider, const std::string& model, const std::string& routing) {
+    return provider + ":" + model + (routing.empty() ? "" : "@" + routing);
+}
+
 void brainNoteHealth(const std::string& provider, bool ok, long ms) {
     std::lock_guard<std::mutex> lk(g_brainMu);
     BrainLock disk;
@@ -387,6 +402,10 @@ void brainNoteHealth(const std::string& provider, bool ok, long ms) {
     auto& h = brain.asObj()["health"].asObj()[provider];
     if (!h.isObj()) h = json::Object{{"ok", 1.0}, {"ms", (double)ms}, {"n", 0L}};
     auto& o = h.asObj();
+    if (freshSamples(h) == 0 && o["n"].asInt(0) > 0) {  // expired: start over rather than blend old data
+        o["ok"] = 1.0; o["ms"] = (double)ms; o["n"] = 0L;
+    }
+    o["at"] = (double)epochSec();
     o["ok"] = 0.8 * o["ok"].asNum(1) + 0.2 * (ok ? 1.0 : 0.0);
     if (ok) o["ms"] = std::round(0.8 * o["ms"].asNum((double)ms) + 0.2 * (double)ms);
     o["n"] = o["n"].asInt(0) + 1;
@@ -400,17 +419,17 @@ double brainHealth(const std::string& provider) {
 }
 
 bool brainPreferFast(const std::string& mainProvider, const std::string& fastProvider) {
-    if (mainProvider == fastProvider) return true; // health is provider-level
+    if (mainProvider == fastProvider) return true; // the very same route
     std::lock_guard<std::mutex> lk(g_brainMu);
     BrainLock disk;
     const auto brain = brainLocked(); // one coherent cross-process snapshot
     const auto& fast = brain.at("health").at(fastProvider);
     constexpr long sufficientSamples = 8;
-    if (fast.at("n").asInt(0) < sufficientSamples) return true;
+    if (freshSamples(fast) < sufficientSamples) return true;
     double fastHealth = fast.at("ok").asNum(1);
     if (fastHealth < .8) return false;
     const auto& main = brain.at("health").at(mainProvider);
-    if (main.at("n").asInt(0) < sufficientSamples || main.at("ok").asNum(1) < .8) return true;
+    if (freshSamples(main) < sufficientSamples || main.at("ok").asNum(1) < .8) return true;
     double mainMs = main.at("ms").asNum(0), fastMs = fast.at("ms").asNum(0);
     // Latency varies with prompt size. Reject only a large, well-observed
     // disadvantage; do not turn a small timing difference into a model verdict.

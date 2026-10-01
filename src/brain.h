@@ -60,15 +60,20 @@ const char* taskScaleName(TaskScale scale);
 // Learned state, persisted in stateDir()/brain.json (small, atomic writes).
 // quirks: per "provider:model" wire incompatibilities discovered from 400s
 //   (no_reasoning, no_stream_usage, max_tokens, max_completion_tokens).
-// health: per provider EWMA of request success and latency.
+// health: per route (provider:model[@routing]) EWMA of request success and
+//   latency, so two models behind one gateway are judged separately. Entries
+//   not refreshed for a week are treated as unknown (stale health expires).
 std::vector<std::string> brainQuirks(const std::string& modelKey);
 void brainNoteQuirk(const std::string& modelKey, const std::string& quirk);
-void brainNoteHealth(const std::string& provider, bool ok, long ms);
-double brainHealth(const std::string& provider);  // EWMA success, 1 when unknown
+// Health key for one route: provider, wire model and explicit routing.
+std::string brainRouteKey(const std::string& provider, const std::string& model, const std::string& routing = "");
+void brainNoteHealth(const std::string& routeKey, bool ok, long ms);
+double brainHealth(const std::string& routeKey);  // EWMA success, 1 when unknown
 // Advisory implicit routing only. A single snapshot compares sufficiently
-// observed health/latency; unknown providers and same-provider models remain
-// eligible. Never used to override a user's explicit model selection.
-bool brainPreferFast(const std::string& mainProvider, const std::string& fastProvider);
+// observed health/latency per route; unknown or stale routes remain eligible,
+// and an identical route is trivially "fast". Never used to override a user's
+// explicit model selection.
+bool brainPreferFast(const std::string& mainRoute, const std::string& fastRoute);
 std::string brainStatus();                        // human summary, one line per provider
 
 // Map a provider 400 body to a quirk to learn ("" = nothing recognizable).

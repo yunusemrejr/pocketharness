@@ -710,7 +710,10 @@ uint64_t allFsRights() {
     return m;
 }
 
+int g_injectedLandlockErrno = 0;
+
 int landlockCreate(uint64_t handled) {
+    if (g_injectedLandlockErrno) { errno = g_injectedLandlockErrno; return -1; }
     struct landlock_ruleset_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.handled_access_fs = handled;
@@ -734,8 +737,12 @@ int landlockConfine(const ChildSpec& spec, uint64_t* handledOut) {
     for (int i = 0; i < 64 && handled; ++i) {
         rsfd = landlockCreate(handled);
         if (rsfd >= 0) break;
-        if (errno == ENOSYS) return 1;  // no Landlock in this kernel
-        if (errno != EINVAL) return 1;
+        // Only recognized "feature absent" outcomes mean unsupported: no
+        // syscall, disabled at boot, or filtered by a container seccomp
+        // policy. Anything else (EMFILE, ENFILE, ENOMEM, ...) is a failure
+        // on a machine that may well support Landlock: never run unconfined.
+        if (errno == ENOSYS || errno == EOPNOTSUPP || errno == EPERM || errno == EACCES) return 1;
+        if (errno != EINVAL) return -1;
         handled &= ~(1ULL << (63 - __builtin_clzll(handled)));
     }
     if (rsfd < 0) return 1;
@@ -782,12 +789,15 @@ int landlockConfine(const ChildSpec& spec, uint64_t* handledOut) {
         if (spec.providerTmp.empty() || !allowTree(spec.providerTmp.c_str(), rw, true))
             return -1;
     } else {
-        if (!allowTree(spec.workspace.c_str(), rw, true)) return -1;
-        if (!allowTree(spec.sessionTmp.c_str(), rw, true)) return -1;
-        allowTree("/tmp", rw, false);
+        // Read-only profile: every tree the model can normally write is
+        // granted read/execute only.
+        const uint64_t work = spec.readOnly ? ro : rw;
+        if (!allowTree(spec.workspace.c_str(), work, true)) return -1;
+        if (!allowTree(spec.sessionTmp.c_str(), work, true)) return -1;
+        allowTree("/tmp", work, false);
         if (spec.auth) {
             for (const auto& r : spec.auth->readRoots) allowTree(r.c_str(), ro, false);
-            for (const auto& r : spec.auth->writeRoots) allowTree(r.c_str(), rw, false);
+            for (const auto& r : spec.auth->writeRoots) allowTree(r.c_str(), work, false);
         }
     }
     // /proc/self/fd etc. are under /proc (ro). Dynamic loader paths covered.
@@ -972,6 +982,10 @@ void childEnterSandbox(const ChildSpec& spec) {
         childWarn("Landlock setup failed; refusing to run");
         _exit(127);
     }
+    if (ll > 0 && spec.readOnly) {
+        childWarn("Landlock unavailable: read-only evidence commands need kernel confinement; refusing to run");
+        _exit(127);
+    }
     if (ll > 0) childWarn("Landlock unavailable: filesystem running without kernel confinement");
     if (!spec.allowNet) {
         int sc = seccompDenyInet();
@@ -982,6 +996,26 @@ void childEnterSandbox(const ChildSpec& spec) {
         if (sc > 0)
             childWarn("seccomp unavailable: model command runs WITHOUT network isolation");
     }
+}
+
+void sandboxTestInjectLandlockErrno(int err) { g_injectedLandlockErrno = err; }
+
+std::string readOnlyChildPath(const std::string& path, const std::vector<std::string>& writableRoots) {
+    std::string out;
+    size_t pos = 0;
+    while (pos <= path.size()) {
+        size_t c = path.find(':', pos);
+        std::string e = path.substr(pos, c == std::string::npos ? std::string::npos : c - pos);
+        pos = c == std::string::npos ? path.size() + 1 : c + 1;
+        if (e.empty() || e[0] != '/') continue;  // relative/empty entries mean the workspace
+        auto real = canonicalDir(e);
+        const std::string& at = real.ok ? real.value : e;
+        bool writable = false;
+        for (const auto& r : writableRoots)
+            if (!r.empty() && (at == r || startsWith(at, r + "/") || e == r || startsWith(e, r + "/"))) writable = true;
+        if (!writable) out += (out.empty() ? "" : ":") + e;
+    }
+    return out.empty() ? "/usr/local/bin:/usr/bin:/bin" : out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1565,11 +1599,30 @@ bool isReadOnlyBash(const std::string& cmd, std::string* why) {
         return std::find(argv.begin() + 1, argv.end(), a) != argv.end();
     };
     if (bin == "find")
-        for (const char* bad : {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprintf"})
+        for (const char* bad : {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0", "-fprintf"})
             if (hasArg(bad)) return deny("find '" + std::string(bad) + "' can execute or write; unavailable read-only");
+    // Short/long option families with attached values (-xcat, --exec=cat,
+    // -ofile) are matched by prefix, not only as separate words.
     if (bin == "fd")
-        for (const char* bad : {"-x", "--exec", "--exec-batch"})
-            if (hasArg(bad)) return deny("fd '" + std::string(bad) + "' executes commands; unavailable read-only");
+        for (size_t k = 1; k < argv.size(); ++k) {
+            const std::string& a = argv[k];
+            bool shortRun = a.size() > 1 && a[0] == '-' && a[1] != '-' &&
+                            a.find_first_of("xX") != std::string::npos;
+            if (shortRun || startsWith(a, "--exec"))
+                return deny("fd '" + a + "' executes commands; unavailable read-only");
+        }
+    if (bin == "tree")
+        for (size_t k = 1; k < argv.size(); ++k) {
+            const std::string& a = argv[k];
+            bool shortRun = a.size() > 1 && a[0] == '-' && a[1] != '-' && a.find('o') != std::string::npos;
+            if (shortRun || startsWith(a, "--output") || a == "--fromfile")
+                return deny("tree '" + a + "' can write a file; unavailable read-only");
+        }
+    if (bin == "file")
+        for (size_t k = 1; k < argv.size(); ++k)
+            if (argv[k] == "--compile" || (argv[k].size() > 1 && argv[k][0] == '-' && argv[k][1] != '-' &&
+                                            argv[k].find('C') != std::string::npos))
+                return deny("file -C writes a compiled magic file; unavailable read-only");
     if (bin == "rg")
         for (size_t k = 1; k < argv.size(); ++k)
             if (argv[k] == "--pre" || argv[k] == "--pre-glob" || startsWith(argv[k], "--pre=") ||
@@ -1584,6 +1637,10 @@ bool isReadOnlyBash(const std::string& cmd, std::string* why) {
                 return deny("git -c/--config-env can inject executable config; unavailable read-only");
             if (argv[k] == "--output" || startsWith(argv[k], "--output=") || argv[k] == "-o")
                 return deny("git --output writes files; unavailable read-only");
+            if (argv[k] == "--ext-diff" || argv[k] == "--textconv" || argv[k] == "--open-files-in-pager" ||
+                startsWith(argv[k], "--open-files-in-pager=") ||
+                (sub == "grep" && startsWith(argv[k], "-O")))
+                return deny("git '" + argv[k] + "' can run an external program; unavailable read-only");
             if (sub.empty() && !startsWith(argv[k], "-")) sub = argv[k];
         }
         if (sub.empty()) return deny("git needs an explicit read-only subcommand");

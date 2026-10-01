@@ -25,6 +25,23 @@ size_t compactCutPoint(const std::vector<ChatMessage>& msgs, size_t keepLast = 8
 // Request, changes (paths + new text), command outcomes and answers of
 // msgs[from, to), clipped to maxBytes. Also the offline compaction summary.
 std::string workDigest(const std::vector<ChatMessage>& msgs, size_t from, size_t to, size_t maxBytes);
+// True when a bash command can count as verification of changed work: it
+// must contain at least one build/test/run/probe-style segment. Inert
+// inspection (pwd, true, echo, ls, cat, git status...) and pure file mutators
+// (cp, mv, rm, touch, tee, sed -i...) never do, however successfully they
+// exit. Pure and unit-tested.
+bool isVerificationCommand(const std::string& cmd);
+// Exact approval parse: "LGTM" with optional markdown emphasis and trailing
+// . or ! only. A reply that adds anything (a caveat, a defect) is an objection.
+bool isReviewApproval(const std::string& reply);
+// Outcome of one council review. Only Approved/Rejected are verdicts; an
+// Unavailable council (every reviewer errored, timed out or was empty) must
+// never read as approval.
+enum class ReviewVerdict { Approved, Rejected, Unavailable, Cancelled };
+// Pure quorum policy: a strict majority of answered reviewers approves; a tie
+// rejects (a concrete defect report is cheap to dismiss, a missed one is not).
+// No answers = Unavailable.
+ReviewVerdict reviewQuorum(int answered, int objections);
 // A summary with tool-call markup removed; empty when little else is left
 // (the summarizer continued the transcript instead of summarizing it).
 std::string cleanSummary(const std::string& text);
@@ -123,6 +140,10 @@ struct AgentOpts {
     long briefDeadlineMs = 20000;
     // Cooldown before same-model recovery attempts (x1, then x4).
     long recoverDelayMs = 2000;
+    // End-to-end wall budget for ONE model request across every layer
+    // (transport retries, fast->main escalation, fallback, recovery). Each
+    // layer is clamped to what remains. 0 = unlimited (tests).
+    long requestBudgetMs = 1800000;
 };
 
 // Default /double deadline: generous for legitimate analyses (bounded to a
@@ -258,7 +279,7 @@ class Agent {
                                      std::vector<ChatResponse>* deferred = nullptr,
                                      std::atomic<bool>* cancel = nullptr);
     std::string stopGate(const std::string& finalText);
-    std::string councilReview();
+    std::string councilReview(ReviewVerdict* verdict);
     // With `deferred`, usage is collected there and no notice is emitted:
     // safe to run off the agent thread (it touches no stats or callbacks).
     std::string makeBrief(const std::string& request, std::vector<ChatResponse>* deferred = nullptr,
@@ -307,7 +328,7 @@ class Agent {
     std::deque<size_t> goalObservations_;  // bounded fingerprints; never a completion verdict
     long outputBoost_ = 1;  // doubled when replies hit the output cap (session-wide)
     long workspaceSequence_ = 0;
-    bool deliverableChecked_ = false;  // the native deliverable gate fires once per goal run
+    int deliverableNags_ = 0;         // corrections sent for a still-missing named output this goal run
     // Per-turn overseer state.
     size_t turnStart_ = 0;
     int turnNudges_ = 0, turnGates_ = 0;
@@ -319,6 +340,7 @@ class Agent {
     std::string lastRequestModel_;  // model changes invalidate prompt calibration
     bool fastPreferred_ = true;    // health snapshot, evaluated once per turn
     int reviewPasses_ = 0;
+    std::string turnIncomplete_;  // why this ordinary turn ended with a required check unresolved
     long workRevision_ = 0;
     std::map<std::string, long> hookPassedRevision_;
     std::vector<std::string> blind_;  // model specs that rejected image input this session

@@ -62,6 +62,12 @@ void killSessionProcesses(long graceMs = 1000);
 // when free space is below reserveBytes and still falling fast. Idempotent;
 // later calls replace the paths/reserve. reserveBytes 0 disables it.
 void startDiskWatchdog(std::vector<std::string> paths, uint64_t reserveBytes);
+// Start time (clock ticks since boot, /proc/PID/stat field 22) of a live
+// process, or 0 when unavailable. Async-signal-safe. Tracked groups record
+// their leader's start time so a recycled group number is never signalled.
+uint64_t processStartTime(pid_t pid);
+// Test seam: register a group with an explicit recorded start time.
+void processTestTrackGroup(pid_t pg, uint64_t startTime);
 // Free bytes available to unprivileged writers on path's filesystem, or -1.
 int64_t diskAvail(const std::string& path);
 

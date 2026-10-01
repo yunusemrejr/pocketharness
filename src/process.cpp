@@ -34,40 +34,65 @@ namespace {
 // being reaped on abnormal exit.
 constexpr int kGroupSlots = 1024;
 std::atomic<pid_t> g_groups[kGroupSlots];
+// Leader start time (clock ticks since boot) captured when the group was
+// registered, parallel to g_groups. A numeric pgid alone cannot say whether it
+// still names OUR group: once every member exits the kernel may reuse the
+// number for an unrelated same-user group. 0 = unknown.
+std::atomic<uint64_t> g_groupStart[kGroupSlots];
 
 bool groupAlive(pid_t pg) { return kill(-pg, 0) == 0 || errno != ESRCH; }
 
-void trackGroup(pid_t pg) {
+// A group is "ours" unless its leader process exists with a DIFFERENT start
+// time than the one recorded at registration (the number was recycled). An
+// absent leader (reaped while members remain) is the normal background-server
+// case and stays ours. Async-signal-safe: raw syscalls and a stack buffer.
+bool groupStillOurs(int slot, pid_t pg) {
+    uint64_t was = g_groupStart[slot].load();
+    if (was == 0) return true;
+    uint64_t now = processStartTime(pg);
+    return now == 0 || now == was;
+}
+
+void trackGroup(pid_t pg, uint64_t startTime) {
     // Claim a free slot with no syscalls first. Pruning costs one kill(2) per
     // occupied slot, and doing that on every spawn put ~512 syscalls between
-    // each tool launch and its first poll.
+    // each tool launch and its first poll. A few rotating slots are pruned
+    // per spawn instead, so retired groups do not linger until the table fills.
+    static std::atomic<unsigned> cursor{0};
+    for (int i = 0; i < 8; ++i) {
+        unsigned at = cursor.fetch_add(1) % kGroupSlots;
+        pid_t old = g_groups[at].load();
+        if (old > 0 && (!groupAlive(old) || !groupStillOurs((int)at, old))) {
+            if (g_groups[at].compare_exchange_strong(old, 0)) g_groupStart[at] = 0;
+        }
+    }
     auto claim = [&] {
-        for (auto& slot : g_groups) {
+        for (int i = 0; i < kGroupSlots; ++i) {
             pid_t empty = 0;
-            if (slot.compare_exchange_strong(empty, pg)) return true;
+            if (g_groups[i].compare_exchange_strong(empty, pg)) { g_groupStart[i] = startTime; return true; }
         }
         return false;
     };
     if (claim()) return;
     // Table full: reclaim slots whose group is gone (pgids get reused).
-    for (auto& slot : g_groups) {
-        pid_t old = slot.load();
-        if (old > 0 && !groupAlive(old)) slot.compare_exchange_strong(old, 0);
+    for (int i = 0; i < kGroupSlots; ++i) {
+        pid_t old = g_groups[i].load();
+        if (old > 0 && (!groupAlive(old) || !groupStillOurs(i, old))) g_groups[i].compare_exchange_strong(old, 0);
     }
     claim();  // still full only with 256 genuinely live groups
 }
 
 void untrackGroup(pid_t pg) {
-    for (auto& slot : g_groups) {
+    for (int i = 0; i < kGroupSlots; ++i) {
         pid_t cur = pg;
-        if (slot.compare_exchange_strong(cur, 0)) return;
+        if (g_groups[i].compare_exchange_strong(cur, 0)) { g_groupStart[i] = 0; return; }
     }
 }
 
 bool anyGroupAlive() {
-    for (auto& slot : g_groups) {
-        pid_t pg = slot.load();
-        if (pg > 0 && groupAlive(pg)) return true;
+    for (int i = 0; i < kGroupSlots; ++i) {
+        pid_t pg = g_groups[i].load();
+        if (pg > 0 && groupAlive(pg) && groupStillOurs(i, pg)) return true;
     }
     return false;
 }
@@ -129,6 +154,42 @@ void watchdogLoop() {
 }
 }  // namespace
 
+uint64_t processStartTime(pid_t pid) {
+    if (pid <= 0) return 0;
+    char path[40] = "/proc/";
+    size_t n = 6;
+    char digits[12];
+    int d = 0;
+    for (long v = pid; v > 0 && d < 11; v /= 10) digits[d++] = (char)('0' + v % 10);
+    while (d > 0) path[n++] = digits[--d];
+    static const char tail[] = "/stat";
+    for (size_t i = 0; i < sizeof(tail); ++i) path[n++] = tail[i];
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char buf[1024];
+    ssize_t got = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (got <= 0) return 0;
+    buf[got] = 0;
+    // comm may hold spaces and parentheses: fields resume after the LAST ')'.
+    char* p = nullptr;
+    for (char* q = buf; *q; ++q) if (*q == ')') p = q;
+    if (!p) return 0;
+    ++p;
+    // starttime is field 22; after the ')' field 3 (state) is the first token.
+    for (int field = 3; field < 22; ++field) {
+        while (*p == ' ') ++p;
+        while (*p && *p != ' ') ++p;
+    }
+    while (*p == ' ') ++p;
+    uint64_t v = 0;
+    bool any = false;
+    for (; *p >= '0' && *p <= '9'; ++p) { v = v * 10 + (uint64_t)(*p - '0'); any = true; }
+    return any ? v : 0;
+}
+
+void processTestTrackGroup(pid_t pg, uint64_t startTime) { trackGroup(pg, startTime); }
+
 int64_t diskAvail(const std::string& path) {
     struct statvfs sv{};
     if (path.empty() || statvfs(path.c_str(), &sv) != 0) return -1;
@@ -146,24 +207,28 @@ void startDiskWatchdog(std::vector<std::string> paths, uint64_t reserveBytes) {
 
 void killSessionProcesses(long graceMs) {
     bool any = false;
-    for (auto& slot : g_groups) {
-        pid_t pg = slot.load();
-        if (pg > 0 && kill(-pg, SIGTERM) == 0) { kill(-pg, SIGCONT); any = true; }
+    for (int i = 0; i < kGroupSlots; ++i) {
+        pid_t pg = g_groups[i].load();
+        if (pg <= 0) continue;
+        // A recycled number belongs to someone else: forget it, never signal.
+        if (!groupStillOurs(i, pg)) { g_groups[i].compare_exchange_strong(pg, 0); g_groupStart[i] = 0; continue; }
+        if (kill(-pg, SIGTERM) == 0) { kill(-pg, SIGCONT); any = true; }
     }
     if (!any) return;
     for (long waited = 0; waited < graceMs; waited += 25) {
         bool alive = false;
-        for (auto& slot : g_groups) {
-            pid_t pg = slot.load();
-            if (pg > 0 && groupAlive(pg)) alive = true;
+        for (int i = 0; i < kGroupSlots; ++i) {
+            pid_t pg = g_groups[i].load();
+            if (pg > 0 && groupAlive(pg) && groupStillOurs(i, pg)) alive = true;
         }
         if (!alive) break;
         struct timespec ts{0, 25 * 1000 * 1000};
         nanosleep(&ts, nullptr);
     }
-    for (auto& slot : g_groups) {
-        pid_t pg = slot.exchange(0);
-        if (pg > 0) kill(-pg, SIGKILL);
+    for (int i = 0; i < kGroupSlots; ++i) {
+        pid_t pg = g_groups[i].exchange(0);
+        if (pg > 0 && groupStillOurs(i, pg)) kill(-pg, SIGKILL);
+        g_groupStart[i] = 0;
     }
 }
 
@@ -269,7 +334,7 @@ SpawnResult spawn(const SpawnOpts& opts) {
     // this, kill(-pid) below could fire before the child's setpgid and hit
     // our own process group. Errors are harmless (child may have exited).
     setpgid(pid, pid);
-    trackGroup(pid);
+    trackGroup(pid, processStartTime(pid));
     int exitFd = -1;
 #ifdef SYS_pidfd_open
     exitFd = (int)syscall(SYS_pidfd_open, pid, 0);  // wake on exit without polling EOF pipes

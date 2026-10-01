@@ -272,6 +272,12 @@ single turn. Token, request, and cost accounting cover every stream, and
 so goals stay single-stream. The toggle persists in the session until
 changed; the prompt shows `·2×` while it is on.
 
+The analysis passes are read-only at the kernel level, not just by command
+filtering: their shell children get the workspace, extra roots, scratch and
+`/tmp` read-only through Landlock, no network, and a PATH without any writable
+directory, so even an allowlisted tool (`find -fprint0`, `tree -o`) cannot
+write. Without Landlock they refuse to run shell commands.
+
 ## The five tools
 
 The model-facing surface is exactly: `read` `write` `edit` `bash` `skill`.
@@ -577,8 +583,9 @@ effort parameters.
 **Learned quirks.** When a provider rejects a request with a recognizable
 400 (unsupported reasoning effort, `stream_options`, the wrong max-token
 parameter), the harness records the quirk for that model in `brain.json`
-and retries without it — once, then forever after. Per-provider EWMA
-health is tracked the same way (`/brain`).
+and retries without it — once, then forever after. Per-route EWMA
+health (provider, model and explicit routing; week-old data expires) is tracked
+the same way (`/brain`), so two models behind one gateway are judged separately.
 
 Model specs: `alias`, `provider:model`, or `provider:model@routing`:
 
