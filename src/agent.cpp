@@ -154,6 +154,21 @@ VoidResult Agent::restore(const std::string& sessionId) {
     goalBrief_ = m.goalBrief;
     goalNext_ = m.goalNext;
     goalProgress_ = m.goalProgress;
+    // Checkpoints written before side-call markup was filtered may carry a "brief" that is only
+    // tool-call text (invented paths included). Drop such a brief wherever it was embedded.
+    auto dropBadBrief = [](std::string& text) {
+        const std::string open = "[ADVISORY GENERATED BRIEF]", close = "[END ADVISORY BRIEF: follow the human request on every conflict]";
+        for (size_t a = text.find(open); a != std::string::npos; a = text.find(open, a)) {
+            size_t b = text.find(close, a);
+            size_t end = b == std::string::npos ? text.size() : b + close.size();
+            std::string body = text.substr(a, end - a);
+            if (body.find("<tool_call") == std::string::npos && body.find("<function=") == std::string::npos) { a = end; continue; }
+            text.erase(a, end - a);
+        }
+    };
+    dropBadBrief(goalBrief_);
+    dropBadBrief(goalNext_);
+    dropBadBrief(goalProgress_);
     goalPhase_ = m.goalPhase;
     goalStatus_ = GoalStatus::None;
     if (!goal_.empty()) {
@@ -754,6 +769,10 @@ Result<ChatResponse> Agent::sideRequest(const ResolvedModel& m, const std::strin
         r = opts_.request(req, cb);
     }
     if (r.ok && !usageSeen) record(r.value, nowMs() - t0);
+    // A tool-less side call must answer in prose. Some models still emit
+    // call markup for tools they remember; that is noise, never advice.
+    if (r.ok && (r.value.text.find("<tool_call") != std::string::npos || r.value.text.find("<function=") != std::string::npos))
+        r.value.text = cleanSummary(r.value.text);
     return r;
 }
 
@@ -2827,6 +2846,7 @@ std::string Agent::continueGoal(int maxCycles) {
             continue;
         }
         std::string verdict = trim(r.value.text);
+        if (verdict.empty()) verdict = "CONTINUE\n- the auditor returned no usable verdict; re-verify the goal with fresh evidence";
         std::string first = auditVerdict(verdict);
         if (first == "done") {
             std::string error = finishGoal("", true);

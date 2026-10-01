@@ -11,6 +11,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <set>
 
 #include "agent.h"
 #include "brain.h"
@@ -136,6 +137,12 @@ std::string afterChange(ToolEnv& env, const std::string& path, const std::string
     std::string out;
     auto findings = slopScan(path, content);
     for (auto& f : lintScan(path, content, 'M')) findings.push_back(std::move(f));
+    // A scene rendered to a video file has no viewer to motion-sensitize or inject into: those web-app
+    // findings are noise once the video doctrine is in play (the legibility and layout checks stay).
+    if (env.videoDocLoaded)
+        std::erase_if(findings, [](const std::string& f) {
+            return f.find("prefers-reduced-motion fallback") != std::string::npos || f.find("raw HTML sink") != std::string::npos;
+        });
     std::vector<std::string> fresh;
     auto& seen = env.qualitySeen[path];
     for (const auto& finding : findings)
@@ -149,7 +156,7 @@ std::string afterChange(ToolEnv& env, const std::string& path, const std::string
     std::string lp = toLower(path);
     // Deterministic backstop for the Jev prompt-time verdict: writing a UI file
     // without having read the design doctrine gets one firm demand.
-    if (firstTouch && !env.uiDocLoaded)
+    if (firstTouch && !env.uiDocLoaded && !env.videoDocLoaded)
         for (const char* ext : {".html", ".css", ".jsx", ".tsx", ".vue", ".svelte", ".astro", ".scss"})
             if (endsWith(lp, ext)) {
                 out += "\n[harness] UI work: you have not read the design doctrine. Before continuing, run "
@@ -425,6 +432,34 @@ ToolResult toolEdit(ToolEnv& env, const json::Value& args) {
                       afterChange(env, path, updated, data.value), true};
 }
 
+// grep/find/which/diff/test exit 1 to answer "nothing found" or "differs", not
+// "the tool broke". Only a silent exit 1 whose last statement runs such a
+// query counts: any stderr text keeps it a failure so real errors stay loud.
+bool isQueryNoMatch(const std::string& cmd, int exitCode, const std::string& err) {
+    if (exitCode != 1 || !err.empty()) return false;
+    std::string last = cmd;
+    while (!last.empty() && (last.back() == '\n' || last.back() == ' ' || last.back() == ';')) last.pop_back();
+    size_t nl = last.rfind('\n');
+    if (nl != std::string::npos) last = last.substr(nl + 1);
+    for (const char* sep : {"&&", "||", ";"}) {
+        size_t k = last.rfind(sep);
+        if (k != std::string::npos) last = last.substr(k + strlen(sep));
+    }
+    static const std::set<std::string> kQuery = {"grep", "egrep", "fgrep", "rg", "find", "which", "diff", "cmp",
+                                                 "test", "[", "pgrep", "type", "command", "fc-list", "ls", "compgen"};
+    size_t i = 0;
+    while (i <= last.size()) {
+        size_t e = last.find('|', i);
+        std::string stage = trim(last.substr(i, e == std::string::npos ? std::string::npos : e - i));
+        while (startsWith(stage, "!") || startsWith(stage, "(")) stage = trim(stage.substr(1));
+        std::string word = stage.substr(0, stage.find_first_of(" \t"));
+        if (kQuery.count(word.substr(word.rfind('/') == std::string::npos ? 0 : word.rfind('/') + 1))) return true;
+        if (e == std::string::npos) break;
+        i = e + 1;
+    }
+    return false;
+}
+
 ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
     ToolResult r;
     // Read-only passes never spawn recursive pocket children (the allowlist
@@ -538,6 +573,10 @@ ToolResult spawnBash(ToolEnv& env, const std::string& cmd, long timeoutSec) {
         return r;
     }
     r.ok = (sr.termSig == 0 && sr.exitCode == 0);
+    if (!r.ok && isQueryNoMatch(cmd, sr.exitCode, sr.err)) {
+        r.ok = true;
+        out += "[note: exit 1 from a search/test command usually means no match, not a tool failure]\n";
+    }
     // Exit 141 can be an early pipe reader, or an explicit failure from a
     // stage. Without PIPESTATUS evidence it must not certify success.
     if (sr.termSig == 0 && sr.exitCode == 141 && cmd.find('|') != std::string::npos) {

@@ -850,7 +850,7 @@ int kitMain(int argc, char** argv) {
         "  search QUERY           web search (title, url, snippet)\n"
         "  dom URL                JS-rendered page text via headless Chrome\n"
         "  shot URL OUT.png [WxH] screenshot via headless Chrome (visual QA)\n"
-        "  frame HTML OUT.png     deterministic scene frame (--time, --size)\n"
+        "  frame HTML OUT.png     deterministic scene frame (--time, --size; --times a,b,c = one contact sheet)\n"
         "  video HTML OUT.mp4     render a scene (--duration, --fps, --size, --audio, --start, --timeout)\n"
         "  vcheck FILE.mp4        finished-video QA: streams, duration, black/frozen/silent spans, clipping\n"
         "  vsheet FILE.mp4 OUT.png contact sheet of the whole video in one image (timestamped)\n"

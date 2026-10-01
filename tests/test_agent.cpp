@@ -3268,6 +3268,30 @@ TEST(agent_Slow_Brief_Is_Skipped_At_Deadline) {
     return "";
 }
 
+TEST(agent_Brief_Of_Tool_Call_Markup_Is_Never_Injected) {
+    // A tool-less planner that answers with call syntax (and invented paths) produced no advice at all.
+    AgentOpts opts;
+    opts.model = resolveModel(defaultConfig(), "glm").value;
+    opts.brief = true;
+    std::string workPrompt;
+    opts.request = [&](const ChatRequest& req, const ChatCallbacks&) {
+        ChatResponse r;
+        if (req.system.find("planning council") != std::string::npos) {
+            r.text = "<tool_call><function=bash><parameter=command>ls -la /workspace</parameter></function></tool_call>";
+            return Result<ChatResponse>::Ok(r);
+        }
+        workPrompt = req.messages.back().content;
+        r.text = "Done.";
+        return Result<ChatResponse>::Ok(r);
+    };
+    Agent agent(opts);
+    CHECK(agent.runTurn("fix the parser migration across modules and benchmark the complete pipeline please").empty());
+    CHECK(!workPrompt.empty());
+    CHECK(workPrompt.find("ADVISORY") == std::string::npos);
+    CHECK(workPrompt.find("<tool_call") == std::string::npos && workPrompt.find("/workspace") == std::string::npos);
+    return "";
+}
+
 TEST(agent_Adaptive_Simple_Work_Skips_Planning_And_Uses_Fast_Until_Failure) {
     for (bool explicitThinking : {false, true}) {
         AgentOpts opts;

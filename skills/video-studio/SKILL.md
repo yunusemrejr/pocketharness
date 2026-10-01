@@ -36,6 +36,7 @@ pocket kit music music.wav --style corporate --duration D --seed N     # styles:
 pocket kit sfx whoosh.wav whoosh --seed 3 ; pocket kit sfx tick.wav click
 pocket kit mix audio.wav --voice narration.wav --music music.wav --duration D --lufs -14 --at 9.3:whoosh.wav:-2 ...
 pocket kit frame scene.html check.png --time 6 --size 1280x720      # lint + a still: look at it
+pocket kit frame scene.html moments.png --times 3,12,40,66 --size 960x540   # several moments, ONE launch, one numbered sheet (not N renders + ffmpeg stacking)
 pocket kit video scene.html preview.mp4 --duration D --fps 12 --size 640x360 --audio audio.wav
 pocket kit vsheet preview.mp4 sheet.png --n 12                      # the whole video in one image: read it
 pocket kit video scene.html final.mp4 --duration D --fps 30 --size 1920x1080 --audio audio.wav

@@ -237,6 +237,26 @@ TEST(video_Frame_And_Sequence_Use_Explicit_Times) {
     return "";
 }
 
+TEST(video_Frame_Times_Option_Validation) {
+    VideoScratch scratch;
+    CHECK(scratch.setup());
+    for (const char* bad : {"abc", "1,,2", "-3,4", "1,x"}) {
+        auto r = scratch.render("ok", true, {"--size", "320x240", "--times", bad});
+        CHECK(r.ok && r.exitCode == 1 && r.err.find("--times needs") != std::string::npos);
+    }
+    auto many = scratch.render("ok", true, {"--size", "320x240", "--times", "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25"});
+    CHECK(many.ok && many.exitCode == 1 && many.err.find("at most 24") != std::string::npos);
+    auto cols = scratch.render("ok", true, {"--size", "320x240", "--times", "1,2", "--cols", "9"});
+    CHECK(cols.ok && cols.exitCode == 1 && cols.err.find("--cols") != std::string::npos);
+    // One moment is just --time.
+    auto one = scratch.render("ok", true, {"--size", "320x240", "--times", "2.5"});
+    CHECK(one.ok && one.exitCode == 0);
+    auto log = readFileBounded(scratch.path + "/log", 100000);
+    CHECK(log.ok && log.value.find("__pocketSeek(2.5)") != std::string::npos);
+    CHECK(scratch.cleaned());
+    return "";
+}
+
 TEST(video_Source_Review_Preserves_Palette_And_Separates_Generic_Copy) {
     VideoScratch scratch;
     CHECK(scratch.setup());

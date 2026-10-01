@@ -299,11 +299,11 @@ std::vector<std::string> sourceSuggestions(const std::string& html) {
 }
 
 const char* videoUsage = "usage: kit video SCENE.html OUT.mp4 --duration SECONDS [--size 1920x1080] [--fps 30] [--audio FILE] [--start SECONDS] [--timeout SECONDS] [--no-lint]";
-const char* frameUsage = "usage: kit frame SCENE.html OUT.png [--time SECONDS] [--size 1280x720] [--timeout 120] [--no-lint]";
+const char* frameUsage = "usage: kit frame SCENE.html OUT.png [--time SECONDS | --times S1,S2,S3.. [--cols N]] [--size 1280x720] [--timeout 120] [--no-lint]   (--times: one contact sheet of several moments, one browser launch)";
 
 
 // Lint the scene at sample times; report what is stable across samples (a transient mid-reveal state is not a defect).
-void lintScene(Cdp& cdp, const std::vector<double>& times, const std::string& source) {
+void lintScene(Cdp& cdp, const std::vector<double>& times, const std::string& source, bool exact = false) {
     std::map<std::string, std::pair<int, std::pair<double, std::string>>> seen;
     std::vector<std::string> order;
     for (double t : times) {
@@ -317,7 +317,7 @@ void lintScene(Cdp& cdp, const std::vector<double>& times, const std::string& so
             ++seen[key].first;
         }
     }
-    const int need = times.size() > 1 ? 2 : 1;
+    const int need = !exact && times.size() > 1 ? 2 : 1;
     std::vector<std::string> lines;
     for (const auto& key : order)
         if (seen[key].first >= need) {
@@ -328,8 +328,8 @@ void lintScene(Cdp& cdp, const std::vector<double>& times, const std::string& so
     if (lines.empty()) fprintf(stderr, "lint: no layout or legibility findings at %zu sampled time%s\n", times.size(), times.size() == 1 ? "" : "s");
     else {
         fprintf(stderr, "lint: %zu issue%s; fix before the final render\n", lines.size(), lines.size() == 1 ? "" : "s");
-        for (size_t i = 0; i < lines.size() && i < 12; ++i) fprintf(stderr, "  lint: %s\n", sanitizeTerminal(lines[i]).c_str());
-        if (lines.size() > 12) fprintf(stderr, "  lint: ... and %zu more\n", lines.size() - 12);
+        for (size_t i = 0; i < lines.size() && i < 30; ++i) fprintf(stderr, "  lint: %s\n", sanitizeTerminal(lines[i]).c_str());
+        if (lines.size() > 30) fprintf(stderr, "  lint: ... and %zu more\n", lines.size() - 30);
     }
     const auto suggestions = sourceSuggestions(source);
     for (size_t i = 0; i < suggestions.size() && i < 12; ++i)
@@ -343,13 +343,30 @@ std::string render(const std::vector<std::string>& args, bool still) {
     double duration = 0, at = 0, timeout = 0, start = 0;
     std::string audio;
     bool lint = true;
+    std::vector<double> sheetTimes;  // frame --times: several moments, one contact sheet
+    int sheetCols = 0;
     for (size_t i = 2; i < args.size(); i += 2) {
         if (args[i] == "--no-lint") { lint = false; --i; continue; }
         if (i + 1 == args.size()) return "missing value for " + args[i];
         const std::string& key = args[i];
         const std::string& value = args[i+1];
         double n = 0;
-        if (key == "--size") {
+        if (key == "--times" && still) {
+            sheetTimes.clear();
+            for (size_t p = 0; p <= value.size();) {
+                size_t c = value.find(',', p);
+                double t = 0;
+                if (!number(value.substr(p, c == std::string::npos ? std::string::npos : c - p), t) || t < 0 || t > 86400)
+                    return "--times needs comma-separated seconds, e.g. 3.2,12,40";
+                sheetTimes.push_back(t);
+                if (c == std::string::npos) break;
+                p = c + 1;
+            }
+            if (sheetTimes.size() > 24) return "--times accepts at most 24 moments";
+        } else if (key == "--cols" && still) {
+            if (!number(value, n) || n < 1 || n > 6 || n != std::floor(n)) return "--cols must be an integer 1..6";
+            sheetCols = (int)n;
+        } else if (key == "--size") {
             size_t x = value.find('x');
             double w = 0, h = 0;
             if (x == std::string::npos || !number(value.substr(0, x), w) || !number(value.substr(x+1), h) ||
@@ -368,7 +385,9 @@ std::string render(const std::vector<std::string>& args, bool still) {
         }
     }
     if (!still && (duration <= 0 || width % 2 || height % 2)) return "video needs --duration (0..900s) and even dimensions";
-    int frames = still ? 1 : (int)std::ceil(duration * fps - 1e-9);
+    const bool sheet = still && sheetTimes.size() > 1;
+    if (still && sheetTimes.size() == 1) at = sheetTimes[0];
+    int frames = sheet ? (int)sheetTimes.size() : still ? 1 : (int)std::ceil(duration * fps - 1e-9);
     if (frames < 1 || frames > 54000) return "render must contain 1..54000 frames; render longer projects in parts with --start";
     if (timeout <= 0) timeout = std::min(14400.0, 120.0 + frames * 0.6);  // scales with the work; explicit --timeout wins
     if (!endsWith(toLower(args[1]), still ? ".png" : ".mp4")) return still ? "frame output must end in .png" : "video output must end in .mp4";
@@ -386,7 +405,8 @@ std::string render(const std::vector<std::string>& args, bool still) {
     for (const char* name : {"google-chrome", "chromium", "chromium-browser", "google-chrome-stable"})
         if (!(chrome = whichExe(name)).empty()) break;
     if (chrome.empty()) return "Chrome/Chromium is needed for frames; inspect `pocket kit probe`";
-    std::string ffmpeg = still ? "" : whichExe("ffmpeg");
+    std::string ffmpeg = !still || sheet ? whichExe("ffmpeg") : "";
+    if (sheet && ffmpeg.empty()) return "FFmpeg is needed to tile a contact sheet; render single frames with --time instead";
     if (!still && ffmpeg.empty()) return "FFmpeg is needed for video encoding; frame export remains available";
 
     Signals signals;
@@ -401,6 +421,7 @@ std::string render(const std::vector<std::string>& args, bool still) {
     Fd output;
     int created = mkstemp(outputTemplate.data());
     if (created < 0) return "cannot stage output in its destination directory";
+    { mode_t um = umask(0); umask(um); fchmod(created, 0666 & ~um); }  // mkstemp makes 0600; renders are ordinary files
     staged.path = outputTemplate;
     output.fd = fcntl(created, F_DUPFD_CLOEXEC, 10); close(created);
     if (output.fd < 0) return "cannot retain staged output descriptor";
@@ -469,7 +490,7 @@ std::string render(const std::vector<std::string>& args, bool still) {
         if (!loaded) poll(nullptr, 0, 20);
     }
     if (!loaded) return "scene did not finish loading before the deadline";
-    auto ready = cdp.evaluate(R"JS((async()=>{
+    auto ready = cdp.evaluate(std::string("window.__pocketStill = ") + (still ? "true" : "false") + ";" + R"JS((async()=>{
         if (window.renderReady !== undefined) await window.renderReady;
         if (document.fonts) await document.fonts.ready;
         await Promise.all(Array.from(document.images, async image => {
@@ -523,7 +544,7 @@ std::string render(const std::vector<std::string>& args, bool still) {
         await Promise.all(Array.from(document.querySelectorAll('video'), mediaReady));
         // A scene may be pure CSS/SVG animation: seeking the timeline is then all a frame needs.
         if (typeof window.renderFrame !== 'function') {
-            if (!document.getAnimations().length && !document.querySelector('svg,video[src],video source[src]'))
+            if (!window.__pocketStill && !document.getAnimations().length && !document.querySelector('svg,video[src],video source[src]'))
                 throw new Error('Nothing to render: define window.renderFrame(timeSeconds) or animate with CSS/SVG animations');
             window.renderFrame = () => {};
         }
@@ -545,9 +566,10 @@ std::string render(const std::vector<std::string>& args, bool still) {
     if (!ready.ok) return ready.error;
     if (lint) {
         std::vector<double> times;
-        if (still) times.push_back(at);
+        if (sheet) times = sheetTimes;
+        else if (still) times.push_back(at);
         else for (double f : {.05, .15, .27, .4, .52, .64, .76, .88, .96}) times.push_back(start + duration * f);
-        lintScene(cdp, times, readFileBounded(source.string(), 4 << 20).value);
+        lintScene(cdp, times, readFileBounded(source.string(), 4 << 20).value, sheet);
     }
     if (!still) {
         SpawnOpts encode;
@@ -570,9 +592,10 @@ std::string render(const std::vector<std::string>& args, bool still) {
         encoder.start(std::move(encode));
     }
     int64_t started = nowMs();
+    std::vector<std::string> sheetPngs;
     for (int frame = 0; frame < frames; ++frame) {
         if (interrupted || nowMs() >= deadline) return interrupted ? "render cancelled" : "render time budget exhausted";
-        std::string seconds = json::stringify(still ? at : start + (double)frame / fps);
+        std::string seconds = json::stringify(sheet ? sheetTimes[frame] : still ? at : start + (double)frame / fps);
         // One transient capture stall (GC, heavy canvas) must not cost the whole render: redraw and retry once.
         Result<json::Value> shot = Result<json::Value>::Err("");
         for (int attempt = 0; attempt < 2; ++attempt) {
@@ -586,6 +609,7 @@ std::string render(const std::vector<std::string>& args, bool still) {
             (still ? "" : " (the scene is too heavy for this frame; simplify it, or render in pieces with --start and join with ffmpeg concat)");
         auto png = pngBytes(shot.value.at("data").asStr(), (unsigned)width, (unsigned)height);
         if (!png.ok) return png.error;
+        if (sheet) { sheetPngs.push_back(std::move(png.value)); continue; }
         int fd = still ? output.fd : pictures.write.fd;
         if (!writeBounded(fd, png.value, deadline, still ? nullptr : &encoder)) {
             if (!still && encoder.done.load()) {
@@ -596,6 +620,52 @@ std::string render(const std::vector<std::string>& args, bool still) {
         }
         if (!still && (frame == 0 || (frame + 1) % fps == 0 || frame + 1 == frames))
             fprintf(stderr, "rendered %d/%d frames\n", frame + 1, frames);
+    }
+    if (sheet) {
+        // Tile the captured moments into one image, numbered 1..N in --times order.
+        Temp dir;
+        dir.directory = true;
+        std::string tmpl = temp + "/pocket-sheet-XXXXXX";
+        if (!mkdtemp(tmpl.data())) return "cannot create contact sheet directory";
+        dir.path = tmpl;
+        for (size_t i = 0; i < sheetPngs.size(); ++i) {
+            char name[32];
+            snprintf(name, sizeof name, "/f%02zu.png", i + 1);
+            auto w = atomicWriteFile(dir.path + name, sheetPngs[i]);
+            if (!w.ok) return w.error;
+        }
+        const int cols = sheetCols ? std::min<int>(sheetCols, (int)sheetPngs.size()) : (sheetPngs.size() <= 4 ? 2 : 3);
+        const int rows = ((int)sheetPngs.size() + cols - 1) / cols;
+        const int tile = std::min(width, std::max(320, 1920 / cols));
+        const std::string sheetFile = dir.path + "/sheet.png";
+        auto filter = [&](bool stamp) {
+            return "scale=" + std::to_string(tile) + ":-2" +
+                   (stamp ? ",drawtext=text='%{eif\\:n+1\\:d}':x=8:y=8:fontsize=h/10:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=4" : "") +
+                   ",tile=" + std::to_string(cols) + "x" + std::to_string(rows) + ":padding=6:margin=6:color=0x101010";
+        };
+        SpawnResult tiled;
+        for (bool stamp : {true, false}) {
+            SpawnOpts tile1;
+            tile1.exe = ffmpeg;
+            tile1.argv = {ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-framerate", "1", "-i", dir.path + "/f%02d.png",
+                          "-vf", filter(stamp), "-frames:v", "1", sheetFile};
+            tile1.timeoutMs = 120000;
+            tile1.outLimit = 1 << 16;
+            tiled = spawn(tile1);
+            if (tiled.ok && tiled.exitCode == 0) break;
+        }
+        if (!tiled.ok || tiled.exitCode != 0) return "contact sheet failed: " + trim(tiled.err.substr(0, 300));
+        auto sheetPng = readFileBounded(sheetFile, 64 << 20);
+        if (!sheetPng.ok) return sheetPng.error;
+        if (!writeBounded(output.fd, sheetPng.value, deadline)) return "cannot write the contact sheet";
+        std::string legend;
+        for (size_t i = 0; i < sheetTimes.size(); ++i) {
+            char b[40];
+            snprintf(b, sizeof b, "%s%zu=%.2fs", i ? "  " : "", i + 1, sheetTimes[i]);
+            legend += b;
+        }
+        printf("%s: contact sheet, %zu moments in %d columns, each %dx%d scaled to %d wide  [%s]  (read it as an image)\n",
+               sanitizeTerminal(args[1]).c_str(), sheetTimes.size(), cols, width, height, tile, legend.c_str());
     }
     if (!still) {
         pictures.write.reset();
@@ -611,6 +681,7 @@ std::string render(const std::vector<std::string>& args, bool still) {
     if (interrupted || nowMs() >= deadline) return interrupted ? "render cancelled" : "render time budget exhausted";
     if (rename(staged.path.c_str(), destination.c_str())) return "cannot publish completed output";
     staged.path.clear();
+    if (!sheet)
     printf("%s: %s %dx%d, %d frame%s, %.3fs media, %.2fs render\n", sanitizeTerminal(args[1]).c_str(),
         still ? "PNG" : "H.264 MP4", width, height, frames, frames == 1 ? "" : "s",
         still ? at : (double)frames / fps, (nowMs() - started) / 1000.0);

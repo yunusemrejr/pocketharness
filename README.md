@@ -325,7 +325,7 @@ pocket kit web URL          readable page text + numbered links
 pocket kit search QUERY     keyless web search (DuckDuckGo html → lite)
 pocket kit dom URL          JS-rendered text via headless Chrome
 pocket kit shot URL OUT.png screenshot for visual QA (desktop/mobile sizes)
-pocket kit frame SCENE.html OUT.png --time 1.5   seek a deterministic frame
+pocket kit frame SCENE.html OUT.png --time 1.5   seek a deterministic frame (--times 3,9,20 [--cols N]: one contact sheet of several moments)
 pocket kit video SCENE.html OUT.mp4 --duration 6 --fps 30 --size 1920x1080 [--audio mix.wav] [--start S]
 pocket kit vcheck FILE.mp4 [--duration S]        finished-video QA: streams, black/frozen/silent spans, loudness, clipping
 pocket kit vsheet FILE.mp4 OUT.png [--n 12]       the whole video as one timestamped contact sheet

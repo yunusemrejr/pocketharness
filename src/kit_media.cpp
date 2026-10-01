@@ -60,6 +60,8 @@ std::string download(const std::string& url, const std::string& dest, long sec =
     std::string tmp = dest + ".part-XXXXXX";
     int fd = mkstemp(tmp.data());
     if (fd < 0) return "cannot stage download beside " + dest;
+    // mkstemp creates 0600; a downloaded asset should have ordinary file permissions.
+    { mode_t um = umask(0); umask(um); fchmod(fd, 0666 & ~um); }
     close(fd);
     SpawnResult r = run({"curl", "--disable", "-fsSL", "-A", kUA, "--connect-timeout", "10", "--max-time", std::to_string(sec),
                          "--max-filesize", "400000000", "--proto", "=http,https", "-o", tmp, url}, (sec + 5) * 1000, 1 << 16);
@@ -601,7 +603,8 @@ int assetFont(const std::vector<std::string>& a) {
         if (s == std::string::npos) break;
         size_t e = outCss.find("/* ", s + 3);
         std::string block = outCss.substr(s, e == std::string::npos ? std::string::npos : e - s);
-        if (block.find("url(") != std::string::npos) kept += block;
+        // Downloaded faces reference local files; a remote url( is a subset we skipped.
+        if (block.find("url(") != std::string::npos && block.find("url(http") == std::string::npos) kept += block;
         if (e == std::string::npos) break;
         p = e;
     }
@@ -1016,8 +1019,10 @@ int kitAsset(const std::vector<std::string>& a) {
         "       kit asset get URL|polyhaven:ID|three OUT_DIR [--res 1k] [--credit TXT]  download; writes ATTRIBUTION.txt\n"
         "       kit asset font \"Family\" OUT_DIR [--weights 400,700]                     Google Font as local woff2 + css\n"
         "       kit asset inspect FILE.gltf|FILE.glb                                 bounded local 3D preflight; JSON report";
-    if (a.empty() || a[0] == "--help") { puts(usage); return a.empty() ? 2 : 0; }
+    if (a.empty() || a[0] == "--help" || a[0] == "-h") { puts(usage); return a.empty() ? 2 : 0; }
     std::vector<std::string> rest(a.begin() + 1, a.end());
+    // `kit asset SUB --help` asks for usage; it must not read as a failure.
+    if (!rest.empty() && (rest[0] == "--help" || rest[0] == "-h")) { puts(usage); return 0; }
     if (a[0] == "search") return assetSearch(rest);
     if (a[0] == "get") return assetGet(rest);
     if (a[0] == "font") return assetFont(rest);

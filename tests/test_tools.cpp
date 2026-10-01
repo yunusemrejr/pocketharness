@@ -166,6 +166,24 @@ TEST(tools_Bash_Capture_And_Guard) {
     return "";
 }
 
+TEST(tools_Bash_Silent_Query_No_Match_Is_Not_A_Failure) {
+    ToolFixture f;
+    CHECK(f.ok);
+    // grep/find/which exit 1 means "nothing found": informational, not TOOL FAILED.
+    ToolResult r = runTool(f.env, "bash", R"({"command":"echo hi; grep -q zzz /dev/null"})");
+    CHECK(r.ok && r.output.find("[exit: 1]") != std::string::npos && r.output.find("no match") != std::string::npos);
+    r = runTool(f.env, "bash", R"({"command":"which no-such-tool-xyz 2>/dev/null"})");
+    CHECK(r.ok);
+    r = runTool(f.env, "bash", R"({"command":"find . -name nothing-here-xyz 2>/dev/null | head -3; echo ---; grep -c zzz /dev/null | head -1"})");
+    CHECK(r.ok);
+    // Real failures stay failures: other commands, any stderr, other exit codes.
+    CHECK(!runTool(f.env, "bash", R"({"command":"false"})").ok);
+    CHECK(!runTool(f.env, "bash", R"({"command":"python3 -c 'import sys; sys.exit(1)'"})").ok);
+    CHECK(!runTool(f.env, "bash", R"({"command":"echo boom >&2; grep -q zzz /dev/null"})").ok);
+    CHECK(!runTool(f.env, "bash", R"({"command":"grep zzz /no/such/file/xyz"})").ok);
+    return "";
+}
+
 TEST(tools_Bash_Caps_File_Size) {
     ToolFixture f;
     CHECK(f.ok);

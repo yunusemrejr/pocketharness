@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.13.4
+
+Fixes from a long goal session (a narrated CPU explainer video) that exposed
+harness faults rather than model faults. Every item has a regression test.
+
+- Side calls (planning brief, goal audit, reviewers) never return call markup:
+  a tool-less model that answered with `<tool_call>` text used to be injected
+  as the "advisory brief" (with invented `/workspace` paths) into the goal and
+  every continuation. Such text is now stripped, an empty brief is skipped, an
+  empty audit verdict means CONTINUE, and checkpoints saved with a poisoned
+  brief are cleaned on load.
+- `bash` exit 1 from a silent search/test command (`grep`, `find`, `which`,
+  `diff`, `test`...) is reported as "no match", not `TOOL FAILED`. Any stderr
+  text, other exit codes and other commands still fail.
+- `kit asset font` wrote CSS faces whose `url()` pointed at Google (subsets it
+  never downloaded) and left woff2 files at mode 0600; only local faces are
+  kept and files get ordinary permissions. `kit asset SUB --help` exits 0.
+  Rendered frames/videos are also created with ordinary permissions.
+- `kit frame` accepts a static page (no animation) instead of failing with
+  "Nothing to render". New `--times S1,S2,.. [--cols N]` renders several
+  moments in one browser launch into one numbered contact sheet, replacing N
+  separate launches plus hand-made ffmpeg stacking; lint covers every moment
+  and shows up to 30 findings.
+- Video projects (video-studio loaded) no longer get web-app noise on scene
+  files: the prefers-reduced-motion and raw-HTML-sink findings and the forced
+  design-doctrine detour are skipped; layout and legibility checks remain.
+
 ## 0.13.3
 
 Make the read-only and completion guarantees mechanically true, from an
